@@ -36,7 +36,7 @@ Desktop.ini
 *.code-workspace
 
 # ============================================================
-# Secrets
+# Secrets / Credentials
 # ============================================================
 
 .env
@@ -50,20 +50,50 @@ secrets/
 credentials/
 
 # ============================================================
-# Pentest Runtime Data
+# Pentest Projects
+#
+# All assessment/project runtime data is excluded from Git.
+#
+# Example:
+# projects/PENTEST-2026-001/
+# projects/PENTEST-2026-002/
 # ============================================================
 
-projects/*/
+projects/*
+!projects/.gitkeep
+
+# ============================================================
+# Pentest Evidence
+#
+# Evidence generated during an assessment must not be
+# committed to the repository.
+# ============================================================
+
 evidence/*
+!evidence/.gitkeep
+
+# ============================================================
+# Generated Reports
+# ============================================================
 
 reports/generated/
 reports/output/
 
-!projects/.gitkeep
-!evidence/.gitkeep
+# ============================================================
+# Project / Assessment Evidence
+#
+# These rules cover evidence stored inside project directories
+# even if the project directory structure changes later.
+# ============================================================
+
+projects/**/evidence/
+projects/**/evidence/*
 
 # ============================================================
-# Temporary Scan Results
+# Temporary Scan / Network Capture Files
+#
+# These are generally generated during assessments and can
+# become very large.
 # ============================================================
 
 *.pcap
@@ -71,23 +101,11 @@ reports/output/
 *.har
 
 # ============================================================
-# Screenshots / Evidence
+# Pentest Tool Temporary Output
 # ============================================================
 
-*.png
-*.jpg
-*.jpeg
-*.webp
-
-# ============================================================
-# Archives
-# ============================================================
-
-*.zip
-*.7z
-*.rar
-*.tar
-*.gz
+*.tmp
+*.temp
 
 # ============================================================
 # Logs
@@ -97,11 +115,26 @@ reports/output/
 logs/
 
 # ============================================================
-# Temporary Files
+# Temporary / Backup Files
 # ============================================================
 
-*.tmp
-*.temp
 *.bak
 *.swp
 *.swo
+*.orig
+
+# ============================================================
+# Archives
+#
+# Do not ignore archives globally because documentation may
+# legitimately contain downloadable examples.
+#
+# If an assessment archive must be excluded, put it under
+# projects/ or evidence/.
+# ============================================================
+
+# *.zip
+# *.7z
+# *.rar
+# *.tar
+# *.gz
