@@ -3,21 +3,23 @@
     Mengaktifkan Python virtual environment untuk BrebesKab-CSIRT-Tools.
 
 .DESCRIPTION
-    Script ini dirancang untuk di-dot-source dari PowerShell agar environment
-    tetap aktif pada terminal yang sedang digunakan.
+    Script ini harus di-dot-source dari PowerShell agar aktivasi .venv
+    tetap berlaku pada terminal yang sedang digunakan.
 
     Script:
       - Memastikan .venv tersedia.
       - Mengaktifkan .venv\Scripts\Activate.ps1.
       - Menambahkan repository root dan scripts/ ke PYTHONPATH.
-      - Menampilkan Python interpreter yang sedang aktif.
-      - Menampilkan daftar file Python pada scripts/.
+      - Menampilkan interpreter dan versi Python yang aktif.
+      - Menampilkan file Python yang tersedia di scripts/.
+      - Tidak gagal hanya karena scripts/ belum memiliki file Python.
 
     Penggunaan:
       . .\scripts\activate-venv.ps1
 
     Setelah aktif:
-      python scripts\project.py list
+      python --version
+      python scripts/project.py list
 #>
 
 [CmdletBinding()]
@@ -87,8 +89,12 @@ Write-Host ''
 
 Write-Host 'Python scripts yang tersedia:' -ForegroundColor Yellow
 
-$PythonScripts = Get-ChildItem -LiteralPath $ScriptsPath -Filter '*.py' -File |
-    Sort-Object Name
+# Force array semantics so Count is always available in PowerShell 5.1,
+# including when there are zero or one .py files.
+$PythonScripts = @(
+    Get-ChildItem -LiteralPath $ScriptsPath -Filter '*.py' -File |
+        Sort-Object Name
+)
 
 if ($PythonScripts.Count -eq 0) {
     Write-Host '  [INFO] Belum ada file .py di scripts/.' -ForegroundColor DarkYellow
@@ -100,6 +106,9 @@ else {
 }
 
 Write-Host ''
+Write-Host '[PASS] Python environment siap digunakan.' -ForegroundColor Green
+Write-Host ''
 Write-Host 'Contoh:' -ForegroundColor Yellow
+Write-Host '  python --version'
 Write-Host '  python scripts/project.py list'
 Write-Host ''
