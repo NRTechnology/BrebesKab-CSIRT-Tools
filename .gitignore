@@ -50,13 +50,13 @@ secrets/
 credentials/
 
 # ============================================================
+# Local Runtime
+# ============================================================
+
+.runtime/
+
+# ============================================================
 # Pentest Projects
-#
-# All assessment/project runtime data is excluded from Git.
-#
-# Example:
-# projects/PENTEST-2026-001/
-# projects/PENTEST-2026-002/
 # ============================================================
 
 projects/*
@@ -64,9 +64,6 @@ projects/*
 
 # ============================================================
 # Pentest Evidence
-#
-# Evidence generated during an assessment must not be
-# committed to the repository.
 # ============================================================
 
 evidence/*
@@ -81,19 +78,21 @@ reports/output/
 
 # ============================================================
 # Project / Assessment Evidence
-#
-# These rules cover evidence stored inside project directories
-# even if the project directory structure changes later.
 # ============================================================
 
 projects/**/evidence/
 projects/**/evidence/*
 
 # ============================================================
+# Local Pentest Tool Binaries
+# ============================================================
+
+tools/ffuf/
+tools/nuclei/
+tools/httpx/
+
+# ============================================================
 # Temporary Scan / Network Capture Files
-#
-# These are generally generated during assessments and can
-# become very large.
 # ============================================================
 
 *.pcap
@@ -125,12 +124,6 @@ logs/
 
 # ============================================================
 # Archives
-#
-# Do not ignore archives globally because documentation may
-# legitimately contain downloadable examples.
-#
-# If an assessment archive must be excluded, put it under
-# projects/ or evidence/.
 # ============================================================
 
 # *.zip
