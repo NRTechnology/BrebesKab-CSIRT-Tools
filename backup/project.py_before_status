@@ -5,8 +5,6 @@ BrebesKab-CSIRT-Tools - Project Manager
 Usage:
     python scripts/project.py list
     python scripts/project.py use PENTEST-2026-002
-    python scripts/project.py status
-    python scripts/project.py clear
 """
 
 from __future__ import annotations
@@ -23,7 +21,7 @@ except ImportError:
     sys.exit(1)
 
 
-SCRIPT_VERSION = "1.2.0"
+SCRIPT_VERSION = "1.1.0"
 
 
 def repository_root() -> Path:
@@ -221,92 +219,6 @@ def use_project(project_id: str) -> int:
     return 0
 
 
-def status_project() -> int:
-    active_file = active_project_file()
-
-    if not active_file.is_file():
-        print()
-        print("=" * 72)
-        print(" BrebesKab-CSIRT-Tools - Active Project Status")
-        print("=" * 72)
-        print("[INFO] Tidak ada active project.")
-        print()
-        return 0
-
-    data = load_yaml(active_file)
-
-    if not data:
-        print("[ERROR] active-project.yaml tidak dapat dibaca atau kosong.")
-        print(f"Context: {active_file}")
-        return 1
-
-    project_id = data.get("project_id")
-
-    if not isinstance(project_id, str) or not project_id.strip():
-        print("[ERROR] active-project.yaml tidak memiliki project_id yang valid.")
-        print(f"Context: {active_file}")
-        return 1
-
-    project_id = project_id.strip()
-
-    try:
-        project_dir, assessment = load_project(project_id)
-    except ValueError as exc:
-        print(f"[ERROR] {exc}")
-        print(f"Context: {active_file}")
-        return 1
-
-    application = data.get("application", assessment.get("application", "-"))
-    target = data.get("target", assessment.get("target", "-"))
-    environment = data.get("environment", assessment.get("environment", "-"))
-    assessment_type = data.get(
-        "assessment_type",
-        assessment.get("assessment_type", "-"),
-    )
-    activated_at = data.get("activated_at", "-")
-
-    print()
-    print("=" * 72)
-    print(" BrebesKab-CSIRT-Tools - Active Project Status")
-    print("=" * 72)
-    print(f"Project ID  : {project_id}")
-    print(f"Application : {application}")
-    print(f"Target      : {target}")
-    print(f"Environment : {environment}")
-    print(f"Type        : {assessment_type}")
-    print(f"Activated   : {activated_at}")
-    print(f"Project     : {project_dir}")
-    print(f"Context     : {active_file}")
-    print()
-
-    return 0
-
-
-def clear_project() -> int:
-    active_file = active_project_file()
-
-    if not active_file.exists():
-        print()
-        print("[INFO] Tidak ada active project yang perlu di-clear.")
-        print()
-        return 0
-
-    if not active_file.is_file():
-        print(f"[ERROR] Context path bukan file: {active_file}")
-        return 1
-
-    active_file.unlink()
-
-    print()
-    print("=" * 72)
-    print(" BrebesKab-CSIRT-Tools - Active Project")
-    print("=" * 72)
-    print("[PASS] Active project telah di-clear.")
-    print(f"Context   : {active_file}")
-    print()
-    return 0
-
-
 def print_help() -> None:
     print(
         f"""BrebesKab-CSIRT-Tools Project Manager v{SCRIPT_VERSION}
@@ -314,14 +226,10 @@ def print_help() -> None:
 Usage:
   python scripts/project.py list
   python scripts/project.py use PENTEST-2026-002
-  python scripts/project.py status
-  python scripts/project.py clear
 
 Commands:
-  list              Menampilkan seluruh pentest project dan active project.
-  use <project>     Menetapkan project sebagai active project.
-  status            Menampilkan detail active project.
-  clear             Menghapus active project context.
+  list <project>  Menampilkan seluruh pentest project dan active project.
+  use <project>   Menetapkan project sebagai active project.
 """
     )
 
@@ -348,24 +256,6 @@ def main() -> int:
             return 1
 
         return use_project(sys.argv[2])
-
-    if command == "status":
-        if len(sys.argv) != 2:
-            print("[ERROR] Command 'status' tidak menerima argument.")
-            print()
-            print_help()
-            return 1
-
-        return status_project()
-
-    if command == "clear":
-        if len(sys.argv) != 2:
-            print("[ERROR] Command 'clear' tidak menerima argument.")
-            print()
-            print_help()
-            return 1
-
-        return clear_project()
 
     print(f"[ERROR] Command tidak dikenal: {sys.argv[1]}")
     print()
