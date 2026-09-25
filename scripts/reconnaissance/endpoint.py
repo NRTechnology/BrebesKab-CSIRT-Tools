@@ -197,43 +197,39 @@ def require_technology_completed() -> dict[str, Any]:
 
 
 def base_document(technology: dict[str, Any]) -> dict[str, Any]:
+    """Build the standard reconnaissance YAML document."""
     ctx = project_context()
     target_url = str(technology.get("target_url", "")).strip()
     hostname = str(technology.get("hostname", "")).strip()
-
     return {
         "schema_version": "1.0",
         "project_id": ctx.project_id,
-        "status": "not-started",
-        "application": technology.get("application", ""),
-        "target_url": target_url,
-        "hostname": hostname,
-        "environment": technology.get("environment", ""),
-        "assessment_type": technology.get("assessment_type", ""),
-        "scope_reference": technology.get(
-            "scope_reference",
-            "01-preparation/scope/scope.yaml",
-        ),
-        "sources": {
-            "html": False,
-            "robots_txt": False,
-            "sitemap_xml": False,
-            "javascript": False,
+        "updated_at": now_iso(),
+        "endpoint": {
+            "status": "not-started",
+            "application": technology.get("application", ""),
+            "target_url": target_url,
+            "hostname": hostname,
+            "environment": technology.get("environment", ""),
+            "assessment_type": technology.get("assessment_type", ""),
+            "scope_reference": technology.get("scope_reference", "01-preparation/scope/scope.yaml"),
+            "sources": {"html": False, "robots_txt": False, "sitemap_xml": False, "javascript": False},
+            "endpoints": [],
+            "summary": {"total": 0, "html_links": 0, "forms": 0, "javascript": 0, "robots": 0, "sitemap": 0, "same_host": 0, "external": 0},
+            "notes": "",
+            "discovered_at": "",
         },
-        "endpoints": [],
-        "summary": {
-            "total": 0,
-            "html_links": 0,
-            "forms": 0,
-            "javascript": 0,
-            "robots": 0,
-            "sitemap": 0,
-            "same_host": 0,
-            "external": 0,
-        },
-        "notes": "",
-        "discovered_at": "",
     }
+
+
+def require_endpoint(data: dict[str, Any]) -> dict[str, Any]:
+    endpoint = data.get("endpoint")
+    if not isinstance(endpoint, dict):
+        raise RuntimeError(
+            "Field 'endpoint' pada endpoint.yaml tidak valid. "
+            "Struktur YAML harus menggunakan mapping 'endpoint:'."
+        )
+    return endpoint
 
 
 def normalize_endpoint(base_url: str, value: str) -> str | None:
@@ -461,8 +457,9 @@ def fetch(
 
 
 def inspect_document(data: dict[str, Any]) -> None:
-    target_url = str(data.get("target_url", "")).strip()
-    hostname = str(data.get("hostname", "")).strip()
+    endpoint = require_endpoint(data)
+    target_url = str(endpoint.get("target_url", "")).strip()
+    hostname = str(endpoint.get("hostname", "")).strip()
 
     if not target_url or not hostname:
         raise RuntimeError("Target URL / hostname tidak tersedia di endpoint.yaml.")
@@ -480,7 +477,7 @@ def inspect_document(data: dict[str, Any]) -> None:
     content_type = html_response.headers.get("Content-Type", "")
     html = html_response.text if "text/html" in content_type.lower() else ""
 
-    data["sources"] = {
+    endpoint["sources"] = {
         "html": bool(html),
         "robots_txt": False,
         "sitemap_xml": False,
@@ -500,7 +497,7 @@ def inspect_document(data: dict[str, Any]) -> None:
             hostname,
             endpoints,
         )
-        data["sources"]["javascript"] = js_count > 0
+        endpoint["sources"]["javascript"] = js_count > 0
     else:
         link_count = 0
         form_count = 0
@@ -510,7 +507,7 @@ def inspect_document(data: dict[str, Any]) -> None:
     robots_response, robots_error = fetch(session, robots_url)
 
     if robots_response is not None and robots_response.status_code < 500:
-        data["sources"]["robots_txt"] = True
+        endpoint["sources"]["robots_txt"] = True
         extract_text_endpoints(
             robots_response.text,
             robots_response.url,
@@ -523,7 +520,7 @@ def inspect_document(data: dict[str, Any]) -> None:
     sitemap_response, sitemap_error = fetch(session, sitemap_url)
 
     if sitemap_response is not None and sitemap_response.status_code < 500:
-        data["sources"]["sitemap_xml"] = True
+        endpoint["sources"]["sitemap_xml"] = True
         extract_text_endpoints(
             sitemap_response.text,
             sitemap_response.url,
@@ -541,8 +538,8 @@ def inspect_document(data: dict[str, Any]) -> None:
         )
     )
 
-    data["endpoints"] = endpoint_list
-    data["summary"] = {
+    endpoint["endpoints"] = endpoint_list
+    endpoint["summary"] = {
         "total": len(endpoint_list),
         "html_links": sum("HTML link" in e["sources"] for e in endpoint_list),
         "forms": sum("form action" in e["sources"] for e in endpoint_list),
@@ -564,9 +561,10 @@ def inspect_document(data: dict[str, Any]) -> None:
     if not html:
         notes.append("Target response bukan HTML atau HTML kosong; HTML discovery dilewati.")
 
-    data["notes"] = "; ".join(notes)
-    data["status"] = "in-progress"
-    data["discovered_at"] = now_iso()
+    endpoint["notes"] = "; ".join(notes)
+    endpoint["status"] = "in-progress"
+    endpoint["discovered_at"] = now_iso()
+    data["updated_at"] = now_iso()
 
     save_yaml(endpoint_file(), data)
 
@@ -574,9 +572,9 @@ def inspect_document(data: dict[str, Any]) -> None:
         phase="02-reconnaissance",
         item="02-006",
         action=(
-            f"Endpoint discovery recorded: {data['summary']['total']} endpoints "
-            f"(same-host={data['summary']['same_host']}, "
-            f"external={data['summary']['external']})"
+            f"Endpoint discovery recorded: {endpoint['summary']['total']} endpoints "
+            f"(same-host={endpoint['summary']['same_host']}, "
+            f"external={endpoint['summary']['external']})"
         ),
         status="in-progress",
     )
@@ -584,39 +582,36 @@ def inspect_document(data: dict[str, Any]) -> None:
 
 def validate(data: dict[str, Any]) -> tuple[bool, list[str]]:
     errors: list[str] = []
+    try:
+        endpoint = require_endpoint(data)
+    except RuntimeError as exc:
+        return False, [str(exc)]
 
-    if data.get("status") not in {"in-progress", "completed"}:
-        errors.append("Status harus in-progress atau completed.")
-
+    if endpoint.get("status") not in {"in-progress", "completed"}:
+        errors.append("endpoint.status harus in-progress atau completed.")
     if not data.get("project_id"):
         errors.append("project_id kosong.")
+    for field in ("application", "target_url", "hostname", "environment", "assessment_type", "scope_reference"):
+        if not str(endpoint.get(field, "")).strip():
+            errors.append(f"endpoint.{field} kosong.")
 
-    if not data.get("target_url"):
-        errors.append("target_url kosong.")
-
-    if not data.get("hostname"):
-        errors.append("hostname kosong.")
-
-    if not isinstance(data.get("endpoints"), list):
-        errors.append("endpoints harus berupa list.")
-
-    summary = data.get("summary")
+    if not isinstance(endpoint.get("endpoints"), list):
+        errors.append("endpoint.endpoints harus berupa list.")
+    summary = endpoint.get("summary")
     if not isinstance(summary, dict):
-        errors.append("summary tidak tersedia.")
+        errors.append("endpoint.summary tidak tersedia.")
     else:
         total = summary.get("total")
         if not isinstance(total, int):
-            errors.append("summary.total tidak valid.")
-        elif total != len(data.get("endpoints", [])):
-            errors.append("summary.total tidak sesuai jumlah endpoints.")
+            errors.append("endpoint.summary.total tidak valid.")
+        elif total != len(endpoint.get("endpoints", [])):
+            errors.append("endpoint.summary.total tidak sesuai jumlah endpoints.")
 
-    if data.get("status") == "completed":
-        if not data.get("discovered_at"):
-            errors.append("discovered_at kosong.")
-
-        sources = data.get("sources")
-        if not isinstance(sources, dict):
-            errors.append("sources tidak tersedia.")
+    if endpoint.get("status") == "completed":
+        if not endpoint.get("discovered_at"):
+            errors.append("endpoint.discovered_at kosong.")
+        if not isinstance(endpoint.get("sources"), dict):
+            errors.append("endpoint.sources tidak tersedia.")
 
     return not errors, errors
 
@@ -655,10 +650,10 @@ def command_inspect() -> int:
         print(f"[FAIL] Endpoint discovery gagal: {exc}")
         return 1
 
-    summary = data["summary"]
+    summary = require_endpoint(data)["summary"]
 
     print("[PASS] Endpoint Discovery berhasil.")
-    print(f"Target      : {data['target_url']}")
+    print(f"Target      : {require_endpoint(data)['target_url']}")
     print(f"Endpoints   : {summary['total']}")
     print(f"Same-host   : {summary['same_host']}")
     print(f"External    : {summary['external']}")
@@ -678,10 +673,11 @@ def command_list() -> int:
         return 1
 
     data = load_yaml(path)
-    endpoints = data.get("endpoints", [])
+    endpoint = require_endpoint(data)
+    endpoints = endpoint.get("endpoints", [])
 
     print(f"Project ID : {project_context().project_id}")
-    print(f"Status     : {data.get('status', '-')}")
+    print(f"Status     : {endpoint.get('status', '-')}")
     print(f"Endpoints  : {len(endpoints)}")
 
     if not endpoints:
@@ -733,8 +729,10 @@ def command_verify() -> int:
 
     data = load_yaml(path)
 
-    if data.get("status") != "in-progress":
-        if data.get("status") == "completed":
+    endpoint = require_endpoint(data)
+
+    if endpoint.get("status") != "in-progress":
+        if endpoint.get("status") == "completed":
             print("[PASS] Endpoint Discovery sudah completed.")
             return 0
         print("[FAIL] Endpoint Discovery belum diinspeksi.")
@@ -747,7 +745,8 @@ def command_verify() -> int:
             print(f"[FAIL] {error}")
         return 1
 
-    data["status"] = "completed"
+    endpoint["status"] = "completed"
+    data["updated_at"] = now_iso()
     save_yaml(path, data)
 
     record_activity(
@@ -772,7 +771,7 @@ def command_status() -> int:
 
     data = load_yaml(path)
     print(f"Project ID : {project_context().project_id}")
-    print(f"Status     : {data.get('status', 'unknown')}")
+    print(f"Status     : {require_endpoint(data).get('status', 'unknown')}")
     return 0
 
 
