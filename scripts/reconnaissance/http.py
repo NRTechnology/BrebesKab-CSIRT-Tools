@@ -128,7 +128,7 @@ def _empty_document(context: ProjectContext) -> dict[str, Any]:
         "schema_version": "1.0",
         "project_id": context.project_id,
         "updated_at": _now(),
-        "http_https": {
+        "http": {
             "status": "not-started",
             "application": "",
             "target_url": "",
@@ -249,7 +249,7 @@ def _build_from_technology(
     technology = technology_data["technology"]
     data = _empty_document(context)
 
-    data["http_https"].update(
+    data["http"].update(
         {
             "status": "not-started",
             "application": str(technology["application"]).strip(),
@@ -285,14 +285,14 @@ def _load_http(context: ProjectContext) -> dict[str, Any]:
             f"  File    : {data.get('project_id')!r}"
         )
 
-    document = data.get("http_https")
+    document = data.get("http")
     if not isinstance(document, dict):
         raise HTTPReconError(
-            "Field 'http_https' pada http.yaml harus berupa "
+            "Field 'http' pada http.yaml harus berupa "
             "mapping/object."
         )
 
-    defaults = _empty_document(context)["http_https"]
+    defaults = _empty_document(context)["http"]
 
     for key, value in defaults.items():
         if key not in document:
@@ -312,7 +312,7 @@ def _load_http(context: ProjectContext) -> dict[str, Any]:
             f"Gunakan: {', '.join(sorted(VALID_STATUSES))}"
         )
 
-    data["http_https"] = document
+    data["http"] = document
     return data
 
 
@@ -579,7 +579,7 @@ def inspect(
         context = require_active_project()
 
     data = _load_http(context)
-    document = data["http_https"]
+    document = data["http"]
 
     target_url = str(document.get("target_url", "")).strip()
 
@@ -764,7 +764,7 @@ def validate(
         context = require_active_project()
 
     data = _load_http(context)
-    document = data["http_https"]
+    document = data["http"]
     errors: list[str] = []
 
     required_fields = {
@@ -824,7 +824,7 @@ def verify(
         )
 
     data = _load_http(context)
-    data["http_https"]["status"] = "completed"
+    data["http"]["status"] = "completed"
 
     _save_http(context, data)
 
@@ -884,7 +884,7 @@ def print_summary(
         context = require_active_project()
 
     data = _load_http(context)
-    document = data["http_https"]
+    document = data["http"]
     http_data = document.get("http", {})
     https_data = document.get("https", {})
     comparison = document.get("comparison", {})
@@ -960,7 +960,7 @@ def print_full(
     print(f"PROJECT: {context.project_id}")
     print(f"FILE   : {http_file(context)}")
     print()
-    _print_value(data["http_https"])
+    _print_value(data["http"])
 
 
 def _print_value(value: Any, indent: int = 0) -> None:
@@ -1046,7 +1046,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         if command in ("inspect", "check"):
             data = inspect(context=context)
-            document = data["http_https"]
+            document = data["http"]
             http_data = document["http"]
             https_data = document["https"]
             comparison = document["comparison"]
@@ -1089,7 +1089,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"Project ID : {context.project_id}")
             print(
                 "Status     : "
-                f"{data['http_https'].get('status', '')}"
+                f"{data['http'].get('status', '')}"
             )
             return 0
 
