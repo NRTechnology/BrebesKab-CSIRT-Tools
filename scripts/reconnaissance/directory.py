@@ -1,42 +1,35 @@
 #!/usr/bin/env python3
 """
 BrebesKab-CSIRT-Tools
-Reconnaissance: Directory Discovery
+Reconnaissance - Directory Discovery
 
-Checklist:
-    2-006 Directory discovery
+Version: 1.1.1
+
+Checklist mapping:
+    02-006 - Directory discovery
 
 Purpose:
-    Discover web paths/directories on the authorized target using a controlled
-    ffuf wordlist scan. The module records candidates as reconnaissance data;
-    it does not treat a discovered path as a vulnerability.
+    Discover common web paths on the authorized target using ffuf.
+    A random non-existent URL baseline is collected before ffuf so that
+    custom 404 / SPA fallback responses can be recognized as possible
+    false positives.
 
-Safety:
-    - Uses the active project's target.yaml.
-    - Does not automatically scan discovered subdomains.
-    - Defaults to the primary in-scope target only.
-    - Uses a conservative rate limit.
-    - Does not perform destructive HTTP methods.
-    - Does not upload files or modify application data.
-    - Discovery results are evidence, not authorization.
-
-Commands:
-    init
-    discover
-    list
-    show
-    verify
-    status
-    remove
-    version
+Design:
+    - "init" reads the completed target reconnaissance document once.
+    - After "init", directory.yaml is the state file for this module.
+    - "discover" collects a random baseline and then runs ffuf.
+    - Results are retained as reconnaissance evidence.
+    - Baseline matches are classified as possible false positives.
+    - No credentials, cookies, or response bodies are stored.
+    - Discovery does not authorize newly discovered paths.
 """
 
 from __future__ import annotations
 
-import argparse
 import datetime as dt
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -44,12 +37,49 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
+# IMPORTANT:
+# This repository contains scripts/reconnaissance/http.py.
+# When this file is executed directly, Python puts that directory at
+# sys.path[0]. If urllib.request is imported before removing that path,
+# stdlib "http.client" can be shadowed by the local http.py.
+SCRIPT_DIR = Path(__file__).resolve().parent
+SCRIPTS_DIR = SCRIPT_DIR.parent
+
+for _entry in (str(SCRIPT_DIR), str(SCRIPTS_DIR)):
+    while _entry in sys.path:
+        sys.path.remove(_entry)
+
+# Keep the repository scripts directory available for context/activity imports.
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.append(str(SCRIPTS_DIR))
+
+# Safe to import stdlib modules that depend on stdlib "http" now.
+import urllib.error
+import urllib.request
+
 import yaml
 
+try:
+    from activity import ActivityError, record_activity
+except ImportError:
+    ActivityError = RuntimeError
 
-SCRIPT_VERSION = "1.0.0"
-SCHEMA_VERSION = "1.0"
+    def record_activity(*args: Any, **kwargs: Any) -> None:
+        return None
 
+
+try:
+    from context import ContextError, ProjectContext, require_active_project
+except ImportError:
+    ContextError = RuntimeError
+    ProjectContext = Any  # type: ignore[misc,assignment]
+
+    def require_active_project() -> Any:
+        raise RuntimeError("context.py tidak dapat di-import.")
+
+
+SCRIPT_VERSION = "1.1.1"
+SCHEMA_VERSION = "1.1"
 CHECKLIST_ID = "2-006"
 CHECKLIST_NAME = "Directory discovery"
 
@@ -87,257 +117,214 @@ DEFAULT_WORDLIST = [
     "vendor",
 ]
 
-DEFAULT_EXTENSIONS = [
-    "php",
-    "html",
-    "txt",
-    "json",
-    "xml",
-]
-
+DEFAULT_EXTENSIONS = ["php", "html", "txt", "json", "xml"]
 DEFAULT_RATE = 10
 DEFAULT_TIMEOUT = 10
 DEFAULT_THREADS = 5
 DEFAULT_MATCH_CODES = "200,204,301,302,307,308,401,403,405"
-DEFAULT_MAX_TIME = 0
 
-DISCOVERY_DIR = "directory"
-OUTPUT_FILE = "directory.yaml"
-
-
-def _bootstrap_import_path() -> None:
-    """
-    The repository contains reconnaissance/http.py. If scripts/reconnaissance
-    remains on sys.path while importing requests/yaml, Python may shadow the
-    stdlib http package. Remove the current script directory before importing
-    project-local modules.
-    """
-    script_dir = Path(__file__).resolve().parent
-    scripts_dir = script_dir.parent
-
-    for path in (str(script_dir), str(scripts_dir)):
-        while path in sys.path:
-            sys.path.remove(path)
+BASELINE_ATTEMPTS = 3
+BASELINE_PREFIX = ".brebes-csirt-baseline"
 
 
-_bootstrap_import_path()
-
-try:
-    from context import require_active_project
-except ImportError:
-    # Allows direct execution from the repository while keeping the same
-    # behavior as the other reconnaissance modules.
-    repo_root = Path(__file__).resolve().parents[2]
-    scripts_root = repo_root / "scripts"
-    for candidate in (repo_root, scripts_root):
-        if str(candidate) not in sys.path:
-            sys.path.insert(0, str(candidate))
-    from context import require_active_project
-
-try:
-    from activity import record_activity
-except ImportError:
-    record_activity = None
+class DirectoryError(RuntimeError):
+    """Raised when directory reconnaissance cannot be completed."""
 
 
 def now_iso() -> str:
     return dt.datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def project_context():
-    return require_active_project()
-
-
 def project_root() -> Path:
-    context = project_context()
+    context = require_active_project()
     return Path(context.project_path)
 
 
-def output_dir() -> Path:
-    return project_root() / "02-reconnaissance" / DISCOVERY_DIR
+def directory_dir() -> Path:
+    return project_root() / "02-reconnaissance" / "directory"
 
 
-def output_file() -> Path:
-    return output_dir() / OUTPUT_FILE
+def directory_file() -> Path:
+    return directory_dir() / "directory.yaml"
 
 
 def evidence_dir() -> Path:
-    return output_dir() / "evidence"
+    return directory_dir() / "evidence"
 
 
-def load_yaml(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        raise FileNotFoundError(f"File tidak ditemukan: {path}")
+def _load_yaml(path: Path, label: str) -> dict[str, Any]:
+    if not path.is_file():
+        raise DirectoryError(f"{label} tidak ditemukan: {path}")
 
-    with path.open("r", encoding="utf-8") as handle:
-        data = yaml.safe_load(handle) or {}
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = yaml.safe_load(handle)
+    except yaml.YAMLError as exc:
+        raise DirectoryError(f"YAML tidak valid: {path}\n{exc}") from exc
+    except OSError as exc:
+        raise DirectoryError(f"Gagal membaca {path}\n{exc}") from exc
+
+    if data is None:
+        data = {}
 
     if not isinstance(data, dict):
-        raise ValueError(f"Format YAML tidak valid: {path}")
+        raise DirectoryError(f"Format {path.name} harus berupa mapping/object.")
 
     return data
 
 
-def save_yaml(path: Path, data: dict[str, Any]) -> None:
+def _save_yaml(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    with path.open("w", encoding="utf-8") as handle:
-        yaml.safe_dump(
-            data,
-            handle,
-            allow_unicode=True,
-            sort_keys=False,
-            default_flow_style=False,
-        )
+    try:
+        with path.open("w", encoding="utf-8", newline="\n") as handle:
+            yaml.safe_dump(
+                data,
+                handle,
+                allow_unicode=True,
+                sort_keys=False,
+                default_flow_style=False,
+            )
+    except OSError as exc:
+        raise DirectoryError(f"Gagal menulis {path}\n{exc}") from exc
 
 
-def load_target() -> dict[str, Any]:
+def _load_target() -> dict[str, Any]:
     path = project_root() / "02-reconnaissance" / "target" / "target.yaml"
-    data = load_yaml(path)
+    data = _load_yaml(path, "Target reconnaissance")
 
     target = data.get("target")
     if not isinstance(target, dict):
-        raise ValueError("target.yaml tidak memiliki blok 'target'.")
-
-    if target.get("status") != "completed":
-        raise ValueError(
-            "Target belum berstatus completed. Jalankan target.py terlebih dahulu."
+        raise DirectoryError(
+            "Field 'target' pada target.yaml harus berupa mapping/object."
         )
 
-    target_url = str(target.get("target_url") or "").strip()
-    if not target_url:
-        raise ValueError("target.target_url tidak tersedia.")
+    if str(target.get("status", "")).strip().lower() != "completed":
+        raise DirectoryError(
+            "Target reconnaissance belum completed.\n"
+            "Jalankan terlebih dahulu:\n"
+            "  python scripts/reconnaissance/target.py verify"
+        )
 
+    target_url = str(target.get("target_url", "")).strip()
     parsed = urlparse(target_url)
+
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise ValueError(f"Target URL tidak valid: {target_url}")
+        raise DirectoryError(f"Target URL tidak valid: {target_url}")
 
     return {
-        "application": target.get("application", ""),
+        "application": str(target.get("application", "")).strip(),
         "target_url": target_url,
-        "hostname": target.get("hostname", parsed.hostname),
-        "scheme": parsed.scheme,
-        "port": str(target.get("port") or parsed.port or ("443" if parsed.scheme == "https" else "80")),
-        "environment": target.get("environment", ""),
-        "assessment_type": target.get("assessment_type", ""),
-        "scope_reference": target.get("scope_reference", ""),
+        "hostname": str(target.get("hostname") or parsed.hostname).strip(),
+        "scheme": str(target.get("scheme") or parsed.scheme).strip().lower(),
+        "port": str(
+            target.get("port")
+            or parsed.port
+            or ("443" if parsed.scheme == "https" else "80")
+        ),
+        "environment": str(target.get("environment", "")).strip(),
+        "assessment_type": str(target.get("assessment_type", "")).strip(),
+        "scope_reference": str(target.get("scope_reference", "")).strip(),
     }
 
 
-def normalize_base_url(url: str) -> str:
-    parsed = urlparse(url)
+def _normalize_base_url(target_url: str) -> str:
+    parsed = urlparse(target_url)
+
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise ValueError(f"URL target tidak valid: {url}")
+        raise DirectoryError(f"Target URL tidak valid: {target_url}")
 
-    # Directory discovery should operate from the target origin. A path
-    # supplied by target.yaml is retained only when it is not the root.
-    base = f"{parsed.scheme}://{parsed.netloc}"
-    path = parsed.path or "/"
-
-    if not path.endswith("/"):
-        path = path.rsplit("/", 1)[0] + "/"
-
-    if path == "//":
-        path = "/"
-
-    return urljoin(base + "/", path.lstrip("/"))
+    return f"{parsed.scheme}://{parsed.netloc}/"
 
 
-def resolve_ffuf() -> str | None:
-    candidates = []
-
+def _resolve_ffuf() -> str | None:
     configured = os.environ.get("BREBES_FFUF")
     if configured:
-        candidates.append(Path(configured))
+        path = Path(configured)
+        if path.is_file():
+            return str(path)
 
-    repo_root = Path(__file__).resolve().parents[2]
-    candidates.extend(
-        [
-            repo_root / "tools" / "ffuf" / "ffuf.exe",
-            repo_root / "tools" / "ffuf" / "ffuf",
-        ]
-    )
+    repository_root = SCRIPT_DIR.parent.parent
 
-    which = shutil.which("ffuf")
-    if which:
-        candidates.append(Path(which))
+    candidates = [
+        repository_root / "tools" / "ffuf" / "ffuf.exe",
+        repository_root / "tools" / "ffuf" / "ffuf",
+    ]
+
+    system_ffuf = shutil.which("ffuf")
+    if system_ffuf:
+        candidates.append(Path(system_ffuf))
 
     for candidate in candidates:
-        if candidate.exists() and candidate.is_file():
+        if candidate.is_file():
             return str(candidate)
 
     return None
 
 
-def write_default_wordlist() -> Path:
+def _write_default_wordlist() -> Path:
     path = evidence_dir() / "directory-wordlist.txt"
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    with path.open("w", encoding="utf-8") as handle:
-        for item in DEFAULT_WORDLIST:
-            handle.write(item + "\n")
+    path.write_text(
+        "\n".join(DEFAULT_WORDLIST) + "\n",
+        encoding="utf-8",
+    )
 
     return path
 
 
-def load_existing() -> dict[str, Any]:
-    path = output_file()
-    if not path.exists():
-        raise FileNotFoundError(
-            "directory.yaml belum ada. Jalankan 'init' terlebih dahulu."
+def _load_directory() -> dict[str, Any]:
+    data = _load_yaml(directory_file(), "Directory reconnaissance")
+
+    if data.get("project_id") != project_root().name:
+        raise DirectoryError(
+            "Project ID pada directory.yaml tidak sesuai active project.\n"
+            f"  Context : {project_root().name}\n"
+            f"  File    : {data.get('project_id')!r}"
         )
 
-    data = load_yaml(path)
+    if str(data.get("schema_version", "")).strip() != SCHEMA_VERSION:
+        raise DirectoryError(
+            f"Schema directory.yaml tidak didukung: "
+            f"{data.get('schema_version')!r}"
+        )
 
-    if data.get("schema_version") != SCHEMA_VERSION:
-        raise ValueError(
-            f"Schema directory.yaml tidak didukung: {data.get('schema_version')}"
+    directory = data.get("directory")
+
+    if not isinstance(directory, dict):
+        raise DirectoryError(
+            "Field 'directory' pada directory.yaml harus berupa mapping/object."
         )
 
     return data
 
 
-def record(
-    item: str,
-    action: str,
-    status: str,
-) -> None:
-    if record_activity is None:
-        return
-
+def _record_activity(item: str, action: str, status: str) -> None:
     try:
         record_activity(
             phase="02-reconnaissance",
             item=item,
             action=action,
             status=status,
+            context=require_active_project(),
         )
     except TypeError:
-        # Compatibility with activity.py implementations that use positional
-        # or slightly different optional arguments.
         try:
             record_activity(
-                "02-reconnaissance",
-                item,
-                action,
-                status,
+                phase="02-reconnaissance",
+                item=item,
+                action=action,
+                status=status,
             )
         except Exception:
             pass
-    except Exception:
+    except (ActivityError, Exception):
         pass
 
 
-def init() -> int:
-    target = load_target()
-
-    out_dir = output_dir()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    evidence_dir().mkdir(parents=True, exist_ok=True)
-
-    wordlist = write_default_wordlist()
-
-    data = {
+def _empty_document(target: dict[str, Any]) -> dict[str, Any]:
+    return {
         "schema_version": SCHEMA_VERSION,
         "project_id": project_root().name,
         "updated_at": now_iso(),
@@ -347,23 +334,39 @@ def init() -> int:
             "checklist_name": CHECKLIST_NAME,
             "application": target["application"],
             "target_url": target["target_url"],
-            "base_url": normalize_base_url(target["target_url"]),
+            "base_url": _normalize_base_url(target["target_url"]),
             "hostname": target["hostname"],
+            "scheme": target["scheme"],
+            "port": target["port"],
             "environment": target["environment"],
             "assessment_type": target["assessment_type"],
             "scope_reference": target["scope_reference"],
             "method": "ffuf",
-            "wordlist": str(wordlist.relative_to(project_root())),
+            "wordlist": "",
             "rate_limit": DEFAULT_RATE,
-            "timeout": DEFAULT_TIMEOUT,
             "threads": DEFAULT_THREADS,
+            "timeout": DEFAULT_TIMEOUT,
             "match_codes": DEFAULT_MATCH_CODES,
             "extensions": DEFAULT_EXTENSIONS,
             "follow_redirects": False,
+            "baseline": {
+                "status": "not-tested",
+                "url": "",
+                "path": "",
+                "status_code": None,
+                "content_length": None,
+                "content_type": "",
+                "words": None,
+                "lines": None,
+                "attempts": [],
+                "classification": "",
+                "notes": "",
+            },
             "results": [],
             "summary": {
                 "total": 0,
                 "interesting": 0,
+                "possible_false_positive": 0,
                 "by_status": {},
             },
             "evidence": [],
@@ -372,9 +375,23 @@ def init() -> int:
         },
     }
 
-    save_yaml(output_file(), data)
 
-    record(
+def init() -> int:
+    target = _load_target()
+
+    directory_dir().mkdir(parents=True, exist_ok=True)
+    evidence_dir().mkdir(parents=True, exist_ok=True)
+
+    wordlist = _write_default_wordlist()
+
+    data = _empty_document(target)
+    data["directory"]["wordlist"] = str(
+        wordlist.relative_to(project_root())
+    )
+
+    _save_yaml(directory_file(), data)
+
+    _record_activity(
         CHECKLIST_ID,
         "Directory discovery initialized",
         "in-progress",
@@ -383,35 +400,181 @@ def init() -> int:
     print("[PASS] Directory Discovery berhasil diinisialisasi.")
     print(f"PROJECT: {project_root().name}")
     print(f"TARGET : {target['target_url']}")
-    print(f"FILE   : {output_file()}")
+    print(f"FILE   : {directory_file()}")
 
     return 0
 
 
-def parse_ffuf_results(
-    ffuf_json: Path,
-    base_url: str,
-) -> list[dict[str, Any]]:
-    raw = load_yaml(ffuf_json) if ffuf_json.suffix in {".yaml", ".yml"} else None
+def _random_baseline_path() -> str:
+    return f"{BASELINE_PREFIX}-{secrets.token_hex(8)}"
 
-    if raw is not None:
-        payload = raw
-    else:
+
+def _response_signature(value: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        value.get("status_code"),
+        value.get("content_length"),
+        value.get("content_type"),
+        value.get("words"),
+        value.get("lines"),
+    )
+
+
+def _request_baseline(base_url: str, timeout: int) -> dict[str, Any]:
+    attempts: list[dict[str, Any]] = []
+
+    for _ in range(BASELINE_ATTEMPTS):
+        path = "/" + _random_baseline_path()
+        url = urljoin(base_url, path.lstrip("/"))
+
+        request = urllib.request.Request(
+            url,
+            method="GET",
+            headers={
+                "User-Agent": (
+                    f"BrebesKab-CSIRT-Tools/{SCRIPT_VERSION} "
+                    "Directory-Recon"
+                ),
+                "Accept": "*/*",
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = response.read()
+                text = body.decode("utf-8", errors="replace")
+
+                attempts.append(
+                    {
+                        "path": path,
+                        "url": url,
+                        "status_code": int(response.status),
+                        "content_length": len(body),
+                        "content_type": str(
+                            response.headers.get("Content-Type") or ""
+                        ),
+                        "words": len(text.split()),
+                        "lines": len(text.splitlines()),
+                        "error": "",
+                    }
+                )
+
+        except urllib.error.HTTPError as exc:
+            try:
+                body = exc.read()
+            except Exception:
+                body = b""
+
+            headers = exc.headers
+            content_type = str(
+                headers.get("Content-Type") if headers else ""
+            )
+            text = body.decode("utf-8", errors="replace")
+
+            attempts.append(
+                {
+                    "path": path,
+                    "url": url,
+                    "status_code": int(exc.code),
+                    "content_length": len(body),
+                    "content_type": content_type,
+                    "words": len(text.split()),
+                    "lines": len(text.splitlines()),
+                    "error": "",
+                }
+            )
+
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            attempts.append(
+                {
+                    "path": path,
+                    "url": url,
+                    "status_code": None,
+                    "content_length": None,
+                    "content_type": "",
+                    "words": None,
+                    "lines": None,
+                    "error": str(exc),
+                }
+            )
+
+    successful = [
+        item for item in attempts
+        if item.get("status_code") is not None
+    ]
+
+    if not successful:
+        return {
+            "status": "failed",
+            "url": "",
+            "path": "",
+            "status_code": None,
+            "content_length": None,
+            "content_type": "",
+            "words": None,
+            "lines": None,
+            "attempts": attempts,
+            "classification": "baseline-unavailable",
+            "notes": (
+                "Tidak ada response baseline dari random non-existent "
+                "path."
+            ),
+        }
+
+    first = successful[0]
+    signature = _response_signature(first)
+    stable = all(
+        _response_signature(item) == signature
+        for item in successful[1:]
+    )
+
+    return {
+        "status": "completed",
+        "url": first["url"],
+        "path": first["path"],
+        "status_code": first["status_code"],
+        "content_length": first["content_length"],
+        "content_type": first["content_type"],
+        "words": first["words"],
+        "lines": first["lines"],
+        "attempts": attempts,
+        "classification": (
+            "stable-baseline" if stable else "variable-baseline"
+        ),
+        "notes": (
+            "Random non-existent paths menghasilkan response signature "
+            "yang konsisten."
+            if stable
+            else
+            "Response random non-existent paths tidak sepenuhnya "
+            "konsisten; baseline pertama digunakan sebagai pembanding."
+        ),
+    }
+
+
+def _parse_ffuf_results(
+    ffuf_json: Path,
+    baseline: dict[str, Any],
+) -> list[dict[str, Any]]:
+    try:
         with ffuf_json.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DirectoryError(
+            f"Gagal membaca output ffuf: {ffuf_json}\n{exc}"
+        ) from exc
 
-    results = payload.get("results", [])
-    if not isinstance(results, list):
-        return []
+    raw_results = payload.get("results", [])
 
-    parsed_results: list[dict[str, Any]] = []
+    if not isinstance(raw_results, list):
+        raise DirectoryError("Field 'results' pada output ffuf bukan list.")
 
-    for result in results:
-        if not isinstance(result, dict):
+    results: list[dict[str, Any]] = []
+
+    for raw in raw_results:
+        if not isinstance(raw, dict):
             continue
 
-        url = str(result.get("url") or "").strip()
-        input_data = result.get("input") or {}
+        input_data = raw.get("input") or {}
         word = ""
 
         if isinstance(input_data, dict):
@@ -421,35 +584,77 @@ def parse_ffuf_results(
                 or ""
             ).strip()
 
-        status = result.get("status")
-        length = result.get("length")
-        words = result.get("words")
-        lines = result.get("lines")
-        content_type = result.get("content-type") or result.get("content_type")
+        url = str(raw.get("url") or "").strip()
 
         if not url and word:
-            url = urljoin(base_url, word)
+            url = word
 
         if not url:
             continue
 
-        parsed_results.append(
-            {
-                "path": urlparse(url).path or "/",
-                "url": url,
-                "status_code": int(status) if status is not None else None,
-                "content_length": int(length) if length is not None else None,
-                "words": int(words) if words is not None else None,
-                "lines": int(lines) if lines is not None else None,
-                "content_type": content_type,
-                "redirect_location": result.get("redirectlocation")
-                or result.get("redirect_location"),
-                "method": "GET",
-                "source": "ffuf",
-            }
+        item = {
+            "path": urlparse(url).path or "/",
+            "url": url,
+            "method": "GET",
+            "status_code": (
+                int(raw["status"])
+                if raw.get("status") is not None
+                else None
+            ),
+            "content_length": (
+                int(raw["length"])
+                if raw.get("length") is not None
+                else None
+            ),
+            "content_type": (
+                raw.get("content-type")
+                or raw.get("content_type")
+                or ""
+            ),
+            "words": (
+                int(raw["words"])
+                if raw.get("words") is not None
+                else None
+            ),
+            "lines": (
+                int(raw["lines"])
+                if raw.get("lines") is not None
+                else None
+            ),
+            "redirect_location": (
+                raw.get("redirectlocation")
+                or raw.get("redirect_location")
+                or ""
+            ),
+            "source": "ffuf",
+        }
+
+        if baseline.get("status") == "completed":
+            item["baseline_match"] = (
+                _response_signature(item)
+                == _response_signature(baseline)
+            )
+        else:
+            item["baseline_match"] = False
+
+        item["classification"] = (
+            "possible-false-positive"
+            if item["baseline_match"]
+            else "discovery-candidate"
         )
 
-    return parsed_results
+        item["notes"] = (
+            "Response signature sama dengan random non-existent path "
+            "baseline. Retained as evidence; perlu verifikasi manual."
+            if item["baseline_match"]
+            else
+            "Response signature berbeda dari random non-existent "
+            "path baseline."
+        )
+
+        results.append(item)
+
+    return results
 
 
 def discover(
@@ -460,51 +665,101 @@ def discover(
     extensions: list[str] | None = None,
     match_codes: str = DEFAULT_MATCH_CODES,
 ) -> int:
-    data = load_existing()
+    data = _load_directory()
     directory = data["directory"]
 
-    target_url = directory["target_url"]
-    base_url = directory["base_url"]
+    ffuf = _resolve_ffuf()
 
-    ffuf = resolve_ffuf()
     if not ffuf:
         print("[FAIL] ffuf tidak ditemukan.")
-        print("       Install ffuf atau letakkan executable di tools/ffuf/ffuf.exe.")
+        print(
+            "       Install ffuf atau letakkan executable "
+            "di tools/ffuf/ffuf.exe."
+        )
         return 1
 
-    if rate < 1:
-        print("[FAIL] Rate harus >= 1 request/second.")
+    if rate < 1 or threads < 1 or timeout < 1:
+        print("[FAIL] Rate, threads, dan timeout harus >= 1.")
         return 1
 
-    if threads < 1:
-        print("[FAIL] Threads harus >= 1.")
-        return 1
+    base_url = str(directory.get("base_url", "")).strip()
 
-    if timeout < 1:
-        print("[FAIL] Timeout harus >= 1 detik.")
-        return 1
+    if not base_url:
+        raise DirectoryError("base_url belum tersedia pada directory.yaml.")
 
     if wordlist:
         wordlist_path = Path(wordlist).expanduser().resolve()
     else:
-        configured = directory.get("wordlist")
-        if configured:
-            wordlist_path = project_root() / str(configured)
-        else:
-            wordlist_path = write_default_wordlist()
+        configured = str(directory.get("wordlist") or "").strip()
+        wordlist_path = (
+            project_root() / configured
+            if configured
+            else _write_default_wordlist()
+        )
 
-    if not wordlist_path.exists():
+    if not wordlist_path.is_file():
         print(f"[FAIL] Wordlist tidak ditemukan: {wordlist_path}")
         return 1
 
-    ext_list = extensions if extensions is not None else list(
-        directory.get("extensions") or DEFAULT_EXTENSIONS
+    extension_list = (
+        list(extensions)
+        if extensions is not None
+        else list(directory.get("extensions") or DEFAULT_EXTENSIONS)
     )
 
-    output_json = evidence_dir() / "ffuf-directory.json"
+    evidence_dir().mkdir(parents=True, exist_ok=True)
+
+    baseline_file = evidence_dir() / "baseline.json"
+    ffuf_file = evidence_dir() / "ffuf-directory.json"
     stderr_file = evidence_dir() / "ffuf-directory.stderr.log"
 
-    evidence_dir().mkdir(parents=True, exist_ok=True)
+    print("[INFO] Menjalankan 2-006: Directory discovery")
+    print(f"[INFO] Target   : {base_url}")
+    print("[INFO] Baseline : random non-existent path")
+    print(f"[INFO] Wordlist : {wordlist_path}")
+    print(f"[INFO] Rate     : {rate} req/s")
+    print(f"[INFO] Threads  : {threads}")
+    print(f"[INFO] Timeout  : {timeout}s")
+    print(f"[INFO] Matcher  : {match_codes}")
+
+    _record_activity(
+        CHECKLIST_ID,
+        f"Directory discovery started: {base_url}",
+        "in-progress",
+    )
+
+    print()
+    print("[INFO] Mengambil baseline custom 404/error response...")
+
+    baseline = _request_baseline(base_url, timeout)
+
+    baseline_file.write_text(
+        json.dumps(
+            baseline,
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    if baseline["status"] == "completed":
+        print(
+            "[PASS] Baseline berhasil: "
+            f"HTTP {baseline.get('status_code')}, "
+            f"Length {baseline.get('content_length')}, "
+            f"Words {baseline.get('words')}, "
+            f"Lines {baseline.get('lines')}"
+        )
+        print(
+            "[INFO] Baseline classification: "
+            f"{baseline.get('classification')}"
+        )
+    else:
+        print("[WARN] Baseline gagal diperoleh.")
+        print(
+            "[WARN] Discovery tetap dilanjutkan, tetapi "
+            "false-positive comparison tidak tersedia."
+        )
 
     command = [
         ffuf,
@@ -515,7 +770,7 @@ def discover(
         "-of",
         "json",
         "-o",
-        str(output_json),
+        str(ffuf_file),
         "-t",
         str(threads),
         "-rate",
@@ -527,22 +782,16 @@ def discover(
         "-s",
     ]
 
-    if ext_list:
-        command.extend(["-e", ",".join("." + ext.lstrip(".") for ext in ext_list)])
-
-    print("[INFO] Menjalankan 2-006: Directory discovery")
-    print(f"[INFO] Target   : {base_url}")
-    print(f"[INFO] Wordlist : {wordlist_path}")
-    print(f"[INFO] Rate     : {rate} req/s")
-    print(f"[INFO] Threads  : {threads}")
-    print(f"[INFO] Timeout  : {timeout}s")
-    print(f"[INFO] Matcher  : {match_codes}")
-
-    record(
-        CHECKLIST_ID,
-        f"Directory discovery started: {base_url}",
-        "in-progress",
-    )
+    if extension_list:
+        command.extend(
+            [
+                "-e",
+                ",".join(
+                    "." + value.lstrip(".")
+                    for value in extension_list
+                ),
+            ]
+        )
 
     try:
         completed = subprocess.run(
@@ -557,12 +806,15 @@ def discover(
         print(f"[FAIL] Gagal menjalankan ffuf: {exc}")
         directory["status"] = "failed"
         directory["updated_at"] = now_iso()
-        save_yaml(output_file(), data)
-        record(
+        directory["baseline"] = baseline
+        _save_yaml(directory_file(), data)
+
+        _record_activity(
             CHECKLIST_ID,
             f"Directory discovery failed: {exc}",
             "failed",
         )
+
         return 1
 
     stderr_file.write_text(
@@ -571,108 +823,187 @@ def discover(
     )
 
     if completed.returncode != 0:
-        # ffuf may return non-zero when the scan itself cannot be completed.
-        print(f"[FAIL] ffuf gagal dengan exit code {completed.returncode}.")
-        if completed.stderr:
+        print(
+            "[FAIL] ffuf gagal dengan exit code "
+            f"{completed.returncode}."
+        )
+
+        if completed.stderr.strip():
             print(completed.stderr.strip())
 
         directory["status"] = "failed"
         directory["updated_at"] = now_iso()
+        directory["baseline"] = baseline
         directory["evidence"] = [
-            str(output_json.relative_to(project_root())),
+            str(baseline_file.relative_to(project_root())),
             str(stderr_file.relative_to(project_root())),
         ]
-        save_yaml(output_file(), data)
 
-        record(
+        _save_yaml(directory_file(), data)
+
+        _record_activity(
             CHECKLIST_ID,
-            f"Directory discovery failed: ffuf exit code {completed.returncode}",
+            (
+                "Directory discovery failed: "
+                f"ffuf exit code {completed.returncode}"
+            ),
             "failed",
         )
+
         return 1
 
-    if not output_json.exists():
+    if not ffuf_file.is_file():
         print("[FAIL] ffuf selesai tetapi output JSON tidak ditemukan.")
+
         directory["status"] = "failed"
         directory["updated_at"] = now_iso()
-        save_yaml(output_file(), data)
-        record(
+        directory["baseline"] = baseline
+
+        _save_yaml(directory_file(), data)
+
+        _record_activity(
             CHECKLIST_ID,
             "Directory discovery failed: ffuf output missing",
             "failed",
         )
+
         return 1
 
     try:
-        results = parse_ffuf_results(output_json, base_url)
-    except Exception as exc:
-        print(f"[FAIL] Gagal membaca hasil ffuf: {exc}")
+        results = _parse_ffuf_results(
+            ffuf_file,
+            baseline,
+        )
+    except DirectoryError as exc:
+        print(f"[FAIL] {exc}")
+
         directory["status"] = "failed"
         directory["updated_at"] = now_iso()
-        save_yaml(output_file(), data)
-        record(
+        directory["baseline"] = baseline
+
+        _save_yaml(directory_file(), data)
+
+        _record_activity(
             CHECKLIST_ID,
-            f"Directory discovery failed: invalid ffuf result ({exc})",
+            f"Directory discovery failed: {exc}",
             "failed",
         )
+
         return 1
 
     by_status: dict[str, int] = {}
     interesting = 0
+    possible_false_positive = 0
 
     for item in results:
-        code = item.get("status_code")
-        key = str(code) if code is not None else "unknown"
+        status_code = item.get("status_code")
+        key = str(status_code) if status_code is not None else "unknown"
+
         by_status[key] = by_status.get(key, 0) + 1
 
-        if code in {200, 204, 301, 302, 307, 308, 401, 403, 405}:
+        if status_code in {
+            200,
+            204,
+            301,
+            302,
+            307,
+            308,
+            401,
+            403,
+            405,
+        }:
             interesting += 1
+
+        if item.get("baseline_match"):
+            possible_false_positive += 1
 
     directory["status"] = "completed"
     directory["updated_at"] = now_iso()
+    directory["baseline"] = baseline
     directory["results"] = results
+
     directory["summary"] = {
         "total": len(results),
         "interesting": interesting,
+        "possible_false_positive": possible_false_positive,
         "by_status": by_status,
     }
+
     directory["evidence"] = [
-        str(output_json.relative_to(project_root())),
+        str(baseline_file.relative_to(project_root())),
+        str(ffuf_file.relative_to(project_root())),
         str(stderr_file.relative_to(project_root())),
     ]
-    directory["wordlist"] = str(wordlist_path.relative_to(project_root()))
+
+    directory["wordlist"] = str(
+        wordlist_path.relative_to(project_root())
+    )
     directory["rate_limit"] = rate
     directory["threads"] = threads
     directory["timeout"] = timeout
     directory["match_codes"] = match_codes
-    directory["extensions"] = ext_list
+    directory["extensions"] = extension_list
     directory["discovered_at"] = now_iso()
 
-    save_yaml(output_file(), data)
+    _save_yaml(directory_file(), data)
 
     print()
-    print(f"TARGET       : {base_url}")
-    print(f"FOUND        : {len(results)}")
-    print(f"INTERESTING  : {interesting}")
-    print(f"STATUS       : completed")
-    print(f"FILE         : {output_file()}")
+    print(f"TARGET          : {base_url}")
+    print(f"FOUND           : {len(results)}")
+    print(f"INTERESTING     : {interesting}")
+    print(f"POSSIBLE FP     : {possible_false_positive}")
+    print("STATUS          : completed")
+    print(f"FILE            : {directory_file()}")
+
+    if baseline.get("status") == "completed":
+        print(
+            "BASELINE        : "
+            f"HTTP {baseline.get('status_code')} / "
+            f"Length {baseline.get('content_length')}"
+        )
+    else:
+        print("BASELINE        : unavailable")
 
     if results:
         print()
         print("DISCOVERED:")
+
         for item in results:
+            status_code = item.get("status_code", "-")
             print(
-                f"  [{item.get('status_code', '-'):>3}] "
+                f"  [{status_code:>3}] "
                 f"{item.get('path', '/')}"
             )
+
+            if item.get("baseline_match"):
+                print(
+                    "       Classification: "
+                    "possible-false-positive"
+                )
+                print(
+                    "       WARNING       : "
+                    "response signature matches baseline"
+                )
+            else:
+                print(
+                    "       Classification: "
+                    "discovery-candidate"
+                )
     else:
         print()
         print("[INFO] Tidak ada path yang match dengan filter.")
-        print("       Ini bukan bukti bahwa target tidak memiliki directory/path lain.")
+        print(
+            "       Ini bukan bukti bahwa target tidak memiliki "
+            "directory/path lain."
+        )
 
-    record(
+    _record_activity(
         CHECKLIST_ID,
-        f"Directory discovery completed: {len(results)} result(s)",
+        (
+            "Directory discovery completed: "
+            f"{len(results)} result(s), "
+            f"{possible_false_positive} possible false-positive(s)"
+        ),
         "completed",
     )
 
@@ -680,15 +1011,38 @@ def discover(
 
 
 def list_results() -> int:
-    data = load_existing()
+    data = _load_directory()
     directory = data["directory"]
+
+    summary = directory.get("summary") or {}
+    baseline = directory.get("baseline") or {}
 
     print(f"PROJECT: {data.get('project_id', project_root().name)}")
     print(f"TARGET  : {directory.get('base_url', '-')}")
     print(f"STATUS  : {directory.get('status', '-')}")
-    print(f"TOTAL   : {directory.get('summary', {}).get('total', 0)}")
+    print(f"TOTAL   : {summary.get('total', 0)}")
+    print()
 
-    results = directory.get("results", [])
+    print("BASELINE:")
+    print(f"  Status        : {baseline.get('status', '-')}")
+    print(f"  URL           : {baseline.get('url', '-')}")
+    print(f"  Status Code   : {baseline.get('status_code', '-')}")
+    print(
+        f"  Content-Length: "
+        f"{baseline.get('content_length', '-')}"
+    )
+    print(
+        f"  Content-Type  : "
+        f"{baseline.get('content_type', '-')}"
+    )
+    print(f"  Words         : {baseline.get('words', '-')}")
+    print(f"  Lines         : {baseline.get('lines', '-')}")
+    print(
+        f"  Classification: "
+        f"{baseline.get('classification', '-')}"
+    )
+
+    results = directory.get("results") or []
 
     if not results:
         print()
@@ -696,6 +1050,7 @@ def list_results() -> int:
         return 0
 
     print()
+
     for item in results:
         print(
             f"[{item.get('status_code', '-'):>3}] "
@@ -703,69 +1058,125 @@ def list_results() -> int:
         )
         print(f"  URL           : {item.get('url', '-')}")
         print(f"  Method        : {item.get('method', '-')}")
-        print(f"  Content-Length: {item.get('content_length', '-')}")
-        print(f"  Content-Type  : {item.get('content_type', '-')}")
+        print(
+            f"  Content-Length: "
+            f"{item.get('content_length', '-')}"
+        )
+        print(
+            f"  Content-Type  : "
+            f"{item.get('content_type', '-')}"
+        )
+        print(f"  Words         : {item.get('words', '-')}")
+        print(f"  Lines         : {item.get('lines', '-')}")
+        print(
+            f"  Classification: "
+            f"{item.get('classification', '-')}"
+        )
+        print(
+            f"  Baseline Match: "
+            f"{item.get('baseline_match', False)}"
+        )
+
         if item.get("redirect_location"):
-            print(f"  Redirect      : {item['redirect_location']}")
+            print(
+                f"  Redirect      : "
+                f"{item.get('redirect_location')}"
+            )
+
         print(f"  Source        : {item.get('source', '-')}")
+        print(f"  Notes         : {item.get('notes', '-')}")
         print()
 
     return 0
 
 
 def show() -> int:
-    data = load_existing()
-    directory = data["directory"]
-
-    print(yaml.safe_dump(data, allow_unicode=True, sort_keys=False))
+    data = _load_directory()
+    print(yaml.safe_dump(
+        data,
+        allow_unicode=True,
+        sort_keys=False,
+        default_flow_style=False,
+    ))
     return 0
 
 
 def verify() -> int:
-    data = load_existing()
+    data = _load_directory()
     directory = data["directory"]
+    baseline = directory.get("baseline") or {}
+    summary = directory.get("summary") or {}
 
     errors: list[str] = []
 
     if directory.get("checklist_id") != CHECKLIST_ID:
         errors.append("Checklist ID tidak sesuai.")
 
-    if not directory.get("target_url"):
+    if not str(directory.get("target_url", "")).strip():
         errors.append("Target URL kosong.")
 
-    if not directory.get("base_url"):
+    if not str(directory.get("base_url", "")).strip():
         errors.append("Base URL kosong.")
 
     if directory.get("method") != "ffuf":
         errors.append("Method discovery tidak sesuai.")
 
-    status = directory.get("status")
-
-    if status != "completed":
+    if directory.get("status") != "completed":
         errors.append(
-            f"Directory discovery belum completed (status={status})."
+            "Directory discovery belum completed "
+            f"(status={directory.get('status')})."
         )
 
-    summary = directory.get("summary") or {}
-    if not isinstance(summary.get("total"), int):
-        errors.append("Summary total tidak valid.")
+    if baseline.get("status") != "completed":
+        errors.append(
+            "Baseline random non-existent path belum berhasil."
+        )
 
-    results = directory.get("results")
-    if not isinstance(results, list):
-        errors.append("Results bukan list.")
+    if not isinstance(directory.get("results"), list):
+        errors.append("results harus berupa list.")
+
+    if not isinstance(summary.get("total"), int):
+        errors.append("summary.total tidak valid.")
+
+    if not isinstance(
+        summary.get("possible_false_positive"),
+        int,
+    ):
+        errors.append(
+            "summary.possible_false_positive tidak valid."
+        )
 
     if errors:
         print("[FAIL] Directory Discovery verification gagal.")
+
         for error in errors:
             print(f"  - {error}")
+
         return 1
 
     print("[PASS] Directory Discovery memenuhi validasi.")
-    print(f"[PASS] Checklist: {CHECKLIST_ID} {CHECKLIST_NAME}")
-    print(f"[PASS] Status   : {status}")
-    print(f"[PASS] Results  : {summary.get('total', 0)}")
+    print(
+        f"[PASS] Checklist : "
+        f"{CHECKLIST_ID} {CHECKLIST_NAME}"
+    )
+    print(
+        f"[PASS] Status    : "
+        f"{directory.get('status')}"
+    )
+    print(
+        f"[PASS] Baseline  : "
+        f"{baseline.get('classification')}"
+    )
+    print(
+        f"[PASS] Results   : "
+        f"{summary.get('total', 0)}"
+    )
+    print(
+        f"[PASS] Possible FP: "
+        f"{summary.get('possible_false_positive', 0)}"
+    )
 
-    record(
+    _record_activity(
         CHECKLIST_ID,
         "Directory discovery verified",
         "completed",
@@ -775,49 +1186,64 @@ def verify() -> int:
 
 
 def status() -> int:
-    data = load_existing()
+    data = _load_directory()
     directory = data["directory"]
     summary = directory.get("summary") or {}
+    baseline = directory.get("baseline") or {}
 
-    print(f"PROJECT : {data.get('project_id', project_root().name)}")
-    print(f"Target  : {directory.get('target_url', '-')}")
-    print(f"Status  : {directory.get('status', '-')}")
-    print(f"Method  : {directory.get('method', '-')}")
-    print(f"Results : {summary.get('total', 0)}")
-    print(f"Rate    : {directory.get('rate_limit', '-')}")
-    print(f"Threads : {directory.get('threads', '-')}")
-    print(f"Timeout : {directory.get('timeout', '-')}")
-    print(f"Wordlist: {directory.get('wordlist', '-')}")
-    print(f"File    : {output_file()}")
+    print(f"Project ID : {data.get('project_id', project_root().name)}")
+    print(f"Status     : {directory.get('status', '-')}")
+    print(f"Target     : {directory.get('target_url', '-')}")
+    print(f"Method     : {directory.get('method', '-')}")
+    print(f"Results    : {summary.get('total', 0)}")
+    print(
+        f"Possible FP: "
+        f"{summary.get('possible_false_positive', 0)}"
+    )
+    print(f"Baseline   : {baseline.get('status', '-')}")
+    print(f"Rate       : {directory.get('rate_limit', '-')}")
+    print(f"Threads    : {directory.get('threads', '-')}")
+    print(f"Timeout    : {directory.get('timeout', '-')}")
+    print(f"Wordlist   : {directory.get('wordlist', '-')}")
+    print(f"File       : {directory_file()}")
 
     by_status = summary.get("by_status") or {}
+
     if by_status:
         print()
         print("HTTP Status:")
-        for code in sorted(by_status, key=lambda value: (value == "unknown", value)):
-            print(f"  {code}: {by_status[code]}")
+
+        for code in sorted(
+            by_status,
+            key=lambda value: (value == "unknown", value),
+        ):
+            print(
+                f"  {code}: "
+                f"{by_status[code]}"
+            )
 
     return 0
 
 
 def remove() -> int:
-    path = output_file()
+    path = directory_file()
 
     if not path.exists():
-        print("[INFO] directory.yaml tidak ditemukan.")
+        print("[INFO] Directory Discovery belum ada.")
         return 0
 
     confirm = input(
-        "Hapus seluruh data Directory Discovery untuk project aktif? [y/N]: "
+        "Hapus seluruh data Directory Discovery "
+        "untuk project aktif? [y/N]: "
     ).strip().lower()
 
     if confirm != "y":
         print("[INFO] Dibatalkan.")
         return 0
 
-    shutil.rmtree(output_dir())
+    shutil.rmtree(directory_dir())
 
-    record(
+    _record_activity(
         CHECKLIST_ID,
         "Directory discovery data removed",
         "completed",
@@ -828,117 +1254,182 @@ def remove() -> int:
 
 
 def version() -> int:
-    print(f"BrebesKab-CSIRT-Tools directory.py v{SCRIPT_VERSION}")
-    print(f"Checklist: {CHECKLIST_ID} {CHECKLIST_NAME}")
+    print(
+        f"BrebesKab-CSIRT-Tools "
+        f"directory.py v{SCRIPT_VERSION}"
+    )
+    print(
+        f"Checklist: "
+        f"{CHECKLIST_ID} {CHECKLIST_NAME}"
+    )
     print(f"Schema   : {SCHEMA_VERSION}")
     print("Method   : ffuf")
+    print("Baseline : random non-existent path")
     return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="BrebesKab-CSIRT-Tools - Directory Discovery"
+def print_help() -> None:
+    print(
+        "BrebesKab-CSIRT-Tools - Directory Discovery\n"
+        "\n"
+        "Usage:\n"
+        "  python scripts/reconnaissance/directory.py init\n"
+        "  python scripts/reconnaissance/directory.py discover\n"
+        "  python scripts/reconnaissance/directory.py list\n"
+        "  python scripts/reconnaissance/directory.py show\n"
+        "  python scripts/reconnaissance/directory.py verify\n"
+        "  python scripts/reconnaissance/directory.py status\n"
+        "  python scripts/reconnaissance/directory.py remove\n"
+        "  python scripts/reconnaissance/directory.py version\n"
+        "\n"
+        "discover options:\n"
+        "  --wordlist PATH\n"
+        "  --rate N\n"
+        "  --threads N\n"
+        "  --timeout N\n"
+        "  --extensions EXT [EXT ...]\n"
+        "  --match-codes CODES\n"
+        "\n"
+        "The active project is resolved automatically through context.py.\n"
+        "Directory discovery uses ffuf and a random non-existent URL\n"
+        "baseline to identify possible false-positive responses.\n"
     )
 
-    sub = parser.add_subparsers(dest="command")
 
-    sub.add_parser("init", help="Initialize Directory Discovery")
-    sub.add_parser("list", help="List discovered paths")
-    sub.add_parser("show", help="Show directory.yaml")
-    sub.add_parser("verify", help="Validate Directory Discovery")
-    sub.add_parser("status", help="Show Directory Discovery status")
-    sub.add_parser("remove", help="Remove Directory Discovery data")
-    sub.add_parser("version", help="Show version")
-
-    discover_parser = sub.add_parser(
-        "discover",
-        help="Run controlled directory discovery with ffuf",
-    )
-    discover_parser.add_argument(
-        "--wordlist",
-        help="Path to a custom ffuf wordlist",
-    )
-    discover_parser.add_argument(
-        "--rate",
-        type=int,
-        default=DEFAULT_RATE,
-        help=f"Maximum requests/second (default: {DEFAULT_RATE})",
-    )
-    discover_parser.add_argument(
-        "--threads",
-        type=int,
-        default=DEFAULT_THREADS,
-        help=f"Concurrent ffuf threads (default: {DEFAULT_THREADS})",
-    )
-    discover_parser.add_argument(
-        "--timeout",
-        type=int,
-        default=DEFAULT_TIMEOUT,
-        help=f"HTTP timeout in seconds (default: {DEFAULT_TIMEOUT})",
-    )
-    discover_parser.add_argument(
-        "--extensions",
-        nargs="*",
-        default=None,
-        help="Extensions without or with dot, e.g. php html json",
-    )
-    discover_parser.add_argument(
-        "--match-codes",
-        default=DEFAULT_MATCH_CODES,
-        help=f"HTTP status matcher (default: {DEFAULT_MATCH_CODES})",
+def main(argv: list[str] | None = None) -> int:
+    args = list(
+        sys.argv[1:]
+        if argv is None
+        else argv
     )
 
-    return parser
+    if not args or args[0] in {"-h", "--help", "help"}:
+        print_help()
+        return 0
 
+    command = args[0].lower()
 
-def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
+    if command == "version":
+        return version()
 
-    if not args.command:
-        parser.print_help()
-        return 1
+    if command == "init":
+        return init()
 
-    try:
-        if args.command == "init":
-            return init()
-        if args.command == "discover":
+    if command == "list":
+        return list_results()
+
+    if command == "show":
+        return show()
+
+    if command == "verify":
+        return verify()
+
+    if command == "status":
+        return status()
+
+    if command == "remove":
+        return remove()
+
+    if command == "discover":
+        options = args[1:]
+        wordlist: str | None = None
+        rate = DEFAULT_RATE
+        threads = DEFAULT_THREADS
+        timeout = DEFAULT_TIMEOUT
+        extensions: list[str] | None = None
+        match_codes = DEFAULT_MATCH_CODES
+
+        index = 0
+
+        while index < len(options):
+            option = options[index]
+
+            if option == "--wordlist":
+                index += 1
+                if index >= len(options):
+                    print("[FAIL] --wordlist membutuhkan PATH.")
+                    return 2
+                wordlist = options[index]
+
+            elif option == "--rate":
+                index += 1
+                if index >= len(options):
+                    print("[FAIL] --rate membutuhkan nilai.")
+                    return 2
+                try:
+                    rate = int(options[index])
+                except ValueError:
+                    print("[FAIL] --rate harus berupa angka.")
+                    return 2
+
+            elif option == "--threads":
+                index += 1
+                if index >= len(options):
+                    print("[FAIL] --threads membutuhkan nilai.")
+                    return 2
+                try:
+                    threads = int(options[index])
+                except ValueError:
+                    print("[FAIL] --threads harus berupa angka.")
+                    return 2
+
+            elif option == "--timeout":
+                index += 1
+                if index >= len(options):
+                    print("[FAIL] --timeout membutuhkan nilai.")
+                    return 2
+                try:
+                    timeout = int(options[index])
+                except ValueError:
+                    print("[FAIL] --timeout harus berupa angka.")
+                    return 2
+
+            elif option == "--match-codes":
+                index += 1
+                if index >= len(options):
+                    print("[FAIL] --match-codes membutuhkan nilai.")
+                    return 2
+                match_codes = options[index]
+
+            elif option == "--extensions":
+                extensions = []
+                index += 1
+
+                while index < len(options):
+                    value = options[index]
+                    if value.startswith("--"):
+                        index -= 1
+                        break
+                    extensions.append(value)
+                    index += 1
+
+            else:
+                print(f"[FAIL] Option tidak dikenal: {option}")
+                return 2
+
+            index += 1
+
+        try:
             return discover(
-                wordlist=args.wordlist,
-                rate=args.rate,
-                threads=args.threads,
-                timeout=args.timeout,
-                extensions=args.extensions,
-                match_codes=args.match_codes,
+                wordlist=wordlist,
+                rate=rate,
+                threads=threads,
+                timeout=timeout,
+                extensions=extensions,
+                match_codes=match_codes,
             )
-        if args.command == "list":
-            return list_results()
-        if args.command == "show":
-            return show()
-        if args.command == "verify":
-            return verify()
-        if args.command == "status":
-            return status()
-        if args.command == "remove":
-            return remove()
-        if args.command == "version":
-            return version()
+        except (
+            ContextError,
+            DirectoryError,
+            ActivityError,
+        ) as exc:
+            print(f"[FAIL] {exc}")
+            return 1
 
-    except KeyboardInterrupt:
-        print()
-        print("[WARN] Directory discovery dihentikan oleh operator.")
-        record(
-            CHECKLIST_ID,
-            "Directory discovery interrupted by operator",
-            "failed",
-        )
-        return 130
-    except Exception as exc:
-        print(f"[FAIL] {exc}")
-        return 1
-
-    parser.print_help()
-    return 1
+    print(f"[ERROR] Command tidak dikenal: {args[0]}")
+    print()
+    print_help()
+    return 2
 
 
 if __name__ == "__main__":
