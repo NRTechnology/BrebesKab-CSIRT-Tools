@@ -3,7 +3,7 @@
 BrebesKab-CSIRT-Tools
 Reconnaissance - Technology Identification
 
-Version: 1.0.0
+Version: 1.0.1
 
 Checklist mapping:
     02-004 - Technology Identification
@@ -35,21 +35,32 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urljoin, urlparse
 
-import requests
-import yaml
-
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SCRIPTS_DIR = SCRIPT_DIR.parent
 
+# This file lives beside reconnaissance/http.py. When a Python script is
+# executed directly, its own directory is placed at sys.path[0]. That would
+# make the local http.py shadow Python's standard-library http package.
+# Clean sys.path BEFORE importing third-party modules such as requests.
+script_dir_string = str(SCRIPT_DIR)
+
+sys.path[:] = [
+    entry for entry in sys.path
+    if entry != script_dir_string
+]
+
 if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
+    sys.path.append(str(SCRIPTS_DIR))
+
+import requests
+import yaml
 
 from activity import ActivityError, record_activity
 from context import ContextError, ProjectContext, require_active_project
 
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.0.1"
 
 RECON_DIR_NAME = "02-reconnaissance"
 NETWORK_DIR_NAME = "network"
@@ -580,6 +591,16 @@ def _identify_from_headers(
             if version_match:
                 name = version_match.group("name")
                 version = version_match.group("version")
+
+                # Keep one canonical technology entry when the Server
+                # header already maps to a normalized technology family.
+                # Example: Apache/2.4.65 -> Apache HTTP Server.
+                normalized_name = HEADER_TECHNOLOGY_RULES.get(
+                    "server", {}
+                ).get(name.lower())
+
+                if normalized_name:
+                    continue
 
                 _add_technology(
                     technologies,
