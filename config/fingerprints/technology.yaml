@@ -1,0 +1,151 @@
+schema_version: '1.0'
+technology:
+  web_servers:
+    - id: apache
+      name: Apache HTTP Server
+      category: web_server
+      signatures:
+        headers:
+          server:
+            - pattern: 'Apache'
+              confidence: high
+        body: []
+        cookies: []
+        paths: []
+        scripts: []
+      version_detection:
+        headers:
+          server:
+            - pattern: 'Apache/(?P<version>[0-9]+(?:\.[0-9]+){1,2})'
+              capture: version
+
+  runtimes:
+    - id: php
+      name: PHP
+      category: runtime
+      signatures:
+        headers:
+          x-powered-by:
+            - pattern: 'PHP(?:/(?P<version>[0-9]+(?:\.[0-9]+){1,2}))?'
+              confidence: high
+        body: []
+        cookies: []
+        paths: []
+        scripts: []
+      version_detection:
+        headers:
+          x-powered-by:
+            - pattern: 'PHP/(?P<version>[0-9]+(?:\.[0-9]+){1,2})'
+              capture: version
+
+  frameworks:
+    - id: codeigniter4
+      name: CodeIgniter
+      category: framework
+      family: CodeIgniter 4
+      signatures:
+        headers: {}
+        cookies:
+          - pattern: '^ci_session$'
+            confidence: high
+        body: []
+        paths:
+          - pattern: '/vendor/codeigniter4/framework/'
+            confidence: high
+          - pattern: '/vendor/codeigniter4/framework/system/Boot.php'
+            confidence: high
+          - pattern: '/vendor/codeigniter4/framework/system/CodeIgniter.php'
+            confidence: high
+        scripts: []
+      version_detection:
+        headers: {}
+        cookies: []
+        body: []
+        paths: []
+
+    - id: laravel
+      name: Laravel
+      category: framework
+      family: Laravel
+      signatures:
+        headers: {}
+        cookies:
+          - pattern: '^laravel_session$'
+            confidence: high
+          - pattern: '^XSRF-TOKEN$'
+            confidence: medium
+        body: []
+        paths:
+          - pattern: '/vendor/laravel/'
+            confidence: high
+        scripts: []
+      version_detection:
+        headers: {}
+        cookies: []
+        body: []
+        paths: []
+
+  cms: []
+
+  frontend_frameworks: []
+
+  javascript_libraries:
+    - id: jquery
+      name: jQuery
+      category: javascript_library
+      signatures:
+        headers: {}
+        cookies: []
+        body:
+          - pattern: 'jquery(?:[-.]|[./])'
+            confidence: medium
+        paths:
+          - pattern: '/jquery'
+            confidence: low
+        scripts:
+          - pattern: 'jquery(?:[-.]|[./])'
+            confidence: high
+      version_detection:
+        headers: {}
+        cookies: []
+        body:
+          - pattern: 'jquery(?:[-.]|[./])(?P<version>[0-9]+(?:\.[0-9]+){1,2})'
+            capture: version
+        paths:
+          - pattern: 'jquery[-.]?(?P<version>[0-9]+(?:\.[0-9]+){1,2})'
+            capture: version
+        scripts:
+          - pattern: 'jquery[-.]?(?P<version>[0-9]+(?:\.[0-9]+){1,2})'
+            capture: version
+
+    - id: bootstrap
+      name: Bootstrap
+      category: javascript_library
+      signatures:
+        headers: {}
+        cookies: []
+        body:
+          - pattern: 'bootstrap'
+            confidence: medium
+        paths:
+          - pattern: '/bootstrap'
+            confidence: low
+        scripts:
+          - pattern: 'bootstrap(?:[-.]|[./])'
+            confidence: high
+      version_detection:
+        headers: {}
+        cookies: []
+        body:
+          - pattern: 'bootstrap(?:[-.]|[./])(?P<version>[0-9]+(?:\.[0-9]+){1,2})'
+            capture: version
+        paths:
+          - pattern: 'bootstrap[-.]?(?P<version>[0-9]+(?:\.[0-9]+){1,2})'
+            capture: version
+        scripts:
+          - pattern: 'bootstrap[-.]?(?P<version>[0-9]+(?:\.[0-9]+){1,2})'
+            capture: version
+
+  databases: []
+
+  other: []

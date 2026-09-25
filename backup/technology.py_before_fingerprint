@@ -60,15 +60,13 @@ from activity import ActivityError, record_activity
 from context import ContextError, ProjectContext, require_active_project
 
 
-SCRIPT_VERSION = "1.2.2"
+SCRIPT_VERSION = "1.0.1"
 
 RECON_DIR_NAME = "02-reconnaissance"
 NETWORK_DIR_NAME = "network"
 NETWORK_FILE_NAME = "network.yaml"
 TECHNOLOGY_DIR_NAME = "technology"
 TECHNOLOGY_FILE_NAME = "technology.yaml"
-FINGERPRINT_DIR_NAME = "fingerprints"
-FINGERPRINT_FILE_NAME = "technology.yaml"
 
 VALID_STATUSES = {
     "not-started",
@@ -194,464 +192,6 @@ def technology_file(context: ProjectContext) -> Path:
     return technology_dir(context) / TECHNOLOGY_FILE_NAME
 
 
-def fingerprint_file(context: ProjectContext) -> Path:
-    """Return the shared technology fingerprint database path."""
-    repository_root = SCRIPTS_DIR.parent
-    return repository_root / "config" / FINGERPRINT_DIR_NAME / FINGERPRINT_FILE_NAME
-
-
-def _load_fingerprints(context: ProjectContext) -> dict[str, Any]:
-    path = fingerprint_file(context)
-
-    if not path.is_file():
-        raise TechnologyError(
-            f"Technology fingerprint database tidak ditemukan: {path}"
-        )
-
-    data = _load_yaml(path, "Technology fingerprint database")
-
-    if str(data.get("schema_version", "")).strip() != "1.0":
-        raise TechnologyError(
-            f"schema_version fingerprint tidak didukung: "
-            f"{data.get('schema_version')!r}"
-        )
-
-    technology = data.get("technology")
-    if not isinstance(technology, dict):
-        raise TechnologyError(
-            "Field 'technology' pada fingerprint database harus berupa "
-            "mapping/object."
-        )
-
-    return data
-
-
-def _iter_fingerprint_definitions(
-    fingerprint_data: dict[str, Any],
-) -> list[dict[str, Any]]:
-    technology = fingerprint_data.get("technology", {})
-    definitions: list[dict[str, Any]] = []
-
-    categories = (
-        "web_servers",
-        "runtimes",
-        "frameworks",
-        "cms",
-        "frontend_frameworks",
-        "javascript_libraries",
-        "databases",
-        "other",
-    )
-
-    for category in categories:
-        entries = technology.get(category, [])
-        if not isinstance(entries, list):
-            continue
-
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-
-            item = dict(entry)
-            item["_category"] = category
-            definitions.append(item)
-
-    return definitions
-
-
-def _compile_pattern(pattern: Any) -> re.Pattern[str] | None:
-    if not isinstance(pattern, str) or not pattern.strip():
-        return None
-
-    try:
-        return re.compile(pattern, re.I)
-    except re.error:
-        return None
-
-
-def _normalize_evidence_text(value: str, limit: int = 500) -> str:
-    """Normalize observed evidence without storing large HTML fragments."""
-    value = re.sub(r"\s+", " ", str(value)).strip()
-    if limit > 0:
-        return value[:limit]
-    return value
-
-
-def _body_context(value: str, match: re.Match[str], radius: int = 90) -> str:
-    """Return a short HTML context around the matched signature."""
-    text = _normalize_evidence_text(value, limit=0)
-    normalized_match = re.search(match.re.pattern, text, re.I)
-
-    if normalized_match is None:
-        return _normalize_evidence_text(match.group(0), 240)
-
-    start = max(0, normalized_match.start() - radius)
-    end = min(len(text), normalized_match.end() + radius)
-    context = text[start:end]
-
-    if start > 0:
-        context = "... " + context
-    if end < len(text):
-        context += " ..."
-
-    return context[:320]
-
-
-def _match_signature_list(
-    values: list[str],
-    signatures: Any,
-    evidence_type: str = "pattern",
-) -> list[dict[str, Any]]:
-    matches: list[dict[str, Any]] = []
-
-    if not isinstance(signatures, list):
-        return matches
-
-    for signature in signatures:
-        if not isinstance(signature, dict):
-            continue
-
-        pattern = signature.get("pattern")
-        regex = _compile_pattern(pattern)
-        if regex is None:
-            continue
-
-        confidence = str(
-            signature.get("confidence", "medium")
-        ).strip().lower() or "medium"
-
-        for value in values:
-            value = str(value)
-            match = regex.search(value)
-            if not match:
-                continue
-
-            if evidence_type == "body":
-                observed_value = _body_context(value, match)
-            else:
-                observed_value = _normalize_evidence_text(value, 500)
-
-            matches.append(
-                {
-                    "type": evidence_type,
-                    "pattern": str(pattern),
-                    "value": observed_value,
-                    "match": _normalize_evidence_text(match.group(0), 300),
-                    "confidence": confidence,
-                }
-            )
-
-    return matches
-
-
-def _match_header_signatures(
-    headers: dict[str, str],
-    signatures: Any,
-) -> list[dict[str, Any]]:
-    """Match fingerprint signatures against observed HTTP headers."""
-    matches: list[dict[str, Any]] = []
-
-    if not isinstance(signatures, dict):
-        return matches
-
-    for header_name, rules in signatures.items():
-        normalized_name = str(header_name).lower()
-        actual = next(
-            (
-                value
-                for key, value in headers.items()
-                if str(key).lower() == normalized_name
-            ),
-            None,
-        )
-        if actual is None:
-            continue
-
-        matches.extend(
-            {
-                **match,
-                "type": "header",
-                "header": normalized_name,
-            }
-            for match in _match_signature_list([actual], rules, "header")
-        )
-
-    return matches
-
-
-def _version_from_signatures(
-    value: str,
-    rules: Any,
-) -> str:
-    if not isinstance(rules, list):
-        return ""
-
-    for signature in rules:
-        if not isinstance(signature, dict):
-            continue
-
-        regex = _compile_pattern(signature.get("pattern"))
-        capture = str(signature.get("capture", "version")).strip()
-
-        if regex is None:
-            continue
-
-        match = regex.search(value)
-        if match and capture in match.groupdict():
-            return str(match.group(capture)).strip()
-
-    return ""
-
-
-def _fingerprint_technologies(
-    *,
-    fingerprint_data: dict[str, Any],
-    headers: dict[str, str],
-    cookie_names: list[str],
-    html: str,
-    html_paths: list[str],
-    script_sources: list[str],
-) -> list[dict[str, Any]]:
-    """
-    Match technology signatures against already-collected HTTP evidence.
-
-    This function does not make additional network requests. It only analyzes
-    evidence already obtained from the target response.
-    """
-    definitions = _iter_fingerprint_definitions(fingerprint_data)
-    results: list[dict[str, Any]] = []
-
-    body_values = [html] if html else []
-    path_values = list(html_paths)
-    script_values = list(script_sources)
-    cookie_values = list(cookie_names)
-
-    for definition in definitions:
-        name = str(definition.get("name", "")).strip()
-        if not name:
-            continue
-
-        category = str(
-            definition.get("category", definition.get("_category", "other"))
-        ).strip()
-
-        signatures = definition.get("signatures", {})
-        evidence: list[dict[str, Any]] = []
-
-        evidence.extend(
-            _match_header_signatures(
-                headers,
-                signatures.get("headers") if isinstance(signatures, dict) else {},
-            )
-        )
-
-        if isinstance(signatures, dict):
-            evidence.extend(
-                _match_signature_list(
-                    cookie_values,
-                    signatures.get("cookies", []),
-                    "cookie",
-                )
-            )
-            evidence.extend(
-                _match_signature_list(
-                    body_values,
-                    signatures.get("body", []),
-                    "body",
-                )
-            )
-            evidence.extend(
-                _match_signature_list(
-                    path_values,
-                    signatures.get("paths", []),
-                    "path",
-                )
-            )
-            evidence.extend(
-                _match_signature_list(
-                    script_values,
-                    signatures.get("scripts", []),
-                    "script",
-                )
-            )
-
-        if not evidence:
-            continue
-
-        confidence_order = {"low": 1, "medium": 2, "high": 3}
-        confidence = max(
-            (
-                str(item.get("confidence", "medium")).lower()
-                for item in evidence
-            ),
-            key=lambda item: confidence_order.get(item, 2),
-        )
-
-        version = ""
-        version_rules = definition.get("version_detection", {})
-        if isinstance(version_rules, dict):
-            for header_name, rules in version_rules.get("headers", {}).items():
-                actual = next(
-                    (
-                        value
-                        for key, value in headers.items()
-                        if str(key).lower() == str(header_name).lower()
-                    ),
-                    "",
-                )
-                if actual:
-                    version = _version_from_signatures(actual, rules)
-                    if version:
-                        break
-
-            if not version:
-                for value in script_values:
-                    version = _version_from_signatures(
-                        value,
-                        version_rules.get("scripts", []),
-                    )
-                    if version:
-                        break
-
-            if not version:
-                for value in body_values:
-                    version = _version_from_signatures(
-                        value,
-                        version_rules.get("body", []),
-                    )
-                    if version:
-                        break
-
-            if not version:
-                for value in cookie_values:
-                    version = _version_from_signatures(
-                        value,
-                        version_rules.get("cookies", []),
-                    )
-                    if version:
-                        break
-
-            if not version:
-                for value in path_values:
-                    version = _version_from_signatures(
-                        value,
-                        version_rules.get("paths", []),
-                    )
-                    if version:
-                        break
-
-        sources: list[str] = []
-        for item in evidence:
-            evidence_type = str(item.get("type", "signature")).strip()
-            observed_value = str(item.get("value", "")).strip()
-
-            if evidence_type == "header":
-                header_name = str(item.get("header", "")).strip()
-                source = (
-                    f"HTTP header: {header_name} = {observed_value}"
-                    if header_name
-                    else f"HTTP header: {observed_value}"
-                )
-            elif evidence_type == "cookie":
-                source = f"Cookie: {observed_value}"
-            elif evidence_type == "script":
-                source = f"Script source: {observed_value}"
-            elif evidence_type == "body":
-                matched = str(item.get("match", "")).strip()
-                source = (
-                    f"HTML content: match {matched}"
-                    if matched
-                    else "HTML content"
-                )
-            elif evidence_type == "path":
-                source = f"HTML path: {observed_value}"
-            else:
-                source = observed_value or evidence_type
-
-            if source and source not in sources:
-                sources.append(source)
-
-        results.append(
-            {
-                "id": str(definition.get("id", "")).strip(),
-                "name": name,
-                "category": category,
-                "version": version or "unknown",
-                "confidence": confidence,
-                "sources": sources,
-                "evidence": evidence,
-            }
-        )
-
-    return results
-
-
-def _merge_fingerprint_results(
-    technologies: list[dict[str, Any]],
-    fingerprint_results: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Build the canonical technology list from fingerprint results.
-
-    Fingerprint results are authoritative for normalized technology fields.
-    Legacy detections are retained only when no fingerprint definition
-    matched the same technology.
-    """
-    legacy_by_name = {
-        str(item.get("name", "")).strip().lower(): item
-        for item in technologies
-        if str(item.get("name", "")).strip()
-    }
-
-    normalized: list[dict[str, Any]] = []
-    fingerprint_names: set[str] = set()
-
-    for result in fingerprint_results:
-        name = str(result.get("name", "")).strip()
-        if not name:
-            continue
-
-        key = name.lower()
-        fingerprint_names.add(key)
-        legacy = legacy_by_name.get(key, {})
-
-        item = {
-            "name": name,
-            "category": result.get("category", "other"),
-            "version": result.get("version", "unknown"),
-            "confidence": result.get("confidence", "medium"),
-            "sources": list(result.get("sources", [])),
-        }
-
-        detail = str(legacy.get("detail", "")).strip()
-        if detail:
-            item["detail"] = detail
-
-        normalized.append(item)
-
-    # Keep legacy-only detections for compatibility with existing rules.
-    for item in technologies:
-        name = str(item.get("name", "")).strip()
-        if not name or name.lower() in fingerprint_names:
-            continue
-
-        normalized.append(
-            {
-                "name": name,
-                "category": item.get("category", "other"),
-                "version": item.get("version", "unknown"),
-                "confidence": item.get("confidence", "medium"),
-                "sources": list(item.get("sources", [])),
-                **(
-                    {"detail": item.get("detail", "")}
-                    if item.get("detail")
-                    else {}
-                ),
-            }
-        )
-
-    return normalized
-
-
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
@@ -683,9 +223,7 @@ def _empty_document(context: ProjectContext) -> dict[str, Any]:
                 "response_time_ms": None,
             },
             "technologies": [],
-            "fingerprints": [],
             "html_clues": [],
-            "html_paths": [],
             "script_sources": [],
             "meta_generator": "",
             "notes": "",
@@ -965,44 +503,6 @@ def _safe_cookie_names(
     return _unique_strings(names)
 
 
-def _extract_html_paths(
-    html: str,
-    base_url: str,
-) -> list[str]:
-    """Extract URL paths from common HTML URL-bearing attributes."""
-    if not html:
-        return []
-
-    pattern = re.compile(
-        r"""(?:href|src|action)\s*=\s*["']([^"']+)""",
-        re.I,
-    )
-
-    result: list[str] = []
-
-    for raw_value in pattern.findall(html):
-        raw_value = raw_value.strip()
-
-        if not raw_value:
-            continue
-
-        absolute = urljoin(base_url, raw_value)
-        parsed = urlparse(absolute)
-
-        if parsed.scheme not in {"http", "https"}:
-            continue
-
-        safe_value = parsed.path or "/"
-
-        if parsed.query:
-            safe_value += "?" + parsed.query
-
-        if safe_value not in result:
-            result.append(safe_value)
-
-    return result[:200]
-
-
 def _extract_script_sources(
     html: str,
     base_url: str,
@@ -1161,7 +661,6 @@ def identify(
 
     data = _load_technology(context)
     technology = data["technology"]
-    fingerprint_data = _load_fingerprints(context)
 
     target_url = str(technology.get("target_url", "")).strip()
 
@@ -1237,7 +736,6 @@ def identify(
         html = content.decode("utf-8", errors="replace")
 
     html_clues = _extract_html_clues(html)
-    html_paths = _extract_html_paths(html, final_url)
     script_sources = _extract_script_sources(html, final_url)
     meta_generator = _extract_meta_generator(html)
 
@@ -1275,20 +773,6 @@ def identify(
             detail=meta_generator,
         )
 
-    fingerprint_results = _fingerprint_technologies(
-        fingerprint_data=fingerprint_data,
-        headers=safe_headers,
-        cookie_names=cookie_names,
-        html=html,
-        html_paths=html_paths,
-        script_sources=script_sources,
-    )
-
-    technologies = _merge_fingerprint_results(
-        technologies,
-        fingerprint_results,
-    )
-
     technologies.sort(
         key=lambda item: item.get("name", "").lower()
     )
@@ -1306,9 +790,7 @@ def identify(
     }
 
     technology["technologies"] = technologies
-    technology["fingerprints"] = fingerprint_results
     technology["html_clues"] = html_clues
-    technology["html_paths"] = html_paths
     technology["script_sources"] = script_sources
     technology["meta_generator"] = meta_generator
     technology["identified_at"] = _now()
@@ -1388,14 +870,8 @@ def validate(
     if not isinstance(technology.get("technologies"), list):
         errors.append("technologies harus berupa list.")
 
-    if not isinstance(technology.get("fingerprints"), list):
-        errors.append("fingerprints harus berupa list.")
-
     if not isinstance(technology.get("html_clues"), list):
         errors.append("html_clues harus berupa list.")
-
-    if not isinstance(technology.get("html_paths"), list):
-        errors.append("html_paths harus berupa list.")
 
     if not isinstance(technology.get("script_sources"), list):
         errors.append("script_sources harus berupa list.")
@@ -1625,7 +1101,6 @@ def print_help() -> None:
         "\n"
         "init      Read completed network.yaml and create technology.yaml.\n"
         "identify  Perform passive/basic HTTP technology identification.\n"
-        "          Uses config/fingerprints/technology.yaml signatures.\n"
         "list      Show a concise technology summary.\n"
         "show      Show the complete technology reconnaissance document.\n"
         "verify    Validate the technology reconnaissance and mark completed.\n"
