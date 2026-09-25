@@ -4,8 +4,8 @@ BrebesKab-CSIRT-Tools
 Reconnaissance - Recon Summary
 
 Phase : 02 Reconnaissance
-Item  : 02-007 Recon Summary
-Version: 1.0.0
+Item  : Recon Summary
+Version: 1.1.0
 
 Purpose:
     Consolidate the completed reconnaissance results into one summary
@@ -59,7 +59,7 @@ from activity import record_activity
 from context import require_active_project
 
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 RECON_DIR_NAME = "02-reconnaissance"
 SUMMARY_DIR_NAME = "summary"
@@ -71,23 +71,31 @@ RECON_DOCUMENTS = {
     "network": ("network", "network.yaml"),
     "technology": ("technology", "technology.yaml"),
     "http": ("http", "http.yaml"),
+    "subdomain": ("subdomain", "subdomain.yaml"),
     "endpoint": ("endpoint", "endpoint.yaml"),
+    "directory": ("directory", "directory.yaml"),
+    "api": ("api", "api.yaml"),
+    "attack": ("attack", "attack.yaml"),
 }
 
 VALID_STATUSES = {
     "not-started",
     "in-progress",
+    "partial",
     "completed",
+    "skipped",
+    "failed",
+    "blocked",
 }
 
-REQUIRED_MODULES = (
-    "target",
-    "dns",
-    "network",
-    "technology",
-    "http",
-    "endpoint",
-)
+# Lifecycle policy used by generate():
+#   completed   -> include
+#   partial     -> ask: include or skip
+#   skipped     -> skip automatically
+#   not-started -> generation is prohibited
+#   in-progress -> ask: generate and skip / cancel
+#   failed      -> ask: generate and skip / cancel
+#   blocked     -> ask: generate and skip / cancel
 
 
 def now_iso() -> str:
@@ -311,6 +319,7 @@ def technology_names(technology: dict[str, Any]) -> list[str]:
 def build_summary(
     documents: dict[str, dict[str, Any]],
     statuses: dict[str, str],
+    included_modules: set[str],
 ) -> dict[str, Any]:
     ctx = project_context()
 
@@ -321,23 +330,25 @@ def build_summary(
     http = get_module_payload("http", documents["http"])
     endpoint = get_module_payload("endpoint", documents["endpoint"])
 
-    endpoint_counts = count_endpoint_types(endpoint)
+    endpoint_counts = count_endpoint_types(endpoint) if "endpoint" in included_modules else {
+        "total": 0,
+        "same_host": 0,
+        "external": 0,
+    }
 
-    http_data = http.get("http")
-    https_data = http.get("https")
-    comparison = http.get("comparison")
+    http_data = http.get("http") if "http" in included_modules else {}
+    https_data = http.get("https") if "http" in included_modules else {}
+    comparison = http.get("comparison") if "http" in included_modules else {}
 
     if not isinstance(http_data, dict):
         http_data = {}
-
     if not isinstance(https_data, dict):
         https_data = {}
-
     if not isinstance(comparison, dict):
         comparison = {}
 
-    ipv4 = dns.get("ipv4")
-    ipv6 = dns.get("ipv6")
+    ipv4 = dns.get("ipv4") if "dns" in included_modules else []
+    ipv6 = dns.get("ipv6") if "dns" in included_modules else []
 
     if isinstance(ipv4, list):
         ipv4_list = [str(value) for value in ipv4 if str(value).strip()]
@@ -353,140 +364,261 @@ def build_summary(
     else:
         ipv6_list = []
 
-    return {
-        "schema_version": "1.0",
+    def payload(name: str) -> dict[str, Any]:
+        return get_module_payload(name, documents[name]) if name in included_modules else {}
+
+    summary = {
+        "schema_version": "1.1",
         "project_id": ctx.project_id,
         "status": "in-progress",
         "application": str(
-            target.get("application")
-            or technology.get("application")
-            or ""
+            target.get("application") or technology.get("application") or ""
         ).strip(),
         "target_url": str(
-            target.get("target_url")
-            or technology.get("target_url")
-            or ""
+            target.get("target_url") or technology.get("target_url") or ""
         ).strip(),
         "hostname": str(
-            target.get("hostname")
-            or technology.get("hostname")
-            or ""
+            target.get("hostname") or technology.get("hostname") or ""
         ).strip(),
         "environment": str(
-            target.get("environment")
-            or technology.get("environment")
-            or ""
+            target.get("environment") or technology.get("environment") or ""
         ).strip(),
         "assessment_type": str(
-            target.get("assessment_type")
-            or technology.get("assessment_type")
-            or ""
+            target.get("assessment_type") or technology.get("assessment_type") or ""
         ).strip(),
         "scope_reference": str(
-            target.get("scope_reference")
-            or technology.get("scope_reference")
-            or ""
+            target.get("scope_reference") or technology.get("scope_reference") or ""
         ).strip(),
-        "reconnaissance": {
-            "target_identification": {
-                "status": statuses["target"],
-                "target_url": target.get("target_url", ""),
-                "hostname": target.get("hostname", ""),
-                "scheme": target.get("scheme", ""),
-                "port": target.get("port", ""),
-            },
-            "dns": {
-                "status": statuses["dns"],
-                "hostname": dns.get("hostname", ""),
-                "ipv4": ipv4_list,
-                "ipv6": ipv6_list,
-            },
-            "network": {
-                "status": statuses["network"],
-                "target": network.get("target", ""),
-                "open_ports": count_open_ports(network),
-                "ports": network.get("ports", []),
-            },
-            "technology": {
-                "status": statuses["technology"],
-                "server": (
-                    technology.get("http", {}).get("server", "")
-                    if isinstance(technology.get("http"), dict)
-                    else ""
-                ),
-                "powered_by": (
-                    technology.get("http", {}).get("powered_by", "")
-                    if isinstance(technology.get("http"), dict)
-                    else ""
-                ),
-                "technologies": technology_names(technology),
-            },
-            "http": {
-                "status": statuses["http"],
-                "http_status": http_data.get("status_code"),
-                "http_final_url": http_data.get("final_url", ""),
-                "https_status": https_data.get("status_code"),
-                "https_final_url": https_data.get("final_url", ""),
-                "http_to_https_redirect": comparison.get(
-                    "http_to_https_redirect"
-                ),
-                "https_available": comparison.get("https_available"),
-                "tls_version": (
-                    https_data.get("tls", {}).get("tls_version", "")
-                    if isinstance(https_data.get("tls"), dict)
-                    else ""
-                ),
-                "certificate_verified": (
-                    https_data.get("tls", {}).get("certificate_verified")
-                    if isinstance(https_data.get("tls"), dict)
-                    else None
-                ),
-            },
-            "endpoint": {
-                "status": statuses["endpoint"],
-                "total": endpoint_counts["total"],
-                "same_host": endpoint_counts["same_host"],
-                "external": endpoint_counts["external"],
-                "html_links": (
-                    endpoint.get("summary", {}).get("html_links", 0)
-                    if isinstance(endpoint.get("summary"), dict)
-                    else 0
-                ),
-                "forms": (
-                    endpoint.get("summary", {}).get("forms", 0)
-                    if isinstance(endpoint.get("summary"), dict)
-                    else 0
-                ),
-                "javascript": (
-                    endpoint.get("summary", {}).get("javascript", 0)
-                    if isinstance(endpoint.get("summary"), dict)
-                    else 0
-                ),
-                "robots": (
-                    endpoint.get("summary", {}).get("robots", 0)
-                    if isinstance(endpoint.get("summary"), dict)
-                    else 0
-                ),
-                "sitemap": (
-                    endpoint.get("summary", {}).get("sitemap", 0)
-                    if isinstance(endpoint.get("summary"), dict)
-                    else 0
-                ),
-            },
-        },
-        "recon_status": {
-            "target": statuses["target"],
-            "dns": statuses["dns"],
-            "network": statuses["network"],
-            "technology": statuses["technology"],
-            "http": statuses["http"],
-            "endpoint": statuses["endpoint"],
-        },
+        "reconnaissance": {},
+        "recon_status": dict(statuses),
+        "module_decisions": {},
         "observations": [],
         "notes": "",
         "generated_at": now_iso(),
     }
 
+    if "target" in included_modules:
+        summary["reconnaissance"]["target_identification"] = {
+            "status": statuses["target"],
+            "target_url": target.get("target_url", ""),
+            "hostname": target.get("hostname", ""),
+            "scheme": target.get("scheme", ""),
+            "port": target.get("port", ""),
+        }
+
+    if "dns" in included_modules:
+        summary["reconnaissance"]["dns"] = {
+            "status": statuses["dns"],
+            "hostname": dns.get("hostname", ""),
+            "ipv4": ipv4_list,
+            "ipv6": ipv6_list,
+        }
+
+    if "network" in included_modules:
+        summary["reconnaissance"]["network"] = {
+            "status": statuses["network"],
+            "target": network.get("target", ""),
+            "open_ports": count_open_ports(network),
+            "ports": network.get("ports", []),
+        }
+
+    if "technology" in included_modules:
+        technology_payload = technology
+        summary["reconnaissance"]["technology"] = {
+            "status": statuses["technology"],
+            "server": (
+                technology_payload.get("http", {}).get("server", "")
+                if isinstance(technology_payload.get("http"), dict)
+                else ""
+            ),
+            "powered_by": (
+                technology_payload.get("http", {}).get("powered_by", "")
+                if isinstance(technology_payload.get("http"), dict)
+                else ""
+            ),
+            "technologies": technology_names(technology_payload),
+        }
+
+    if "http" in included_modules:
+        summary["reconnaissance"]["http"] = {
+            "status": statuses["http"],
+            "http_status": http_data.get("status_code"),
+            "http_final_url": http_data.get("final_url", ""),
+            "https_status": https_data.get("status_code"),
+            "https_final_url": https_data.get("final_url", ""),
+            "http_to_https_redirect": comparison.get("http_to_https_redirect"),
+            "https_available": comparison.get("https_available"),
+            "tls_version": (
+                https_data.get("tls", {}).get("tls_version", "")
+                if isinstance(https_data.get("tls"), dict)
+                else ""
+            ),
+            "certificate_verified": (
+                https_data.get("tls", {}).get("certificate_verified")
+                if isinstance(https_data.get("tls"), dict)
+                else None
+            ),
+        }
+
+    if "subdomain" in included_modules:
+        subdomain = payload("subdomain")
+        summary["reconnaissance"]["subdomain"] = {
+            "status": statuses["subdomain"],
+            "candidate_count": (
+                subdomain.get("summary", {}).get("candidates_total", 0)
+                if isinstance(subdomain.get("summary"), dict)
+                else 0
+            ),
+            "resolved_count": (
+                subdomain.get("summary", {}).get("resolved_total", 0)
+                if isinstance(subdomain.get("summary"), dict)
+                else 0
+            ),
+            "unresolved_count": (
+                subdomain.get("summary", {}).get("unresolved_total", 0)
+                if isinstance(subdomain.get("summary"), dict)
+                else 0
+            ),
+        }
+
+    if "endpoint" in included_modules:
+        endpoint_payload = endpoint
+        endpoint_summary = (
+            endpoint_payload.get("summary", {})
+            if isinstance(endpoint_payload.get("summary"), dict)
+            else {}
+        )
+        summary["reconnaissance"]["endpoint"] = {
+            "status": statuses["endpoint"],
+            "total": endpoint_counts["total"],
+            "same_host": endpoint_counts["same_host"],
+            "external": endpoint_counts["external"],
+            "html_links": endpoint_summary.get("html_links", 0),
+            "forms": endpoint_summary.get("forms", 0),
+            "javascript": endpoint_summary.get("javascript", 0),
+            "robots": endpoint_summary.get("robots", 0),
+            "sitemap": endpoint_summary.get("sitemap", 0),
+        }
+
+    if "directory" in included_modules:
+        directory = payload("directory")
+        directory_summary = (
+            directory.get("summary", {})
+            if isinstance(directory.get("summary"), dict)
+            else {}
+        )
+        summary["reconnaissance"]["directory"] = {
+            "status": statuses["directory"],
+            "found": directory_summary.get("found", 0),
+            "interesting": directory_summary.get("interesting", 0),
+            "possible_false_positive": directory_summary.get(
+                "possible_false_positive", 0
+            ),
+        }
+
+    if "api" in included_modules:
+        api = payload("api")
+        api_summary = (
+            api.get("summary", {})
+            if isinstance(api.get("summary"), dict)
+            else {}
+        )
+        summary["reconnaissance"]["api"] = {
+            "status": statuses["api"],
+            "api_candidates": api_summary.get("api_candidate_count", 0),
+            "possible_api": api_summary.get("possible_api_count", 0),
+            "non_api": api_summary.get("non_api_count", 0),
+            "unknown": api_summary.get("unknown_count", 0),
+            "probe_targets": api_summary.get("probe_target_count", 0),
+            "probed": api_summary.get("probed_count", 0),
+            "probe_not_found": api_summary.get("probe_not_found_count", 0),
+        }
+
+    if "attack" in included_modules:
+        attack = payload("attack")
+        attack_summary = (
+            attack.get("summary", {})
+            if isinstance(attack.get("summary"), dict)
+            else {}
+        )
+        summary["reconnaissance"]["attack_surface"] = {
+            "status": statuses["attack"],
+            "ipv4_count": attack_summary.get("ipv4_count", 0),
+            "ipv6_count": attack_summary.get("ipv6_count", 0),
+            "open_port_count": attack_summary.get("open_port_count", 0),
+            "technology_count": attack_summary.get("technology_count", 0),
+            "subdomain_candidate_count": attack_summary.get(
+                "subdomain_candidate_count", 0
+            ),
+            "endpoint_count": attack_summary.get("endpoint_count", 0),
+            "same_host_endpoint_count": attack_summary.get(
+                "same_host_endpoint_count", 0
+            ),
+            "directory_count": attack_summary.get("directory_count", 0),
+            "api_candidate_count": attack_summary.get("api_candidate_count", 0),
+            "possible_api_count": attack_summary.get("possible_api_count", 0),
+        }
+
+    for name, status in statuses.items():
+        summary["module_decisions"][name] = (
+            "included" if name in included_modules else "skipped"
+        )
+
+    return summary
+
+
+def prompt_module_decisions(statuses: dict[str, str]) -> set[str]:
+    """Apply the agreed summary generation lifecycle policy."""
+    not_started = [
+        name for name, status in statuses.items() if status == "not-started"
+    ]
+    if not_started:
+        print("[FAIL] Reconnaissance memiliki module berstatus not-started:")
+        for name in not_started:
+            print(f"  - {name}")
+        print("Summary tidak dapat di-generate sampai module tersebut dimulai.")
+        raise RuntimeError("Terdapat reconnaissance berstatus not-started.")
+
+    included: set[str] = set()
+
+    for name, status in statuses.items():
+        if status == "completed":
+            included.add(name)
+            continue
+
+        if status == "skipped":
+            print(f"[INFO] {name} dilewati otomatis (status: skipped).")
+            continue
+
+        if status == "partial":
+            answer = input(
+                f"[WARN] {name} berstatus partial. "
+                "Include module ini dalam summary? [Y/n]: "
+            ).strip().lower()
+            if answer in {"", "y", "yes"}:
+                included.add(name)
+                print(f"[INFO] {name} akan di-include.")
+            else:
+                print(f"[INFO] {name} akan di-skip.")
+            continue
+
+        if status in {"in-progress", "failed", "blocked"}:
+            answer = input(
+                f"[WARN] {name} berstatus {status}. "
+                "Lanjut generate dan skip module ini? [y/N]: "
+            ).strip().lower()
+            if answer in {"y", "yes"}:
+                print(f"[INFO] {name} akan di-skip.")
+                continue
+
+            print("[INFO] Generate dibatalkan.")
+            raise RuntimeError("Generate summary dibatalkan oleh user.")
+
+        raise RuntimeError(
+            f"Status {name} tidak memiliki policy generate: {status or '-'}"
+        )
+
+    return included
 
 def add_observation(
     summary: dict[str, Any],
@@ -513,9 +645,9 @@ def build_observations(
     summary: dict[str, Any],
     documents: dict[str, dict[str, Any]],
 ) -> None:
-    http = get_module_payload("http", documents["http"])
-    endpoint = get_module_payload("endpoint", documents["endpoint"])
-    technology = get_module_payload("technology", documents["technology"])
+    http = get_module_payload("http", documents["http"]) if "http" in documents else {}
+    endpoint = get_module_payload("endpoint", documents["endpoint"]) if "endpoint" in documents else {}
+    technology = get_module_payload("technology", documents["technology"]) if "technology" in documents else {}
 
     comparison = http.get("comparison")
     if isinstance(comparison, dict):
@@ -604,7 +736,7 @@ def cmd_init() -> int:
         )
 
     data = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "project_id": ctx.project_id,
         "status": "not-started",
         "application": "",
@@ -638,25 +770,39 @@ def cmd_generate() -> int:
     }
 
     statuses = validate_source_documents(documents)
-    require_completed_sources(documents, statuses)
+    included_modules = prompt_module_decisions(statuses)
 
-    summary = build_summary(documents, statuses)
-    build_observations(summary, documents)
+    summary = build_summary(documents, statuses, included_modules)
+    build_observations(
+        summary,
+        {name: documents[name] for name in included_modules},
+    )
 
     save_yaml(summary_file(), summary)
 
     record_activity(
         phase="02-reconnaissance",
-        item="02-007",
+        item="recon-summary",
         action="Reconnaissance summary generated",
-        status="in-progress",
+        status="completed",
     )
+
+    skipped = [
+        name for name in statuses if name not in included_modules
+    ]
 
     print("[PASS] Recon Summary berhasil dibuat.")
     print(f"PROJECT: {ctx.project_id}")
     print(f"FILE   : {summary_file()}")
-    print("STATUS : in-progress")
-    print("SOURCES: target, dns, network, technology, http, endpoint")
+    print("STATUS : completed")
+    print(
+        "INCLUDED: "
+        + (", ".join(name for name in statuses if name in included_modules) or "-")
+    )
+    print(
+        "SKIPPED : "
+        + (", ".join(skipped) or "-")
+    )
 
     return 0
 
@@ -689,7 +835,7 @@ def validate_summary(data: dict[str, Any]) -> list[str]:
         errors.append("Project ID tidak sesuai active project.")
 
     status = str(data.get("status", "")).strip().lower()
-    if status not in VALID_STATUSES:
+    if status not in {"not-started", "in-progress", "completed"}:
         errors.append("Status summary tidak valid.")
 
     required_top_level = (
@@ -701,6 +847,7 @@ def validate_summary(data: dict[str, Any]) -> list[str]:
         "scope_reference",
         "reconnaissance",
         "recon_status",
+        "module_decisions",
     )
 
     for field in required_top_level:
@@ -711,25 +858,40 @@ def validate_summary(data: dict[str, Any]) -> list[str]:
     if not isinstance(recon_status, dict):
         errors.append("Field recon_status tidak valid.")
     else:
-        incomplete = [
-            name
-            for name in REQUIRED_MODULES
-            if str(recon_status.get(name, "")).strip().lower()
-            != "completed"
-        ]
+        for name, source_status in recon_status.items():
+            if name not in RECON_DOCUMENTS:
+                errors.append(f"Module reconnaissance tidak dikenal: {name}")
+            elif str(source_status).strip().lower() not in VALID_STATUSES:
+                errors.append(
+                    f"Status {name} tidak valid: {source_status!r}"
+                )
 
-        if incomplete:
-            errors.append(
-                "Reconnaissance belum completed: "
-                + ", ".join(incomplete)
-            )
+    decisions = data.get("module_decisions")
+    if not isinstance(decisions, dict):
+        errors.append("Field module_decisions tidak valid.")
+    else:
+        for name, source_status in (recon_status or {}).items():
+            decision = decisions.get(name)
+            if decision not in {"included", "skipped"}:
+                errors.append(
+                    f"Decision {name} harus 'included' atau 'skipped'."
+                )
+
+            if source_status == "completed" and decision != "included":
+                errors.append(
+                    f"Module completed harus included: {name}."
+                )
+
+            if source_status == "not-started":
+                errors.append(
+                    f"Summary tidak boleh memuat module not-started: {name}."
+                )
 
     reconnaissance = data.get("reconnaissance")
     if not isinstance(reconnaissance, dict):
         errors.append("Field reconnaissance tidak valid.")
 
     return errors
-
 
 def cmd_verify() -> int:
     ctx = project_context()
@@ -845,7 +1007,7 @@ The active project is resolved automatically through context.py.
 No --project argument is required.
 
 init      Create summary.yaml.
-generate  Aggregate completed reconnaissance documents.
+generate  Aggregate reconnaissance documents using the lifecycle policy.
 list      Show summary status and observations.
 show      Show the complete summary document.
 verify    Validate the summary and mark completed.
@@ -859,7 +1021,20 @@ Source documents:
   - network.yaml
   - technology.yaml
   - http.yaml
+  - subdomain.yaml
   - endpoint.yaml
+  - directory.yaml
+  - api.yaml
+  - attack.yaml
+
+Generate policy:
+  completed   -> include
+  partial     -> ask user: include or skip
+  skipped     -> skip automatically
+  not-started -> generation is prohibited
+  in-progress -> ask user: generate and skip or cancel
+  failed      -> ask user: generate and skip or cancel
+  blocked     -> ask user: generate and skip or cancel
 
 This module does not perform network requests or vulnerability testing.
 """
