@@ -5,7 +5,7 @@ Reconnaissance - Recon Summary
 
 Phase : 02 Reconnaissance
 Item  : Recon Summary
-Version: 1.1.0
+Version: 1.1.1
 
 Purpose:
     Consolidate the completed reconnaissance results into one summary
@@ -59,7 +59,7 @@ from activity import record_activity
 from context import require_active_project
 
 
-VERSION = "1.1.0"
+VERSION = "1.1.2"
 
 RECON_DIR_NAME = "02-reconnaissance"
 SUMMARY_DIR_NAME = "summary"
@@ -507,12 +507,30 @@ def build_summary(
             if isinstance(directory.get("summary"), dict)
             else {}
         )
+
+        # directory.py uses:
+        #   summary.total
+        #   summary.interesting
+        #   summary.possible_false_positive
+        # There is no summary.found field.
+        directory_results = (
+            directory.get("results")
+            if isinstance(directory.get("results"), list)
+            else []
+        )
+        directory_total = directory_summary.get(
+            "total",
+            len(directory_results),
+        )
+
         summary["reconnaissance"]["directory"] = {
             "status": statuses["directory"],
-            "found": directory_summary.get("found", 0),
-            "interesting": directory_summary.get("interesting", 0),
-            "possible_false_positive": directory_summary.get(
-                "possible_false_positive", 0
+            "found": int(directory_total or 0),
+            "interesting": int(
+                directory_summary.get("interesting", 0) or 0
+            ),
+            "possible_false_positive": int(
+                directory_summary.get("possible_false_positive", 0) or 0
             ),
         }
 
@@ -523,15 +541,50 @@ def build_summary(
             if isinstance(api.get("summary"), dict)
             else {}
         )
+
+        # api.py v1.1.3 deliberately keeps baseline probe targets
+        # separate from API classification. Therefore probe counts are
+        # derived from the actual probe_targets/probes evidence rather
+        # than treating summary.candidate_count as probe_targets.
+        probe_targets = (
+            api.get("probe_targets")
+            if isinstance(api.get("probe_targets"), list)
+            else []
+        )
+        probes = (
+            api.get("probes")
+            if isinstance(api.get("probes"), list)
+            else []
+        )
+
+        probe_not_found = sum(
+            1
+            for item in probes
+            if isinstance(item, dict)
+            and (
+                str(item.get("probe_classification", "")).lower()
+                == "not-found"
+                or item.get("status_code") == 404
+            )
+        )
+
         summary["reconnaissance"]["api"] = {
             "status": statuses["api"],
-            "api_candidates": api_summary.get("api_candidate_count", 0),
-            "possible_api": api_summary.get("possible_api_count", 0),
-            "non_api": api_summary.get("non_api_count", 0),
-            "unknown": api_summary.get("unknown_count", 0),
-            "probe_targets": api_summary.get("probe_target_count", 0),
-            "probed": api_summary.get("probed_count", 0),
-            "probe_not_found": api_summary.get("probe_not_found_count", 0),
+            "api_candidates": int(
+                api_summary.get("api_candidate_count", 0) or 0
+            ),
+            "possible_api": int(
+                api_summary.get("possible_api_count", 0) or 0
+            ),
+            "non_api": int(
+                api_summary.get("non_api_count", 0) or 0
+            ),
+            "unknown": int(
+                api_summary.get("unknown_count", 0) or 0
+            ),
+            "probe_targets": len(probe_targets),
+            "probed": len(probes),
+            "probe_not_found": probe_not_found,
         }
 
     if "attack" in included_modules:
@@ -656,7 +709,7 @@ def build_observations(
                 summary,
                 "OBS-001",
                 "HTTP does not redirect to HTTPS",
-                "02-005 HTTP / HTTPS reconnaissance",
+                "3-006 HTTP configuration",
                 "HTTP returned a response without redirecting to the HTTPS target.",
             )
 
@@ -673,7 +726,7 @@ def build_observations(
             summary,
             "OBS-002",
             "Web server information exposed",
-            "02-004 Technology Identification",
+            "2-003 Technology fingerprinting",
             f"Server header observed: {server}",
         )
 
@@ -682,7 +735,7 @@ def build_observations(
             summary,
             "OBS-003",
             "Runtime information exposed",
-            "02-004 Technology Identification",
+            "2-003 Technology fingerprinting",
             f"X-Powered-By observed: {powered_by}",
         )
 
@@ -695,13 +748,13 @@ def build_observations(
             name = str(item.get("name", "")).strip()
             detail = str(item.get("detail", "")).strip()
 
-            if name == "CodeIgniter 4":
+            if name == "CodeIgniter":
                 add_observation(
                     summary,
                     "OBS-004",
-                    "CodeIgniter 4 indicated by reconnaissance",
-                    "02-004 Technology Identification / 02-006 Endpoint Discovery",
-                    detail or "CodeIgniter 4 indication observed.",
+                    "CodeIgniter indicated by reconnaissance",
+                    "2-003 Technology fingerprinting",
+                    detail or "CodeIgniter indication observed.",
                 )
 
     endpoints = endpoint.get("endpoints")
@@ -720,7 +773,7 @@ def build_observations(
                 summary,
                 "OBS-005",
                 "Chat-related application endpoints discovered",
-                "02-006 Endpoint Discovery",
+                "2-005 Endpoint discovery",
                 f"{len(chat_paths)} same-host chat endpoint(s) discovered.",
             )
 
@@ -777,6 +830,10 @@ def cmd_generate() -> int:
         summary,
         {name: documents[name] for name in included_modules},
     )
+
+    # A successfully generated Summary is a completed artifact.
+    # Verification is a separate lifecycle step and may add verified_at later.
+    summary["status"] = "completed"
 
     save_yaml(summary_file(), summary)
 
@@ -912,7 +969,7 @@ def cmd_verify() -> int:
 
     record_activity(
         phase="02-reconnaissance",
-        item="02-007",
+        item="recon-summary",
         action="Reconnaissance summary verified",
         status="completed",
     )
