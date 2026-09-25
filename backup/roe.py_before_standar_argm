@@ -42,7 +42,7 @@ from activity import record_activity
 from context import ContextError, ProjectContext, require_active_project
 
 
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.0.0"
 ROE_DIR_NAME = "roe"
 ROE_FILE_NAME = "roe.yaml"
 
@@ -870,14 +870,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("show", help="Show the current RoE.")
     sub.add_parser("validate", help="Validate RoE readiness.")
 
-    sub.add_parser("add", help="Create/configure the RoE draft.")
-    sub.add_parser("list", help="Show a compact RoE summary.")
-    sub.add_parser("status", help="Show current RoE status.")
-    sub.add_parser("verify", help="Validate RoE readiness without changing status.")
-    sub.add_parser("remove", help="Remove the current RoE document.")
-
-    p_set_status = sub.add_parser("set-status", help="Set RoE lifecycle status.")
-    p_set_status.add_argument("status", choices=sorted(VALID_STATUSES))
+    p_status = sub.add_parser("status", help="Set RoE status.")
+    p_status.add_argument("status", choices=sorted(VALID_STATUSES))
 
     p_set = sub.add_parser("set", help="Set a scalar RoE field.")
     p_set.add_argument(
@@ -987,10 +981,6 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        if args.command == "version":
-            print(f"roe.py {SCRIPT_VERSION}")
-            return 0
-
         context = require_active_project()
 
         if args.command == "init":
@@ -1001,26 +991,6 @@ def main() -> int:
                 interactive_init(context)
             return 0
 
-        if args.command == "add":
-            interactive_init(context)
-            return 0
-
-        if args.command == "list":
-            data = show(context=context)
-            roe = data["roe"]
-            print("=" * 72)
-            print(" BrebesKab-CSIRT-Tools - RoE Summary")
-            print("=" * 72)
-            print(f"Project ID       : {context.project_id}")
-            print(f"Status           : {roe.get('status', '')}")
-            print(f"Title            : {roe.get('title', '')}")
-            print(f"Assessment Type  : {roe.get('assessment_type', '')}")
-            print(f"Environment      : {roe.get('environment', '')}")
-            print(f"Authorization    : {roe.get('authorization_reference', '')}")
-            print(f"Scope            : {roe.get('scope_reference', '')}")
-            print(f"File             : {roe_file(context)}")
-            return 0
-
         if args.command == "show":
             data = show(context=context)
             print(f"PROJECT: {context.project_id}")
@@ -1029,7 +999,7 @@ def main() -> int:
             _print_value(data["roe"])
             return 0
 
-        if args.command in {"verify", "validate"}:
+        if args.command == "validate":
             errors = validate(context=context)
             if errors:
                 print("[FAIL] RoE belum siap:")
@@ -1040,30 +1010,8 @@ def main() -> int:
             return 0
 
         if args.command == "status":
-            data = show(context=context)
-            print(f"Project ID : {context.project_id}")
-            print(f"Status     : {data['roe'].get('status', '')}")
-            return 0
-
-        if args.command == "set-status":
             set_status(args.status, context=context)
             print(f"[PASS] Status RoE: {args.status}")
-            return 0
-
-        if args.command == "remove":
-            path = roe_file(context)
-            if not path.is_file():
-                print("[INFO] RoE document belum ada.")
-                return 1
-            path.unlink()
-            record_activity(
-                phase="01-preparation",
-                item="01-003",
-                action="Rules of Engagement document removed",
-                status="completed",
-                context=context,
-            )
-            print(f"[PASS] RoE document telah dihapus: {path}")
             return 0
 
         if args.command == "set":
@@ -1188,6 +1136,10 @@ def main() -> int:
                 context=context,
             )
             print("[PASS] RoE disetujui dan status menjadi approved.")
+            return 0
+
+        if args.command == "version":
+            print(f"roe.py {SCRIPT_VERSION}")
             return 0
 
         parser.error("Perintah tidak dikenal.")

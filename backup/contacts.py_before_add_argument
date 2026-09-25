@@ -45,7 +45,7 @@ from context import ContextError, ProjectContext, require_active_project
 from activity import ActivityError, record_activity
 
 
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.0.0"
 
 CONTACTS_DIR_NAME = "contacts"
 CONTACTS_FILE_NAME = "contacts.yaml"
@@ -313,44 +313,6 @@ def remove_contact(
     return True
 
 
-
-def verify_contact(contact_id: str, *, context: Optional[ProjectContext] = None) -> dict[str, Any]:
-    """Verify one contact record for minimum required fields."""
-    if context is None:
-        context = require_active_project()
-    contact = get_contact(contact_id, context=context)
-    if contact is None:
-        raise ContactsError(f"Contact tidak ditemukan: {contact_id}")
-    contact_id_value = str(contact.get("contact_id", "")).strip()
-    role = str(contact.get("role", "")).strip()
-    name = str(contact.get("name", "")).strip()
-    errors = []
-    if not contact_id_value:
-        errors.append("Contact ID kosong.")
-    if not role:
-        errors.append("Role kosong.")
-    if not name:
-        errors.append("Nama contact kosong.")
-    if errors:
-        raise ContactsError(f"Contact {contact_id.upper()} tidak valid:\n" + "\n".join(f"- {error}" for error in errors))
-    record_activity(phase="01-preparation", item="01-004", action=f"Contact verified: {contact_id_value} ({role})", status="completed", context=context)
-    return contact
-
-def contact_status(*, context: Optional[ProjectContext] = None) -> dict[str, Any]:
-    """Return an overall status summary for contacts."""
-    if context is None:
-        context = require_active_project()
-    contacts = list_contacts(context=context)
-    role_counts: dict[str, int] = {}
-    invalid_contacts: list[str] = []
-    for contact in contacts:
-        role = str(contact.get("role", "")).strip().lower() or "unknown"
-        role_counts[role] = role_counts.get(role, 0) + 1
-        contact_id_value = str(contact.get("contact_id", "")).strip()
-        if not contact_id_value or not str(contact.get("role", "")).strip() or not str(contact.get("name", "")).strip():
-            invalid_contacts.append(contact_id_value or "(unknown)")
-    return {"project_id": context.project_id, "count": len(contacts), "role_counts": role_counts, "invalid_contacts": invalid_contacts, "status": "ready" if contacts and not invalid_contacts else "not-ready"}
-
 def print_contacts(
     *,
     context: Optional[ProjectContext] = None,
@@ -448,8 +410,6 @@ def print_help() -> None:
         "  python scripts/preparation/contacts.py add\n"
         "  python scripts/preparation/contacts.py list\n"
         "  python scripts/preparation/contacts.py show C-001\n"
-        "  python scripts/preparation/contacts.py verify C-001\n"
-        "  python scripts/preparation/contacts.py status\n"
         "  python scripts/preparation/contacts.py remove C-001\n"
         "  python scripts/preparation/contacts.py version\n"
         "\n"
@@ -499,33 +459,6 @@ def main(argv: Optional[list[str]] = None) -> int:
                 print(f"{key:14}: {value}")
 
             return 0
-
-        if command == "verify":
-            if len(args) != 2:
-                print("[ERROR] Gunakan: contacts.py verify C-001")
-                return 2
-            contact = verify_contact(args[1], context=context)
-            print(f"[PASS] Contact {contact['contact_id']} valid.")
-            print()
-            for key in ("contact_id", "role", "name", "organization", "email", "phone", "availability"):
-                print(f"{key.replace('_', ' ').title():14}: {contact.get(key, '')}")
-            return 0
-
-        if command == "status":
-            summary = contact_status(context=context)
-            print("=" * 72)
-            print(" BrebesKab-CSIRT-Tools - Preparation Contacts Status")
-            print("=" * 72)
-            print(f"Project ID : {summary['project_id']}")
-            print(f"Contacts   : {summary['count']}")
-            for role, count in sorted(summary["role_counts"].items()):
-                print(f"  {role:<20}: {count}")
-            if summary["invalid_contacts"]:
-                print("\nInvalid Contacts:")
-                for contact_id_value in summary["invalid_contacts"]:
-                    print(f"  - {contact_id_value}")
-            print(f"\nStatus     : {summary['status']}")
-            return 0 if summary["status"] == "ready" else 1
 
         if command == "remove":
             if len(args) != 2:
