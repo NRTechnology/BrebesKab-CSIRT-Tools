@@ -4,6 +4,7 @@ BrebesKab-CSIRT-Tools - Project Manager
 
 Usage:
     python scripts/project.py create PENTEST-2026-003
+    python scripts/project.py init-secrets PENTEST-2026-002
     python scripts/project.py list
     python scripts/project.py use PENTEST-2026-002
     python scripts/project.py status
@@ -16,7 +17,9 @@ workflow while preserving the existing project context lifecycle.
 from __future__ import annotations
 
 import argparse
+import base64
 import re
+import secrets as py_secrets
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -30,7 +33,7 @@ except ImportError:
     sys.exit(1)
 
 
-SCRIPT_VERSION = "1.3.0"
+SCRIPT_VERSION = "1.4.0"
 PROJECT_ID_PATTERN = re.compile(r"^PENTEST-[0-9]{4}-[0-9]{3,}$")
 ALLOWED_ENVIRONMENTS = ("Production", "Staging", "Pre-Production")
 ALLOWED_ASSESSMENT_TYPES = ("Black Box", "Grey Box", "White Box")
@@ -81,6 +84,87 @@ def runtime_root() -> Path:
 
 def active_project_file() -> Path:
     return runtime_root() / "active-project.yaml"
+
+
+def secrets_root() -> Path:
+    """Return the repository-local runtime secrets directory."""
+    return runtime_root() / "secrets"
+
+
+def project_secrets_dir(project_id: str) -> Path:
+    """Return the runtime secrets directory for a project."""
+    return secrets_root() / project_id
+
+
+def encryption_key_file(project_id: str) -> Path:
+    """Return the Fernet-compatible encryption key path for a project."""
+    return project_secrets_dir(project_id) / "encryption.key"
+
+
+def generate_encryption_key() -> bytes:
+    """Generate a Fernet-compatible 32-byte URL-safe base64 key."""
+    return base64.urlsafe_b64encode(py_secrets.token_bytes(32))
+
+
+def is_valid_encryption_key(key: bytes) -> bool:
+    """Validate the expected Fernet-compatible key representation."""
+    key = key.strip()
+    if len(key) != 44:
+        return False
+
+    try:
+        decoded = base64.urlsafe_b64decode(key)
+    except Exception:
+        return False
+
+    return len(decoded) == 32
+
+
+def initialize_project_secrets(project_id: str) -> tuple[Path, bool]:
+    """
+    Ensure a project encryption key exists.
+
+    Returns:
+        (key_path, created)
+    """
+    project_id = normalize_project_id(project_id)
+    key_path = encryption_key_file(project_id)
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if key_path.exists():
+        if not key_path.is_file():
+            raise ValueError(f"Encryption key path bukan file: {key_path}")
+
+        existing_key = key_path.read_bytes().strip()
+        if not is_valid_encryption_key(existing_key):
+            raise ValueError(
+                f"Encryption key tidak valid atau rusak: {key_path}"
+            )
+
+        return key_path, False
+
+    key = generate_encryption_key()
+
+    try:
+        with key_path.open("xb") as handle:
+            handle.write(key + b"\n")
+    except FileExistsError:
+        # Another process initialized the same project concurrently.
+        existing_key = key_path.read_bytes().strip()
+        if not is_valid_encryption_key(existing_key):
+            raise ValueError(
+                f"Encryption key tidak valid atau rusak: {key_path}"
+            )
+        return key_path, False
+
+    # Restrict permissions on POSIX systems. On Windows, filesystem ACLs
+    # remain responsible for access control.
+    try:
+        key_path.chmod(0o600)
+    except OSError:
+        pass
+
+    return key_path, True
 
 
 def load_yaml(path: Path) -> dict[str, Any]:
@@ -182,6 +266,110 @@ def write_initial_activity_log(
     )
 
 
+def append_activity_record(
+    project_dir: Path,
+    *,
+    phase: str,
+    item: str,
+    action: str,
+    status: str,
+    operator: str,
+) -> str:
+    """Append a canonical activity record and return its activity ID."""
+    activity_path = project_dir / "timeline" / "activity.log"
+    activity_path.parent.mkdir(parents=True, exist_ok=True)
+
+    highest = 0
+    if activity_path.is_file():
+        for line in activity_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+
+            parts = [part.strip() for part in line.split("|")]
+            if len(parts) != 7:
+                continue
+
+            activity_id = parts[1].upper()
+            if activity_id.startswith("ACT-") and activity_id[4:].isdigit():
+                highest = max(highest, int(activity_id[4:]))
+
+    activity_id = f"ACT-{highest + 1:04d}"
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+
+    fields = (
+        timestamp,
+        activity_id,
+        phase.strip(),
+        item.strip(),
+        action.strip(),
+        status.strip().lower(),
+        operator.strip(),
+    )
+
+    sanitized = [
+        str(value).replace("\r", " ").replace("\n", " ").replace("|", "/")
+        for value in fields
+    ]
+
+    if not activity_path.exists():
+        activity_path.write_text(
+            ACTIVITY_LOG_HEADER + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+    with activity_path.open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write(" | ".join(sanitized) + "\n")
+
+    return activity_id
+
+
+def init_secrets(project_id: str) -> int:
+    try:
+        project_id = normalize_project_id(project_id)
+        project_dir, _assessment = load_project(project_id)
+        key_path, created = initialize_project_secrets(project_id)
+    except (ValueError, OSError) as exc:
+        print(f"[ERROR] Gagal menyiapkan encryption key: {exc}")
+        return 1
+
+    try:
+        activity_id = append_activity_record(
+            project_dir,
+            phase="00-project",
+            item="00-002",
+            action=(
+                "Project encryption key initialized"
+                if created
+                else "Project encryption key verified"
+            ),
+            status="completed",
+            operator="project.py",
+        )
+    except OSError as exc:
+        print(f"[ERROR] Encryption key siap, tetapi activity log gagal ditulis: {exc}")
+        return 1
+
+    print()
+    print("=" * 60)
+    print(" BrebesKab-CSIRT-Tools - Project Secrets")
+    print("=" * 60)
+    print(f"Project ID : {project_id}")
+    print(f"Key path   : {key_path}")
+
+    if created:
+        print("[PASS] Encryption key berhasil dibuat.")
+    else:
+        print("[PASS] Encryption key sudah tersedia dan valid.")
+
+    print(f"Activity   : {activity_id}")
+    print()
+    print("[INFO] Key tidak ditampilkan dan tidak dicatat ke activity log.")
+    print()
+
+    return 0
+
+
 def create_project(
     *,
     project_id: str,
@@ -252,6 +440,12 @@ def create_project(
     else:
         project_dir.mkdir(parents=True, exist_ok=True)
         print("[PASS] Project directory dibuat.")
+
+    try:
+        key_path, key_created = initialize_project_secrets(project_id)
+    except (ValueError, OSError) as exc:
+        print(f"[ERROR] Gagal menyiapkan encryption key: {exc}")
+        return 1
 
     root_directories = (
         "evidence",
@@ -440,6 +634,18 @@ def create_project(
         timestamp=timestamp,
     )
 
+    key_activity_created = False
+    if key_created and activity_created:
+        append_activity_record(
+            project_dir,
+            phase="00-project",
+            item="00-002",
+            action="Project encryption key initialized",
+            status="completed",
+            operator=tester or "project.py",
+        )
+        key_activity_created = True
+
     print()
     print("=" * 60)
     print(" Project structure ready")
@@ -460,6 +666,14 @@ def create_project(
         print("[PASS] Activity log canonical tersedia.")
     else:
         print("[INFO] Activity log sudah ada; tidak ditimpa.")
+
+    if key_created:
+        print("[PASS] Encryption key runtime berhasil dibuat.")
+    else:
+        print("[INFO] Encryption key runtime sudah tersedia dan valid.")
+    print(f"        Key path: {key_path}")
+    if key_activity_created:
+        print("[PASS] Activity key initialization tercatat.")
 
     print()
     print("Next step:")
@@ -699,10 +913,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "command",
-        choices=("create", "list", "use", "status", "clear"),
+        choices=("create", "init-secrets", "list", "use", "status", "clear"),
         help="Project lifecycle command.",
     )
-    parser.add_argument("project_id", nargs="?", help="Project ID for create/use.")
+    parser.add_argument(
+        "project_id",
+        nargs="?",
+        help="Project ID for create/use/init-secrets.",
+    )
     parser.add_argument("--application", default="[Application Name]")
     parser.add_argument("--target", default="[Target URL]")
     parser.add_argument("--tester", default="[Tester]")
@@ -738,6 +956,11 @@ def main(argv: list[str] | None = None) -> int:
             assessment_type=args.assessment_type,
             force=args.force,
         )
+
+    if args.command == "init-secrets":
+        if not args.project_id:
+            parser.error("command 'init-secrets' membutuhkan <PROJECT-ID>.")
+        return init_secrets(args.project_id)
 
     if args.command == "use":
         if not args.project_id:

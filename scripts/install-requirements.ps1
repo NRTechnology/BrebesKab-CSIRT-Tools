@@ -1,5 +1,5 @@
 ﻿#requires -Version 5.1
-# BrebesKab-CSIRT-Tools install-requirements.ps1 v2.5
+# BrebesKab-CSIRT-Tools install-requirements.ps1 v2.6
 # Native verification is based on process exit code, not stdout/stderr content.
 [CmdletBinding()]
 param(
@@ -36,7 +36,26 @@ $WinGetPackages = @(
 
 $PythonPackages = @(
     'typer','rich','httpx','requests','PyYAML','pydantic',
-    'python-dateutil','beautifulsoup4','lxml','playwright','Jinja2','python-docx'
+    'python-dateutil','beautifulsoup4','lxml','playwright','Jinja2','python-docx',
+    'cryptography'
+)
+
+# Package-to-module mapping used for dependency import verification.
+# The PyPI distribution name is not always identical to the Python import name.
+$PythonImportChecks = @(
+    [pscustomobject]@{ Package='typer'; Module='typer' },
+    [pscustomobject]@{ Package='rich'; Module='rich' },
+    [pscustomobject]@{ Package='httpx'; Module='httpx' },
+    [pscustomobject]@{ Package='requests'; Module='requests' },
+    [pscustomobject]@{ Package='PyYAML'; Module='yaml' },
+    [pscustomobject]@{ Package='pydantic'; Module='pydantic' },
+    [pscustomobject]@{ Package='python-dateutil'; Module='dateutil' },
+    [pscustomobject]@{ Package='beautifulsoup4'; Module='bs4' },
+    [pscustomobject]@{ Package='lxml'; Module='lxml' },
+    [pscustomobject]@{ Package='playwright'; Module='playwright' },
+    [pscustomobject]@{ Package='Jinja2'; Module='jinja2' },
+    [pscustomobject]@{ Package='python-docx'; Module='docx' },
+    [pscustomobject]@{ Package='cryptography'; Module='cryptography' }
 )
 
 $GitHubHeaders = @{
@@ -802,6 +821,38 @@ function Verify-PythonEnvironment {
         Write-Log "Python package OK: $pkg" 'OK'
     }
 
+    foreach($check in $PythonImportChecks){
+        $pythonCode = @"
+import importlib.util
+import sys
+
+module_name = sys.argv[1]
+if importlib.util.find_spec(module_name) is None:
+    raise SystemExit(1)
+print(module_name)
+"@
+
+        $importCheck = Invoke-NativeCapture `
+            -FilePath $VenvPython `
+            -Arguments @('-c',$pythonCode,$check.Module)
+
+        if($importCheck.ExitCode -ne 0){
+            throw "Python module tidak dapat diimport: $($check.Module) (package: $($check.Package))"
+        }
+
+        Write-Log "Python module OK: $($check.Module) [$($check.Package)]" 'OK'
+    }
+
+    $cryptographyVersion = Invoke-NativeCapture `
+        -FilePath $VenvPython `
+        -Arguments @('-c','import cryptography; print(cryptography.__version__)')
+
+    if($cryptographyVersion.ExitCode -ne 0){
+        throw "Cryptography import verification gagal."
+    }
+
+    Write-Log "cryptography runtime OK: $(($cryptographyVersion.StdOut + "`r`n" + $cryptographyVersion.StdErr).Trim())" 'OK'
+
     $playwright = Invoke-NativeCapture `
         -FilePath $VenvPython `
         -Arguments @('-m','playwright','--version')
@@ -917,17 +968,17 @@ try{
         -Force | Out-Null
 
     Write-Log '============================================================' 'STEP'
-    Write-Log 'BrebesKab-CSIRT-Tools install-requirements.ps1 v2.5' 'STEP'
+    Write-Log 'BrebesKab-CSIRT-Tools install-requirements.ps1 v2.6' 'STEP'
     Write-Log '============================================================' 'STEP'
 
     Request-Administrator
 
     if(-not(Test-Administrator)){
-        throw 'Installer v2.5 tidak berjalan sebagai Administrator setelah proses elevation.'
+        throw 'Installer v2.6 tidak berjalan sebagai Administrator setelah proses elevation.'
     }
 
     if(-not [Environment]::Is64BitOperatingSystem){
-        throw 'Installer v2.5 membutuhkan Windows 64-bit.'
+        throw 'Installer v2.6 membutuhkan Windows 64-bit.'
     }
 
     if(-not(Find-Command 'winget')){
