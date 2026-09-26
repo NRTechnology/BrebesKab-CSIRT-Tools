@@ -3,7 +3,7 @@
 BrebesKab-CSIRT-Tools
 Preparation - Test Account
 
-Version: 1.0.0
+Version: 1.3.0
 
 Manage authorized test accounts for a pentest project.
 
@@ -13,14 +13,16 @@ Account data is stored at:
 The active project is resolved through context.py.
 No --project argument is required.
 
-This module does not create or store passwords, secrets, tokens,
-or authentication credentials.
+Credential values are accepted only in encrypted form and are stored
+as Fernet ciphertext in accounts.yaml. Plaintext credentials are kept
+only in memory when explicitly decrypted for an authorized caller.
 """
 
 from __future__ import annotations
 
 import sys
 from datetime import datetime
+from getpass import getpass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -35,12 +37,14 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 from activity import ActivityError, record_activity
 from context import ContextError, ProjectContext, require_active_project
+from secrets import SecretsError, decrypt, encrypt, load_key
 
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.3.0"
 
 ACCOUNT_DIR_NAME = "account"
 ACCOUNT_FILE_NAME = "accounts.yaml"
+ACCOUNT_SCHEMA_VERSION = "2.0"
 
 VALID_ROLES = {
     "tester",
@@ -81,7 +85,7 @@ def _now() -> str:
 def _empty_document(context: ProjectContext) -> dict[str, Any]:
     """Return the initial account document."""
     return {
-        "schema_version": "1.0",
+        "schema_version": ACCOUNT_SCHEMA_VERSION,
         "project_id": context.project_id,
         "updated_at": _now(),
         "accounts": [],
@@ -123,6 +127,16 @@ def _load(context: ProjectContext) -> dict[str, Any]:
             f"  File    : {data.get('project_id')!r}"
         )
 
+    schema_version = str(data.get("schema_version", "")).strip()
+    if schema_version != ACCOUNT_SCHEMA_VERSION:
+        raise AccountError(
+            "Schema accounts.yaml tidak didukung oleh account.py versi ini.\n"
+            f"  Ditemukan : {schema_version or '[kosong]'}\n"
+            f"  Didukung  : {ACCOUNT_SCHEMA_VERSION}\n"
+            "Gunakan account.py versi yang sesuai atau lakukan migrasi "
+            "account terlebih dahulu."
+        )
+
     accounts = data.get("accounts", [])
 
     if not isinstance(accounts, list):
@@ -144,7 +158,7 @@ def _save(
     directory = account_dir(context)
     directory.mkdir(parents=True, exist_ok=True)
 
-    data["schema_version"] = "1.0"
+    data["schema_version"] = ACCOUNT_SCHEMA_VERSION
     data["project_id"] = context.project_id
     data["updated_at"] = _now()
 
@@ -244,11 +258,141 @@ def _next_account_id(
     return f"TA-{highest + 1:03d}"
 
 
+def _validate_encrypted_credential(
+    value: str,
+    field_name: str,
+) -> str:
+    """
+    Validate an encrypted credential token without exposing plaintext.
+
+    The ciphertext must be decryptable by the active project's encryption
+    key and the resulting plaintext must not be empty.
+    """
+    token = str(value or "").strip()
+
+    if not token:
+        raise AccountError(
+            f"Credential terenkripsi '{field_name}' wajib diisi."
+        )
+
+    try:
+        plaintext = decrypt(token)
+    except SecretsError as exc:
+        raise AccountError(
+            f"Credential terenkripsi '{field_name}' tidak valid atau "
+            "tidak sesuai encryption key project."
+        ) from exc
+
+    if not plaintext:
+        raise AccountError(
+            f"Credential terenkripsi '{field_name}' menghasilkan nilai kosong."
+        )
+
+    return token
+
+
+def _credentials(account: dict[str, Any]) -> dict[str, str]:
+    """Return encrypted credential fields from an account record."""
+    raw = account.get("credentials")
+
+    if not isinstance(raw, dict):
+        raise AccountError(
+            "Field 'credentials' pada test account tidak valid."
+        )
+
+    username = raw.get("username")
+    password = raw.get("password")
+
+    if not isinstance(username, str) or not username.strip():
+        raise AccountError(
+            "Credential username terenkripsi tidak tersedia."
+        )
+
+    if not isinstance(password, str) or not password.strip():
+        raise AccountError(
+            "Credential password terenkripsi tidak tersedia."
+        )
+
+    return {
+        "username": username.strip(),
+        "password": password.strip(),
+    }
+
+
+def get_account_credentials(
+    account_id: str,
+    *,
+    context: Optional[ProjectContext] = None,
+) -> dict[str, str]:
+    """
+    Decrypt and return one account's username/password in memory.
+
+    This is the only account.py API intended for a caller that actually needs
+    the plaintext credentials. The values are never written to accounts.yaml
+    and are never included in activity records or normal account output.
+    """
+    if context is None:
+        context = require_active_project()
+
+    account = get_account(account_id, context=context)
+    if account is None:
+        raise AccountError(
+            f"Test account tidak ditemukan: {account_id}"
+        )
+
+    encrypted = _credentials(account)
+
+    try:
+        username = decrypt(encrypted["username"])
+        password = decrypt(encrypted["password"])
+    except SecretsError as exc:
+        raise AccountError(
+            f"Credential test account {account_id.upper()} "
+            "tidak dapat didecrypt dengan project encryption key."
+        ) from exc
+
+    if not username:
+        raise AccountError(
+            f"Username test account {account_id.upper()} hasil decrypt kosong."
+        )
+
+    if not password:
+        raise AccountError(
+            f"Password test account {account_id.upper()} hasil decrypt kosong."
+        )
+
+    return {
+        "username": username,
+        "password": password,
+    }
+
+
+def _username_for_comparison(
+    account: dict[str, Any],
+) -> Optional[str]:
+    """Decrypt an account username for duplicate detection only."""
+    raw = account.get("credentials")
+
+    if not isinstance(raw, dict):
+        return None
+
+    token = raw.get("username")
+
+    if not isinstance(token, str) or not token.strip():
+        return None
+
+    try:
+        return decrypt(token)
+    except SecretsError:
+        return None
+
+
 def add_account(
     *,
     role: str,
     name: str,
-    username: str,
+    username_encrypted: str,
+    password_encrypted: str,
     purpose: str = "",
     access: str = "",
     status: str = "planned",
@@ -256,18 +400,26 @@ def add_account(
     context: Optional[ProjectContext] = None,
 ) -> dict[str, Any]:
     """
-    Add one test account record.
+    Add one test account record using encrypted username/password.
 
-    Passwords, API keys, tokens, and other secrets must not be stored.
+    The caller must provide Fernet ciphertext generated with the active
+    project's encryption key. Plaintext credentials are not accepted.
     """
     if context is None:
         context = require_active_project()
+
+    # Fail early with a clear error when the project key is unavailable.
+    try:
+        load_key()
+    except SecretsError as exc:
+        raise AccountError(
+            "Encryption key project belum tersedia atau tidak valid."
+        ) from exc
 
     role = _validate_role(role)
     status = _validate_status(status)
 
     name = name.strip()
-    username = username.strip()
     purpose = purpose.strip()
     access = access.strip()
     notes = notes.strip()
@@ -277,32 +429,48 @@ def add_account(
             "Nama pemegang account wajib diisi."
         )
 
-    if not username:
+    encrypted_username = _validate_encrypted_credential(
+        username_encrypted,
+        "username",
+    )
+    encrypted_password = _validate_encrypted_credential(
+        password_encrypted,
+        "password",
+    )
+
+    try:
+        decrypted_username = decrypt(encrypted_username)
+    except SecretsError as exc:
         raise AccountError(
-            "Username account wajib diisi."
-        )
+            "Username terenkripsi tidak dapat didecrypt."
+        ) from exc
 
     data = _load(context)
     accounts = data["accounts"]
 
-    for account in accounts:
-        if not isinstance(account, dict):
+    for existing in accounts:
+        if not isinstance(existing, dict):
             continue
 
-        existing_username = str(
-            account.get("username", "")
-        ).strip().lower()
+        existing_username = _username_for_comparison(existing)
 
-        if existing_username == username.lower():
+        if (
+            existing_username is not None
+            and existing_username.strip().lower()
+            == decrypted_username.strip().lower()
+        ):
             raise AccountError(
-                f"Username sudah terdaftar: {username}"
+                "Username account sudah terdaftar."
             )
 
     account = {
         "account_id": _next_account_id(accounts),
         "role": role,
         "name": name,
-        "username": username,
+        "credentials": {
+            "username": encrypted_username,
+            "password": encrypted_password,
+        },
         "purpose": purpose,
         "access": access,
         "status": status,
@@ -322,15 +490,13 @@ def add_account(
         item="01-005",
         action=(
             f"Test account recorded: "
-            f"{account['account_id']} "
-            f"({username})"
+            f"{account['account_id']}"
         ),
         status="completed",
         context=context,
     )
 
     return account
-
 
 def list_accounts(
     *,
@@ -498,7 +664,7 @@ def print_accounts(
     *,
     context: Optional[ProjectContext] = None,
 ) -> None:
-    """Print test account information."""
+    """Print test account metadata without exposing credentials."""
     if context is None:
         context = require_active_project()
 
@@ -518,7 +684,7 @@ def print_accounts(
         for account in accounts:
             print(
                 f"[{account.get('account_id', '-')}] "
-                f"{account.get('username', '')}"
+                f"Credential: [encrypted]"
             )
 
             print(
@@ -573,13 +739,12 @@ def print_accounts(
         or "[none]"
     )
 
-
 def print_account(
     account_id: str,
     *,
     context: Optional[ProjectContext] = None,
 ) -> bool:
-    """Print one test account."""
+    """Print one complete test account, including decrypted credentials."""
     if context is None:
         context = require_active_project()
 
@@ -595,17 +760,36 @@ def print_account(
         )
         return False
 
+    credentials = get_account_credentials(
+        account_id,
+        context=context,
+    )
+
     print("=" * 72)
     print(" Test Account")
     print("=" * 72)
+    print(f"account_id    : {account.get('account_id', '')}")
+    print(f"name          : {account.get('name', '')}")
+    print(f"role          : {account.get('role', '')}")
+    print(f"username      : {credentials['username']}")
+    print(f"password      : {credentials['password']}")
+    print(f"purpose       : {account.get('purpose', '')}")
+    print(f"access        : {account.get('access', '')}")
+    print(f"status        : {account.get('status', '')}")
 
-    for key, value in account.items():
-        print(
-            f"{key:14}: {value}"
-        )
+    if account.get("created_at"):
+        print(f"created_at    : {account.get('created_at')}")
+
+    if account.get("verified_at"):
+        print(f"verified_at   : {account.get('verified_at')}")
+
+    if account.get("notes"):
+        print(f"notes         : {account.get('notes')}")
+
+    print()
+    print("WARNING       : username dan password ditampilkan dalam plaintext.")
 
     return True
-
 
 def print_status(
     *,
@@ -687,7 +871,13 @@ def interactive_add(
     *,
     context: Optional[ProjectContext] = None,
 ) -> dict[str, Any]:
-    """Interactively add one test account."""
+    """Interactively add one test account using plaintext input in memory.
+
+    The username is read as normal text and the password is read without
+    echo. Both values are encrypted immediately with the active project's
+    Fernet key before they are passed to add_account(). Plaintext values are
+    never written to accounts.yaml or activity.log.
+    """
     if context is None:
         context = require_active_project()
 
@@ -696,11 +886,9 @@ def interactive_add(
     print("=" * 72)
     print(f"Project ID : {context.project_id}")
     print()
-
     print(
-        "CATATAN: Jangan masukkan password, "
-        "API key, token, secret, atau credential "
-        "lain ke dalam form ini."
+        "CATATAN: Username dan password akan dienkripsi otomatis "
+        "dengan project encryption key sebelum disimpan."
     )
     print()
 
@@ -714,10 +902,33 @@ def interactive_add(
         required=True,
     )
 
-    username = _prompt(
+    username_plaintext = _prompt(
         "Username",
         required=True,
     )
+
+    while True:
+        password_plaintext = getpass(
+            "Password: "
+        )
+
+        if password_plaintext:
+            break
+
+        print("[ERROR] Nilai wajib diisi.")
+
+    try:
+        username_encrypted = encrypt(username_plaintext)
+        password_encrypted = encrypt(password_plaintext)
+    except SecretsError as exc:
+        raise AccountError(
+            "Gagal mengenkripsi credential dengan project encryption key."
+        ) from exc
+    finally:
+        # Remove local references as soon as possible. Python strings are
+        # immutable, so this is best-effort cleanup only.
+        username_plaintext = ""
+        password_plaintext = ""
 
     purpose = _prompt(
         "Purpose",
@@ -741,7 +952,8 @@ def interactive_add(
     account = add_account(
         role=role,
         name=name,
-        username=username,
+        username_encrypted=username_encrypted,
+        password_encrypted=password_encrypted,
         purpose=purpose,
         access=access,
         status=status,
@@ -761,6 +973,113 @@ def interactive_add(
     return account
 
 
+def interactive_add_encrypted(
+    *,
+    context: Optional[ProjectContext] = None,
+) -> dict[str, Any]:
+    """Interactively add an account from pre-encrypted Fernet values."""
+    if context is None:
+        context = require_active_project()
+
+    print("=" * 72)
+    print(" Add Test Account (Encrypted)")
+    print("=" * 72)
+    print(f"Project ID : {context.project_id}")
+    print()
+    print(
+        "CATATAN: Username dan password harus berupa ciphertext Fernet "
+        "yang dibuat menggunakan encryption key project aktif."
+    )
+    print()
+
+    role = _prompt(
+        "Role (tester/reviewer/admin/user/operator/other)",
+        required=True,
+    )
+
+    name = _prompt(
+        "Name",
+        required=True,
+    )
+
+    username_encrypted = _prompt(
+        "Username (encrypted)",
+        required=True,
+    )
+
+    while True:
+        password_encrypted = getpass(
+            "Password (encrypted): "
+        ).strip()
+
+        if password_encrypted:
+            break
+
+        print("[ERROR] Nilai wajib diisi.")
+
+    purpose = _prompt("Purpose")
+    access = _prompt("Access / privilege")
+    status = _prompt("Status (planned/active/disabled/revoked)")
+
+    if not status:
+        status = "planned"
+
+    notes = _prompt("Notes")
+
+    account = add_account(
+        role=role,
+        name=name,
+        username_encrypted=username_encrypted,
+        password_encrypted=password_encrypted,
+        purpose=purpose,
+        access=access,
+        status=status,
+        notes=notes,
+        context=context,
+    )
+
+    print()
+    print(
+        f"[PASS] Test account "
+        f"{account['account_id']} berhasil disimpan."
+    )
+    print(
+        f"File: {account_file(context)}"
+    )
+
+    return account
+
+def print_credentials(
+    account_id: str,
+    *,
+    context: Optional[ProjectContext] = None,
+) -> bool:
+    """
+    Decrypt and print credentials for an explicit credential-retrieval command.
+
+    This command is intentionally explicit because it exposes plaintext
+    credentials to the terminal.
+    """
+    if context is None:
+        context = require_active_project()
+
+    credentials = get_account_credentials(
+        account_id,
+        context=context,
+    )
+
+    print("=" * 72)
+    print(" Test Account Credentials")
+    print("=" * 72)
+    print(f"Account ID : {account_id.upper()}")
+    print("WARNING: plaintext credentials akan ditampilkan ke terminal.")
+    print()
+    print(f"Username   : {credentials['username']}")
+    print(f"Password   : {credentials['password']}")
+    return True
+
+
+
 def print_help() -> None:
     """Print CLI help."""
     print(
@@ -769,20 +1088,25 @@ def print_help() -> None:
         "Usage:\n"
         "  python scripts/preparation/account.py init\n"
         "  python scripts/preparation/account.py add\n"
+        "  python scripts/preparation/account.py add-encrypted\n"
         "  python scripts/preparation/account.py list\n"
         "  python scripts/preparation/account.py show TA-001\n"
         "  python scripts/preparation/account.py verify TA-001\n"
         "  python scripts/preparation/account.py status\n"
         "  python scripts/preparation/account.py remove TA-001\n"
+        "  python scripts/preparation/account.py credentials TA-001\n"
         "  python scripts/preparation/account.py version\n"
         "\n"
         "The active project is resolved automatically through "
         "context.py.\n"
         "No --project argument is required.\n"
         "\n"
-        "IMPORTANT:\n"
-        "  Do not store passwords, tokens, API keys, secrets,\n"
-        "  or other authentication credentials in accounts.yaml.\n"
+        "CREDENTIAL SECURITY:\n"
+        "  Command 'add' menerima username/password biasa dan mengenkripsinya\n"
+        "  otomatis menggunakan encryption key project aktif.\n"
+        "  Command 'add-encrypted' menerima ciphertext Fernet secara langsung.\n"
+        "  Plaintext credential tidak disimpan di accounts.yaml.\n"
+        "  Command 'show' dan 'credentials' secara eksplisit menampilkan plaintext.\n"
     )
 
 
@@ -823,6 +1147,13 @@ def main(
 
         if command == "add":
             interactive_add(
+                context=context
+            )
+
+            return 0
+
+        if command == "add-encrypted":
+            interactive_add_encrypted(
                 context=context
             )
 
@@ -876,6 +1207,21 @@ def main(
             )
 
             return 0
+
+        if command == "credentials":
+            if len(args) != 2:
+                print(
+                    "[ERROR] Gunakan: "
+                    "account.py credentials TA-001"
+                )
+                return 2
+
+            found = print_credentials(
+                args[1],
+                context=context,
+            )
+
+            return 0 if found else 1
 
         if command == "status":
             print_status(
@@ -933,6 +1279,7 @@ def main(
         ContextError,
         AccountError,
         ActivityError,
+        SecretsError,
     ) as exc:
         print(
             f"[ERROR] {exc}"
