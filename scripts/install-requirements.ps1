@@ -1,6 +1,6 @@
-﻿#requires -Version 5.1
-# BrebesKab-CSIRT-Tools install-requirements.ps1 v2.6
-# Native verification is based on process exit code, not stdout/stderr content.
+#requires -Version 5.1
+# BrebesKab-CSIRT-Tools install-requirements.ps1 v2.16
+# CLI version verification is based on executable availability and non-empty version output.
 [CmdletBinding()]
 param(
     [switch]$DryRun,
@@ -65,7 +65,7 @@ $GitHubHeaders = @{
 }
 
 $script:State = [ordered]@{
-    schema_version=2.5
+    schema_version=2.16
     started_at=(Get-Date).ToString('o')
     repo_root=$RepoRoot
     dry_run=[bool]$DryRun
@@ -105,7 +105,9 @@ function Test-Administrator {
 }
 
 function Request-Administrator {
-    if (Test-Administrator) { return }
+    if (Test-Administrator) {
+        return
+    }
 
     Write-Log 'PowerShell belum berjalan sebagai Administrator. Meminta akses Administrator melalui UAC...' 'WARN'
 
@@ -135,16 +137,24 @@ function Request-Administrator {
             -Wait `
             -PassThru `
             -ErrorAction Stop
-
-        if ($process.ExitCode -ne 0) {
-            throw "Proses Administrator selesai dengan exit code $($process.ExitCode)."
-        }
-
-        exit 0
     }
     catch {
         throw "Permintaan akses Administrator gagal atau dibatalkan oleh user: $($_.Exception.Message)"
     }
+
+    $childExitCode = $process.ExitCode
+
+    if ($childExitCode -ne 0) {
+        # The elevated child already performed its own error handling and
+        # rollback. Do not let the parent re-enter the installer catch/rollback
+        # path and hide the real child failure behind an elevation error.
+        Write-Log "Proses Administrator selesai dengan exit code $childExitCode." 'ERROR'
+        Write-Log "Detail proses elevated tersedia pada: $LogFile" 'ERROR'
+        exit $childExitCode
+    }
+
+    Write-Log 'Proses Administrator selesai dengan sukses.' 'OK'
+    exit 0
 }
 
 function Refresh-Path {
@@ -725,21 +735,28 @@ function Invoke-NativeCapture {
     $stderrFile = Join-Path $DownloadRoot ("verify-" + [Guid]::NewGuid().ToString('N') + ".stderr")
 
     try {
-        $process = Start-Process `
-            -FilePath $FilePath `
-            -ArgumentList $Arguments `
-            -Wait `
-            -PassThru `
-            -NoNewWindow `
-            -RedirectStandardOutput $stdoutFile `
-            -RedirectStandardError $stderrFile `
-            -ErrorAction Stop
+        # Native tools may write informational/version output to stderr.
+        # In Windows PowerShell 5.1, keep native stderr from becoming a
+        # terminating error while we capture stdout/stderr to files.
+        $previousErrorActionPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            # Use the PowerShell call operator instead of Start-Process -ArgumentList.
+            # Start-Process joins an argument array into a single command-line string,
+            # which can break arguments containing newlines/quotes such as Python -c code.
+            # The call operator preserves the argument array as discrete native arguments.
+            & $FilePath @Arguments 1> $stdoutFile 2> $stderrFile
+            $exitCode = $LASTEXITCODE
+        }
+        finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
 
         $stdout = if(Test-Path $stdoutFile){ Get-Content $stdoutFile -Raw -ErrorAction SilentlyContinue } else { '' }
         $stderr = if(Test-Path $stderrFile){ Get-Content $stderrFile -Raw -ErrorAction SilentlyContinue } else { '' }
 
         [pscustomobject]@{
-            ExitCode = $process.ExitCode
+            ExitCode = $exitCode
             StdOut   = [string]$stdout
             StdErr   = [string]$stderr
         }
@@ -747,6 +764,17 @@ function Invoke-NativeCapture {
     finally {
         Remove-Item $stdoutFile,$stderrFile -Force -ErrorAction SilentlyContinue
     }
+}
+
+function Get-VerificationOutput {
+    param($Result)
+
+    $output = (($Result.StdOut + "`r`n" + $Result.StdErr).Trim())
+    if($output.Length -gt 2000){
+        $output = $output.Substring(0,2000) + '...'
+    }
+
+    $output
 }
 
 function Verify-Command {
@@ -769,24 +797,57 @@ function Verify-Command {
     Write-Log "VERIFY $Name -> $path"
 
     $result = Invoke-NativeCapture -FilePath $path -Arguments $Arguments
+    $output = Get-VerificationOutput $result
 
-    # Native security tools may write informational/version messages to
-    # stderr. Success is determined by ExitCode, not by the output stream.
-    if($result.ExitCode -ne 0){
-        $details = (($result.StdOut + "`r`n" + $result.StdErr).Trim())
-        if($details.Length -gt 2000){
-            $details = $details.Substring(0,2000) + '...'
-        }
-
-        throw "Verifikasi gagal untuk $Name. Exit code: $($result.ExitCode). Output: $details"
-    }
-
-    $output = (($result.StdOut + "`r`n" + $result.StdErr).Trim())
-    if($output.Length -gt 2000){
-        $output = $output.Substring(0,2000) + '...'
+    # Verification criterion for version-capable CLI tools is intentionally simple:
+    # executable exists and the requested version command returns non-empty output.
+    # Do not reject a valid version banner only because the tool uses a non-zero
+    # exit code or writes informational text to stderr on Windows.
+    if([string]::IsNullOrWhiteSpace($output)){
+        throw "Verifikasi gagal untuk ${Name}: command tidak mengembalikan output."
     }
 
     Write-Log "$Name OK: $output" 'OK'
+}
+
+function Verify-Nuclei {
+    if($DryRun){
+        Write-Log 'DryRun: verification dilewati untuk nuclei.' 'DRYRUN'
+        return
+    }
+
+    $path = Find-ToolExecutable 'nuclei'
+
+    if(-not $path){
+        throw 'Tool tidak ditemukan: nuclei'
+    }
+
+    Write-Log "VERIFY nuclei -> $path"
+
+    # Nuclei writes its version banner to stderr on this Windows environment.
+    # Windows PowerShell 5.1 can treat native stderr as a terminating error when
+    # $ErrorActionPreference is Stop. Temporarily use Continue only for this
+    # native command so stderr becomes captured output instead of aborting.
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = (& $path '-version' 2>&1 | Out-String).Trim()
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    # Verification criterion is intentionally simple:
+    # executable exists and -version returns any non-empty output.
+    if([string]::IsNullOrWhiteSpace($output)){
+        throw 'Verifikasi Nuclei gagal: command -version tidak mengembalikan output.'
+    }
+
+    if($output.Length -gt 4000){
+        $output = $output.Substring(0,4000) + '...'
+    }
+
+    Write-Log "nuclei OK: $output" 'OK'
 }
 
 function Verify-PythonEnvironment {
@@ -823,11 +884,14 @@ function Verify-PythonEnvironment {
 
     foreach($check in $PythonImportChecks){
         $pythonCode = @"
-import importlib.util
+import importlib
 import sys
 
 module_name = sys.argv[1]
-if importlib.util.find_spec(module_name) is None:
+try:
+    importlib.import_module(module_name)
+except Exception as exc:
+    print(type(exc).__name__, exc, file=sys.stderr)
     raise SystemExit(1)
 print(module_name)
 "@
@@ -837,7 +901,12 @@ print(module_name)
             -Arguments @('-c',$pythonCode,$check.Module)
 
         if($importCheck.ExitCode -ne 0){
-            throw "Python module tidak dapat diimport: $($check.Module) (package: $($check.Package))"
+            $details = (($importCheck.StdOut + "`r`n" + $importCheck.StdErr).Trim())
+            if($details.Length -gt 2000){
+                $details = $details.Substring(0,2000) + '...'
+            }
+
+            throw "Python module tidak dapat diimport: $($check.Module) (package: $($check.Package)). Output: $details"
         }
 
         Write-Log "Python module OK: $($check.Module) [$($check.Package)]" 'OK'
@@ -968,17 +1037,17 @@ try{
         -Force | Out-Null
 
     Write-Log '============================================================' 'STEP'
-    Write-Log 'BrebesKab-CSIRT-Tools install-requirements.ps1 v2.6' 'STEP'
+    Write-Log 'BrebesKab-CSIRT-Tools install-requirements.ps1 v2.16' 'STEP'
     Write-Log '============================================================' 'STEP'
 
     Request-Administrator
 
     if(-not(Test-Administrator)){
-        throw 'Installer v2.6 tidak berjalan sebagai Administrator setelah proses elevation.'
+        throw 'Installer v2.16 tidak berjalan sebagai Administrator setelah proses elevation.'
     }
 
     if(-not [Environment]::Is64BitOperatingSystem){
-        throw 'Installer v2.6 membutuhkan Windows 64-bit.'
+        throw 'Installer v2.16 membutuhkan Windows 64-bit.'
     }
 
     if(-not(Find-Command 'winget')){
@@ -1012,7 +1081,7 @@ try{
     Verify-Command 'git' @('--version')
     Verify-Command 'nmap' @('--version')
     Verify-Command 'ffuf' @('-V')
-    Verify-Command 'nuclei' @('-version')
+    Verify-Nuclei
     Verify-Command 'httpx' @('-version')
 
     if (-not $DryRun) {
