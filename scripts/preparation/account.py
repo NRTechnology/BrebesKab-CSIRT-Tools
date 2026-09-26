@@ -3,7 +3,7 @@
 BrebesKab-CSIRT-Tools
 Preparation - Test Account
 
-Version: 1.3.0
+Version: 1.5.0
 
 Manage authorized test accounts for a pentest project.
 
@@ -40,7 +40,7 @@ from context import ContextError, ProjectContext, require_active_project
 from secrets import SecretsError, decrypt, encrypt, load_key
 
 
-SCRIPT_VERSION = "1.3.0"
+SCRIPT_VERSION = "1.5.0"
 
 ACCOUNT_DIR_NAME = "account"
 ACCOUNT_FILE_NAME = "accounts.yaml"
@@ -586,10 +586,10 @@ def verify_account(
     *,
     context: Optional[ProjectContext] = None,
 ) -> bool:
-    """
-    Mark an account as active after manual verification.
+    """Mark one test account as active after manual verification.
 
-    This command does not perform authentication against the target.
+    This command verifies one preparation test-account record identified by
+    ``account_id``. It does not authenticate against the target.
     """
     if context is None:
         context = require_active_project()
@@ -610,6 +610,27 @@ def verify_account(
         if current_id != wanted:
             continue
 
+        credentials = _credentials(account)
+
+        try:
+            username = decrypt(credentials["username"])
+            password = decrypt(credentials["password"])
+        except SecretsError as exc:
+            raise AccountError(
+                f"Credential test account {wanted} tidak dapat "
+                "didecrypt dengan project encryption key."
+            ) from exc
+
+        if not username:
+            raise AccountError(
+                f"Username test account {wanted} hasil decrypt kosong."
+            )
+
+        if not password:
+            raise AccountError(
+                f"Password test account {wanted} hasil decrypt kosong."
+            )
+
         account["status"] = "active"
         account["verified_at"] = _now()
 
@@ -629,10 +650,14 @@ def verify_account(
             context=context,
         )
 
+        print(
+            f"[PASS] Test account {wanted} telah diverifikasi aktif."
+        )
+        print("[PASS] Credential encryption/decryption check: OK")
+        print("[PASS] Status: active")
         return True
 
     return False
-
 
 def set_notes(
     notes: str,
@@ -1107,6 +1132,7 @@ def print_help() -> None:
         "  Command 'add-encrypted' menerima ciphertext Fernet secara langsung.\n"
         "  Plaintext credential tidak disimpan di accounts.yaml.\n"
         "  Command 'show' dan 'credentials' secara eksplisit menampilkan plaintext.\n"
+        "  Command 'verify TA-001' memverifikasi satu test account dan mengubah statusnya menjadi active.\n"
     )
 
 
@@ -1200,11 +1226,6 @@ def main(
                     f"{args[1]}"
                 )
                 return 1
-
-            print(
-                f"[PASS] Test account "
-                f"{args[1].upper()} telah diverifikasi aktif."
-            )
 
             return 0
 
