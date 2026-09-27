@@ -5,7 +5,7 @@ Infrastructure - Infrastructure Summary
 
 Phase : 03 Infrastructure
 Item  : 03-011 Infrastructure Summary
-Version: 1.0.0
+Version: 1.0.1
 
 Purpose:
     Consolidate the completed infrastructure assessment results into one
@@ -77,7 +77,7 @@ from activity import record_activity
 from context import require_active_project
 
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 RECON_DIR_NAME = "02-reconnaissance"
 INFRA_DIR_NAME = "03-infrastructure"
@@ -854,15 +854,36 @@ def build_highlights(
         else {}
     )
 
+    network_ports = (
+        network.get("ports", [])
+        if isinstance(network, dict)
+        else []
+    )
+
+    observed_open_ports = (
+        network_summary.get("open_ports")
+        or network_summary.get("observed_open_ports")
+    )
+
+    # The reconnaissance network artifact stores the port observations
+    # directly under network.ports and does not require a network.summary
+    # section. Derive the count from the authoritative ports list when an
+    # explicit summary count is absent.
+    if observed_open_ports is None:
+        if isinstance(network_ports, list):
+            observed_open_ports = sum(
+                1
+                for item in network_ports
+                if isinstance(item, dict)
+                and str(item.get("state", "")).strip().lower() == "open"
+            )
+        else:
+            observed_open_ports = 0
+
     return {
         "network": {
-            "observed_open_ports": (
-                network_summary.get("open_ports")
-                or network_summary.get("observed_open_ports")
-            ),
-            "ports": network.get("ports", [])
-            if isinstance(network, dict)
-            else [],
+            "observed_open_ports": observed_open_ports,
+            "ports": network_ports,
         },
         "service": {
             "ports_enumerated": service_summary.get("ports_enumerated"),
@@ -1057,9 +1078,12 @@ def build_summary(
         if record["requires_review"] is True
     )
 
+    # Lifecycle status is independent from requires_review.
+    # All source checklists can be completed even when some assessment
+    # conditions still require analyst review.
     summary_status = (
-        "in-progress"
-        if completed_count != len(CHECKLISTS)
+        "completed"
+        if completed_count == len(CHECKLISTS)
         else "in-progress"
     )
 
@@ -1173,7 +1197,7 @@ def cmd_generate() -> int:
         phase="03-infrastructure",
         item="03-011",
         action="Infrastructure summary generated",
-        status="in-progress",
+        status=summary["status"],
     )
 
     checklist_count = summary["infrastructure"]["checklists"]["completed"]
@@ -1257,6 +1281,19 @@ def validate_summary(data: dict[str, Any]) -> list[str]:
         if completed != len(CHECKLISTS):
             errors.append(
                 "Belum semua checklist infrastructure completed."
+            )
+
+        expected_status = (
+            "completed"
+            if completed == len(CHECKLISTS)
+            else "in-progress"
+        )
+
+        top_status = str(data.get("status", "")).strip().lower()
+        if top_status != expected_status:
+            errors.append(
+                "Status summary tidak konsisten dengan jumlah checklist: "
+                f"expected={expected_status}, actual={top_status or '-'}"
             )
 
     modules = infrastructure.get("modules")
