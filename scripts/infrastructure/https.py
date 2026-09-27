@@ -3,7 +3,7 @@
 BrebesKab-CSIRT-Tools
 Infrastructure - HTTPS Configuration
 
-Version: 1.0.0
+Version: 1.0.1
 
 Checklist mapping:
     3-007 - HTTPS configuration
@@ -102,8 +102,8 @@ warnings.simplefilter("ignore", InsecureRequestWarning)
 # Constants
 # ---------------------------------------------------------------------------
 
-SCRIPT_VERSION = "1.0.0"
-SCHEMA_VERSION = "1.0"
+SCRIPT_VERSION = "1.0.1"
+SCHEMA_VERSION = "1.1"
 
 CHECKLIST_ID = "3-007"
 CHECKLIST_NAME = "HTTPS configuration"
@@ -1172,7 +1172,7 @@ def cmd_version() -> int:
     print("Scope    : 01-preparation/scope/scope.yaml")
     print("Tool     : Python requests; optional curl confirmation")
     print("Rule     : HTTPS 2xx = content-served-over-https; HTTPS 3xx final HTTPS = redirects-within-https; same-host final HTTP = redirects-to-http")
-    print("Evidence : Certificate validation deferred to 3-010; Set-Cookie retained with values redacted")
+    print("Evidence : Certificate validation deferred to 3-010; Set-Cookie retained with values redacted; body size semantics are explicit")
     return 0
 
 
