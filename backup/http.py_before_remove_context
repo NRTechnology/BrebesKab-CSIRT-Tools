@@ -3,7 +3,7 @@
 BrebesKab-CSIRT-Tools
 Infrastructure - HTTP Configuration
 
-Version: 1.0.2
+Version: 1.0.1
 
 Checklist mapping:
     3-006 - HTTP configuration
@@ -97,8 +97,8 @@ except ImportError as exc:
 # Constants
 # ---------------------------------------------------------------------------
 
-SCRIPT_VERSION = "1.0.2"
-SCHEMA_VERSION = "1.2"
+SCRIPT_VERSION = "1.0.1"
+SCHEMA_VERSION = "1.1"
 
 CHECKLIST_ID = "3-006"
 CHECKLIST_NAME = "HTTP configuration"
@@ -389,6 +389,9 @@ def target_metadata(network_data: dict[str, Any]) -> dict[str, Any]:
 def build_http_url(hostname: str) -> str:
     return f"http://{hostname}/"
 
+
+def build_https_url(hostname: str) -> str:
+    return f"https://{hostname}/"
 
 
 # ---------------------------------------------------------------------------
@@ -871,6 +874,7 @@ def cmd_analyze() -> int:
         )
 
     http_url = build_http_url(target["hostname"])
+    https_url = build_https_url(target["hostname"])
 
     print(f"[INFO] HTTP configuration probe: {http_url}")
 
@@ -896,6 +900,21 @@ def cmd_analyze() -> int:
         curl_result,
     )
 
+    # Store HTTPS comparison as supporting context only. The module does not
+    # assess HTTPS/TLS security; it records availability/final URL so the report
+    # can explain the HTTP redirect behavior without duplicating 3-007..3-010.
+    comparison = request_once(
+        https_url,
+        allow_redirects=True,
+        verify=True,
+    )
+    document["http"]["https_context"] = {
+        "url": https_url,
+        "status_code": comparison.get("status_code"),
+        "final_url": comparison.get("final_url", ""),
+        "error": comparison.get("error", ""),
+        "tool": comparison.get("tool", "python-requests"),
+    }
 
     save_json(
         http_evidence_file(),
@@ -906,6 +925,7 @@ def cmd_analyze() -> int:
             "method": "controlled GET; initial response captured before redirect following",
             "http": initial,
             "followed": followed,
+            "https_context": comparison,
             "curl": curl_result,
         },
     )
