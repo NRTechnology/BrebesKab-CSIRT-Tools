@@ -3,8 +3,8 @@
 BrebesKab-CSIRT-Tools
 Infrastructure - Certificate Validation Assessment
 
-Version: 1.0.0
-Schema: 1.0
+Version: 1.0.2
+Schema: 1.2
 
 Checklist mapping:
     3-010 - Certificate validation
@@ -58,10 +58,10 @@ import argparse
 import datetime as dt
 import hashlib
 import ipaddress
+import os
 import json
 import re
 import shutil
-import ssl
 import subprocess
 import sys
 from pathlib import Path
@@ -114,8 +114,8 @@ except ImportError as exc:
 # Constants
 # ---------------------------------------------------------------------------
 
-SCRIPT_VERSION = "1.0.0"
-SCHEMA_VERSION = "1.0"
+SCRIPT_VERSION = "1.0.2"
+SCHEMA_VERSION = "1.2"
 
 CHECKLIST_ID = "3-010"
 CHECKLIST_NAME = "Certificate validation"
@@ -439,17 +439,60 @@ def require_authorized_target(
 
 
 def find_executable(*names: str) -> str:
+    """Resolve executables from PATH plus known Windows installation paths.
+
+    The installer may have updated User PATH in an elevated child process while
+    the current PowerShell/Python process still has the older environment.
+    Known installation paths therefore provide a deterministic fallback.
+    """
     for name in names:
         path = shutil.which(name)
         if path:
-            return path
+            return str(Path(path).resolve())
+
+    if os.name == "nt":
+        program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+        program_files_x86 = Path(
+            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        )
+        local_app_data = Path(
+            os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))
+        )
+
+        known_paths = {
+            "openssl": [
+                program_files / "OpenSSL-Win64" / "bin" / "openssl.exe",
+                program_files / "OpenSSL-Win32" / "bin" / "openssl.exe",
+                program_files_x86 / "OpenSSL-Win32" / "bin" / "openssl.exe",
+            ],
+            "openssl.exe": [
+                program_files / "OpenSSL-Win64" / "bin" / "openssl.exe",
+                program_files / "OpenSSL-Win32" / "bin" / "openssl.exe",
+                program_files_x86 / "OpenSSL-Win32" / "bin" / "openssl.exe",
+            ],
+            "curl.exe": [
+                Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "curl.exe",
+                local_app_data / "Microsoft" / "WinGet" / "Links" / "curl.exe",
+            ],
+            "curl": [
+                Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "curl.exe",
+                local_app_data / "Microsoft" / "WinGet" / "Links" / "curl.exe",
+            ],
+        }
+        for name in names:
+            for candidate in known_paths.get(name.lower(), []):
+                if candidate.is_file():
+                    return str(candidate.resolve())
+
     return ""
 
 
 def tool_version(executable: str) -> str:
     if not executable:
         return ""
-    candidates = [["version"], ["--version"], ["-version"]]
+    # Prefer canonical --version first. The curl subcommand "version" would
+    # otherwise be interpreted as a hostname/path and produce curl error 6.
+    candidates = [["--version"], ["version"], ["-version"]]
     for args in candidates:
         try:
             result = subprocess.run(
@@ -540,8 +583,12 @@ def parse_certificate(cert: x509.Certificate, index: int) -> dict[str, Any]:
     except Exception:
         sig_name = "unknown"
 
-    not_before = getattr(cert, "not_valid_before_utc", cert.not_valid_before)
-    not_after = getattr(cert, "not_valid_after_utc", cert.not_valid_after)
+    not_before = getattr(cert, "not_valid_before_utc", None)
+    if not_before is None:
+        not_before = cert.not_valid_before
+    not_after = getattr(cert, "not_valid_after_utc", None)
+    if not_after is None:
+        not_after = cert.not_valid_after
 
     return {
         "index": index,
@@ -596,6 +643,48 @@ def parse_pem_certificates(pem_text: str) -> tuple[list[x509.Certificate], list[
     return certificates, errors
 
 
+def normalize_dns_name(value: str) -> str:
+    """Normalize a DNS name for case-insensitive certificate comparison."""
+    value = str(value).strip().rstrip(".")
+    if not value:
+        return ""
+    try:
+        return value.encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        return value.lower()
+
+
+def dns_name_matches(pattern: str, hostname: str) -> bool:
+    """Match a certificate DNS SAN/CN using conservative RFC-style rules.
+
+    Supports exact DNS names and a single left-most-label wildcard such as
+    ``*.example.com``. Wildcards are not accepted in partial labels or across
+    multiple labels.
+    """
+    pattern_norm = normalize_dns_name(pattern)
+    hostname_norm = normalize_dns_name(hostname)
+    if not pattern_norm or not hostname_norm:
+        return False
+    if pattern_norm == hostname_norm:
+        return True
+
+    if "*" not in pattern_norm:
+        return False
+    if not pattern_norm.startswith("*.") or pattern_norm.count("*") != 1:
+        return False
+
+    suffix = pattern_norm[2:]
+    if not suffix:
+        return False
+
+    prefix, sep, remainder = hostname_norm.partition(".")
+    if not sep or not prefix or remainder != suffix:
+        return False
+
+    # The wildcard must represent exactly one DNS label.
+    return "*" not in prefix and "." not in prefix
+
+
 def hostname_matches_leaf(cert: x509.Certificate, hostname: str) -> tuple[bool, str]:
     # Prefer SAN and only use CN as a fallback for evidence. curl/Schannel is
     # the independent final hostname-validation authority for this module.
@@ -627,34 +716,31 @@ def hostname_matches_leaf(cert: x509.Certificate, hostname: str) -> tuple[bool, 
     else:
         source = "subject-alternative-name"
 
-    try:
-        if target_is_ip:
-            target_ip = ipaddress.ip_address(hostname)
-            for candidate in presented:
-                try:
-                    if ipaddress.ip_address(candidate) == target_ip:
-                        return True, source
-                except ValueError:
-                    continue
-        else:
-            # Let Python's hostname matcher apply standard wildcard rules.
-            cert_dict = {"subjectAltName": [("DNS", value) for value in presented]}
+    if target_is_ip:
+        target_ip = ipaddress.ip_address(hostname)
+        for candidate in presented:
             try:
-                ssl.match_hostname(cert_dict, hostname)
-                return True, source
-            except ssl.CertificateError:
-                # Python's matcher does not accept CN fallback through SAN.
-                pass
-    except Exception:
-        pass
+                if ipaddress.ip_address(candidate) == target_ip:
+                    return True, source
+            except ValueError:
+                continue
+        return False, source
+
+    for candidate in presented:
+        if dns_name_matches(str(candidate), hostname):
+            return True, source
 
     return False, source
 
 
 def validity_result(cert: x509.Certificate) -> dict[str, Any]:
     now = dt.datetime.now(dt.timezone.utc)
-    not_before = getattr(cert, "not_valid_before_utc", cert.not_valid_before)
-    not_after = getattr(cert, "not_valid_after_utc", cert.not_valid_after)
+    not_before = getattr(cert, "not_valid_before_utc", None)
+    if not_before is None:
+        not_before = cert.not_valid_before
+    not_after = getattr(cert, "not_valid_after_utc", None)
+    if not_after is None:
+        not_after = cert.not_valid_after
     if not_before.tzinfo is None:
         not_before = not_before.replace(tzinfo=dt.timezone.utc)
     if not_after.tzinfo is None:
