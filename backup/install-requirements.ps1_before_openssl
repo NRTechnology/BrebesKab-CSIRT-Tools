@@ -1,5 +1,5 @@
-﻿#requires -Version 5.1
-# BrebesKab-CSIRT-Tools install-requirements.ps1 v2.18
+#requires -Version 5.1
+# BrebesKab-CSIRT-Tools install-requirements.ps1 v2.17
 # CLI version verification is based on executable availability and non-empty version output.
 [CmdletBinding()]
 param(
@@ -65,7 +65,7 @@ $GitHubHeaders = @{
 }
 
 $script:State = [ordered]@{
-    schema_version=2.18
+    schema_version=2.17
     started_at=(Get-Date).ToString('o')
     repo_root=$RepoRoot
     dry_run=[bool]$DryRun
@@ -73,8 +73,6 @@ $script:State = [ordered]@{
     venv_created_by_script=$false
     python_reference=$null
     python_base=$null
-    curl_reference=$null
-    openssl_reference=$null
     completed=$false
 }
 
@@ -279,101 +277,6 @@ function Ensure-Curl {
 
     Write-Log "curl berhasil diinstall: $installed" 'OK'
     return $installed
-}
-
-function Find-OpenSSLExecutable {
-    <#
-        Resolve a real native openssl.exe executable.
-
-        Priority:
-        1. Native openssl.exe available in PATH.
-        2. Common OpenSSL installation locations on Windows.
-
-        This intentionally accepts an already-installed OpenSSL from another
-        trusted installation (for example a developer toolchain) and does not
-        reinstall or replace it.
-    #>
-    try {
-        $command = Get-Command 'openssl.exe' -CommandType Application -ErrorAction Stop |
-            Select-Object -First 1
-
-        if ($command -and $command.Source) {
-            $source = [string]$command.Source
-            if (Test-Path $source) {
-                return $source
-            }
-        }
-    }
-    catch {}
-
-    $candidates = @(
-        (Join-Path $env:ProgramFiles 'OpenSSL-Win64\bin\openssl.exe'),
-        (Join-Path $env:ProgramFiles 'OpenSSL-Win32\bin\openssl.exe'),
-        (Join-Path $env:ProgramFiles 'OpenSSL\bin\openssl.exe'),
-        (Join-Path ${env:ProgramFiles(x86)} 'OpenSSL-Win32\bin\openssl.exe'),
-        (Join-Path ${env:ProgramFiles(x86)} 'OpenSSL\bin\openssl.exe'),
-        (Join-Path $env:LOCALAPPDATA 'Programs\OpenSSL\bin\openssl.exe')
-    )
-
-    foreach ($candidate in $candidates) {
-        if ($candidate -and (Test-Path $candidate)) {
-            return $candidate
-        }
-    }
-
-    $null
-}
-
-function Ensure-OpenSSL {
-    $existing = Find-OpenSSLExecutable
-
-    if ($existing) {
-        $binDir = Split-Path -Parent $existing
-
-        Write-Log "OpenSSL sudah tersedia: $existing" 'OK'
-
-        # Make an existing installation consistently available to child
-        # processes used by the toolkit, without reinstalling or replacing it.
-        Add-UserPath $binDir
-
-        Refresh-Path
-        $resolved = Find-OpenSSLExecutable
-
-        if ($resolved) {
-            Write-Log "OpenSSL reference: $resolved" 'OK'
-            return $resolved
-        }
-
-        Write-Log "OpenSSL ditemukan tetapi PATH belum dapat direfresh otomatis: $existing" 'WARN'
-        return $existing
-    }
-
-    if ($DryRun) {
-        Write-Log 'DryRun: OpenSSL tidak ditemukan; install via WinGet: ShiningLight.OpenSSL.Light' 'DRYRUN'
-        return $null
-    }
-
-    Write-Log 'OpenSSL tidak ditemukan. Menginstall OpenSSL Light via WinGet: ShiningLight.OpenSSL.Light' 'STEP'
-    Install-WinGetPackage 'OpenSSL Light' 'ShiningLight.OpenSSL.Light'
-    Refresh-Path
-
-    $installed = Find-OpenSSLExecutable
-
-    if (-not $installed) {
-        throw 'openssl.exe tidak ditemukan setelah instalasi ShiningLight.OpenSSL.Light.'
-    }
-
-    $binDir = Split-Path -Parent $installed
-    Add-UserPath $binDir
-    Refresh-Path
-
-    $resolved = Find-OpenSSLExecutable
-    if (-not $resolved) {
-        throw "OpenSSL terpasang tetapi executable tidak dapat di-resolve: $installed"
-    }
-
-    Write-Log "OpenSSL berhasil diinstall: $resolved" 'OK'
-    return $resolved
 }
 
 function Get-PythonBaseExecutable {
@@ -858,8 +761,6 @@ function Find-ToolExecutable {
         httpx {Join-Path $HttpxDir 'httpx.exe'}
         'curl.exe' {Find-CurlExecutable}
         'curl' {Find-CurlExecutable}
-        'openssl.exe' {Find-OpenSSLExecutable}
-        'openssl' {Find-OpenSSLExecutable}
         default {$null}
     }
 
@@ -1183,17 +1084,17 @@ try{
         -Force | Out-Null
 
     Write-Log '============================================================' 'STEP'
-    Write-Log 'BrebesKab-CSIRT-Tools install-requirements.ps1 v2.18' 'STEP'
+    Write-Log 'BrebesKab-CSIRT-Tools install-requirements.ps1 v2.17' 'STEP'
     Write-Log '============================================================' 'STEP'
 
     Request-Administrator
 
     if(-not(Test-Administrator)){
-        throw 'Installer v2.18 tidak berjalan sebagai Administrator setelah proses elevation.'
+        throw 'Installer v2.16 tidak berjalan sebagai Administrator setelah proses elevation.'
     }
 
     if(-not [Environment]::Is64BitOperatingSystem){
-        throw 'Installer v2.18 membutuhkan Windows 64-bit.'
+        throw 'Installer v2.16 membutuhkan Windows 64-bit.'
     }
 
     if(-not(Find-Command 'winget')){
@@ -1213,12 +1114,6 @@ try{
     # Existing curl.exe installations are reused; WinGet is only invoked
     # when no native curl.exe executable is available.
     $curlPath = Ensure-Curl
-    Refresh-Path
-
-    # OpenSSL is handled separately from the standard WinGet package list.
-    # Existing native openssl.exe installations are reused; WinGet is only
-    # invoked when no usable OpenSSL executable can be located.
-    $opensslPath = Ensure-OpenSSL
     Refresh-Path
 
     $venvPython=Ensure-Venv
@@ -1242,7 +1137,6 @@ try{
     Verify-Nuclei
     Verify-Command 'httpx' @('-version')
     Verify-Command 'curl.exe' @('--version')
-    Verify-Command 'openssl.exe' @('version')
 
     if (-not $DryRun) {
         if (-not (Test-ProjectPython $venvPython)) {
@@ -1270,7 +1164,6 @@ try{
     }
 
     $script:State.curl_reference = $curlPath
-    $script:State.openssl_reference = $opensslPath
     $script:State.completed=$true
     $script:State.completed_at=(Get-Date).ToString('o')
     Save-State
