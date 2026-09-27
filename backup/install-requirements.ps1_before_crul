@@ -1,5 +1,5 @@
 #requires -Version 5.1
-# BrebesKab-CSIRT-Tools install-requirements.ps1 v2.17
+# BrebesKab-CSIRT-Tools install-requirements.ps1 v2.16
 # CLI version verification is based on executable availability and non-empty version output.
 [CmdletBinding()]
 param(
@@ -65,7 +65,7 @@ $GitHubHeaders = @{
 }
 
 $script:State = [ordered]@{
-    schema_version=2.17
+    schema_version=2.16
     started_at=(Get-Date).ToString('o')
     repo_root=$RepoRoot
     dry_run=[bool]$DryRun
@@ -232,51 +232,6 @@ function Install-WinGetPackage {
 
     Add-InstalledComponent 'winget' $Name $Id '' ''
     Write-Log "$Name berhasil diinstall." 'OK'
-}
-
-function Find-CurlExecutable {
-    # Use curl.exe explicitly so the Windows PowerShell "curl" alias
-    # (Invoke-WebRequest) is never mistaken for the native cURL executable.
-    try {
-        $command = Get-Command 'curl.exe' -CommandType Application -ErrorAction Stop |
-            Select-Object -First 1
-
-        if ($command -and $command.Source) {
-            $source = [string]$command.Source
-            if (Test-Path $source) {
-                return $source
-            }
-        }
-    }
-    catch {}
-
-    $null
-}
-
-function Ensure-Curl {
-    $existing = Find-CurlExecutable
-
-    if ($existing) {
-        Write-Log "curl sudah tersedia: $existing" 'OK'
-        return $existing
-    }
-
-    if ($DryRun) {
-        Write-Log 'DryRun: curl.exe tidak ditemukan; install cURL via WinGet: cURL.cURL' 'DRYRUN'
-        return $null
-    }
-
-    Write-Log 'curl.exe tidak ditemukan. Menginstall cURL via WinGet: cURL.cURL' 'STEP'
-    Install-WinGetPackage 'curl' 'cURL.cURL'
-    Refresh-Path
-
-    $installed = Find-CurlExecutable
-    if (-not $installed) {
-        throw 'curl.exe tidak ditemukan setelah instalasi cURL.cURL.'
-    }
-
-    Write-Log "curl berhasil diinstall: $installed" 'OK'
-    return $installed
 }
 
 function Get-PythonBaseExecutable {
@@ -759,8 +714,6 @@ function Find-ToolExecutable {
     $candidate=switch($Name){
         nuclei {Join-Path $NucleiDir 'nuclei.exe'}
         httpx {Join-Path $HttpxDir 'httpx.exe'}
-        'curl.exe' {Find-CurlExecutable}
-        'curl' {Find-CurlExecutable}
         default {$null}
     }
 
@@ -1084,7 +1037,7 @@ try{
         -Force | Out-Null
 
     Write-Log '============================================================' 'STEP'
-    Write-Log 'BrebesKab-CSIRT-Tools install-requirements.ps1 v2.17' 'STEP'
+    Write-Log 'BrebesKab-CSIRT-Tools install-requirements.ps1 v2.16' 'STEP'
     Write-Log '============================================================' 'STEP'
 
     Request-Administrator
@@ -1110,12 +1063,6 @@ try{
 
     Refresh-Path
 
-    # cURL is handled separately from the standard WinGet package list.
-    # Existing curl.exe installations are reused; WinGet is only invoked
-    # when no native curl.exe executable is available.
-    $curlPath = Ensure-Curl
-    Refresh-Path
-
     $venvPython=Ensure-Venv
     Install-PythonPackages $venvPython
     Install-PlaywrightChromium $venvPython
@@ -1136,7 +1083,6 @@ try{
     Verify-Command 'ffuf' @('-V')
     Verify-Nuclei
     Verify-Command 'httpx' @('-version')
-    Verify-Command 'curl.exe' @('--version')
 
     if (-not $DryRun) {
         if (-not (Test-ProjectPython $venvPython)) {
@@ -1163,7 +1109,6 @@ try{
         Write-Log 'OWASP ZAP verification OK.' 'OK'
     }
 
-    $script:State.curl_reference = $curlPath
     $script:State.completed=$true
     $script:State.completed_at=(Get-Date).ToString('o')
     Save-State
