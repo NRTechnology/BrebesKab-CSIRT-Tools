@@ -3,8 +3,8 @@
 BrebesKab-CSIRT-Tools
 Infrastructure - TLS Protocol & Cipher Assessment
 
-Version: 1.0.0
-Schema: 1.0
+Version: 1.0.2
+Schema: 1.2
 
 Checklist mapping:
     3-008 - TLS protocol
@@ -101,8 +101,8 @@ except ImportError as exc:
 # Constants
 # ---------------------------------------------------------------------------
 
-SCRIPT_VERSION = "1.0.1"
-SCHEMA_VERSION = "1.1"
+SCRIPT_VERSION = "1.0.2"
+SCHEMA_VERSION = "1.2"
 
 CHECKLIST_PROTOCOL = "3-008"
 CHECKLIST_PROTOCOL_NAME = "TLS protocol"
@@ -504,7 +504,7 @@ def empty_document(
             "scope_reference": target["scope_reference"],
             "scope_authorized_ports": sorted(scope_ports),
             "network_observed_open_ports": sorted(network_open_ports(network_data)),
-            "method": "Nmap ssl-enum-ciphers primary; optional OpenSSL corroboration",
+            "method": "Nmap ssl-enum-ciphers primary; OpenSSL s_client optional corroboration and negotiated-cipher observation",
             "toolchain": {
                 "nmap": {
                     "available": False,
@@ -516,7 +516,7 @@ def empty_document(
                     "available": False,
                     "path": "",
                     "version": "",
-                    "role": "optional corroboration",
+                    "role": "optional corroboration and negotiated-cipher observation",
                 },
             },
             "probe": {
@@ -533,8 +533,10 @@ def empty_document(
                 {
                     "name": protocol,
                     "status": "not-observed",
-                    "source": "ssl-enum-ciphers",
-                    "evidence": "",
+                    "nmap_status": "not-observed",
+                    "openssl_status": "not-run",
+                    "source": "nmap+openssl",
+                    "evidence": "not yet analyzed",
                 }
                 for protocol in TLS_PROTOCOLS
             ],
@@ -545,6 +547,10 @@ def empty_document(
                     "requires_review": False,
                     "accepted_legacy": [],
                     "accepted_modern": [],
+                    "rejected_legacy": [],
+                    "legacy_not_confirmed": [],
+                    "sslv3_observed": False,
+                    "note": "Protocol evidence is not assessed before analyze.",
                 },
                 "cipher": {
                     "result": "not-assessed",
@@ -552,6 +558,11 @@ def empty_document(
                     "legacy_observed": [],
                     "unknown_observed": [],
                     "modern_observed": [],
+                    "nmap_cipher_count": 0,
+                    "openssl_negotiated_cipher_count": 0,
+                    "enumeration_complete": False,
+                    "coverage": "not-assessed",
+                    "note": "Cipher enumeration completeness is not asserted before analysis.",
                 },
                 "overall_requires_review": False,
             },
@@ -568,8 +579,9 @@ def empty_document(
             },
             "errors": [],
             "notes": [
-                "Accepted protocols are positive observations from ssl-enum-ciphers.",
-                "A protocol absent from Nmap enumeration is recorded as not-observed, not as an asserted rejection.",
+                "Protocol status is normalized from Nmap ssl-enum-ciphers and optional OpenSSL handshake corroboration.",
+                "A protocol absent from both probes is recorded as not-observed; it is not asserted as rejected.",
+                "OpenSSL s_client reports the negotiated cipher from one handshake and does not constitute complete cipher enumeration.",
                 "Certificate validation is deferred to checklist 3-010.",
                 "TLS protocol and cipher evidence are kept separate from vulnerability findings.",
             ],
@@ -811,23 +823,6 @@ def parse_int(value: str) -> int | None:
         return None
 
 
-def classify_cipher(name: str, protocol: str, strength_bits: int | None) -> str:
-    for pattern in LEGACY_CIPHER_PATTERNS:
-        if pattern.search(name):
-            return "legacy-review"
-
-    if not name or not CIPHER_NAME_PATTERN.match(name):
-        return "unknown"
-
-    # TLS 1.3 AES-GCM/ChaCha20 suites and common AEAD families are treated as
-    # modern observations. This remains an evidence classifier, not a finding.
-    if any(pattern.search(name) for pattern in CIPHER_STRENGTH_PATTERNS):
-        return "modern"
-
-    if strength_bits is not None and strength_bits >= 128:
-        return "modern"
-
-    return "unknown"
 
 
 def collect_cipher_tables(protocol_table: ET.Element, protocol: str) -> list[dict[str, Any]]:
@@ -966,6 +961,44 @@ def openssl_protocol_argument(protocol: str) -> str:
     }[protocol]
 
 
+def parse_openssl_negotiated_values(text: str) -> tuple[str, str]:
+    """Extract negotiated protocol and cipher from OpenSSL s_client output."""
+    combined = text or ""
+    negotiated_protocol = ""
+    negotiated_cipher = ""
+
+    match = re.search(r"Protocol version:\s*(TLSv\d(?:\.\d)?)", combined, re.IGNORECASE)
+    if match:
+        negotiated_protocol = match.group(1)
+
+    match = re.search(r"Ciphersuite:\s*([^\s]+)", combined, re.IGNORECASE)
+    if match:
+        negotiated_cipher = match.group(1).strip()
+    else:
+        match = re.search(r"Cipher is\s+([^\s]+)", combined, re.IGNORECASE)
+        if match:
+            negotiated_cipher = match.group(1).strip()
+
+    return negotiated_protocol, negotiated_cipher
+
+
+def classify_openssl_failure(stderr: str, stdout: str) -> tuple[str, str]:
+    """Classify OpenSSL failure without converting generic client errors to rejection."""
+    combined = "\n".join((stdout or "", stderr or "")).lower()
+
+    # A server alert indicating an unsupported protocol is useful positive
+    # evidence that the requested protocol was rejected by the peer.
+    server_rejection_markers = (
+        "tlsv1 alert protocol version",
+        "alert protocol version",
+        "unsupported protocol",
+    )
+    if any(marker in combined for marker in server_rejection_markers):
+        return "rejected", "server-rejected-protocol"
+
+    return "error", "openssl-handshake-failed-without-server-rejection-evidence"
+
+
 def run_openssl_probe(hostname: str, protocol: str) -> dict[str, Any]:
     executable, version = discover_openssl()
     if not executable:
@@ -977,8 +1010,10 @@ def run_openssl_probe(hostname: str, protocol: str) -> dict[str, Any]:
             "stdout": "",
             "stderr": "",
             "negotiated_protocol": "",
+            "negotiated_cipher": "",
             "version": "",
             "executable": "",
+            "client_policy_relaxed": False,
         }
 
     command = [
@@ -993,13 +1028,14 @@ def run_openssl_probe(hostname: str, protocol: str) -> dict[str, Any]:
         "-no_ticket",
     ]
 
-    # OpenSSL 3.x/4.x can reject TLS 1.0/1.1 on the client side because of
-    # its local security policy. Lower the client cipher security level only
-    # for the legacy-protocol corroboration probes so a client-side policy is
-    # less likely to masquerade as a server-side rejection. This does not
-    # relax TLS 1.2/1.3 probes.
+    client_policy_relaxed = False
+    # OpenSSL 4.x can reject TLS 1.0/1.1 on the client side because of the
+    # local security policy. Lower the client cipher security level only for
+    # these corroboration probes so a local policy is less likely to masquerade
+    # as a server-side rejection. This does not relax TLS 1.2/1.3 probes.
     if protocol in {"TLSv1.0", "TLSv1.1"}:
         command.extend(["-cipher", "DEFAULT:@SECLEVEL=0"])
+        client_policy_relaxed = True
 
     try:
         result = subprocess.run(
@@ -1022,8 +1058,10 @@ def run_openssl_probe(hostname: str, protocol: str) -> dict[str, Any]:
             "stdout": str(exc.stdout or ""),
             "stderr": str(exc.stderr or ""),
             "negotiated_protocol": "",
+            "negotiated_cipher": "",
             "version": version,
             "executable": executable,
+            "client_policy_relaxed": client_policy_relaxed,
         }
     except OSError as exc:
         return {
@@ -1034,28 +1072,35 @@ def run_openssl_probe(hostname: str, protocol: str) -> dict[str, Any]:
             "stdout": "",
             "stderr": "",
             "negotiated_protocol": "",
+            "negotiated_cipher": "",
             "version": version,
             "executable": executable,
+            "client_policy_relaxed": client_policy_relaxed,
         }
 
-    combined = "\n".join((result.stdout or "", result.stderr or ""))
-    negotiated = ""
-    match = re.search(r"Protocol version:\s*(TLSv\d(?:\.\d)?)", combined)
-    if match:
-        negotiated = match.group(1)
+    stdout = result.stdout or ""
+    stderr = result.stderr or ""
+    combined = "\n".join((stdout, stderr))
+    negotiated_protocol, negotiated_cipher = parse_openssl_negotiated_values(combined)
 
-    status = "accepted" if result.returncode == 0 and negotiated else "rejected-or-error"
+    if result.returncode == 0 and negotiated_protocol:
+        status = "accepted"
+        reason = "handshake succeeded"
+    else:
+        status, reason = classify_openssl_failure(stderr, stdout)
 
     return {
         "protocol": protocol,
         "status": status,
-        "reason": "handshake succeeded" if status == "accepted" else "OpenSSL handshake did not complete",
+        "reason": reason,
         "returncode": result.returncode,
-        "stdout": result.stdout or "",
-        "stderr": result.stderr or "",
-        "negotiated_protocol": negotiated,
+        "stdout": stdout,
+        "stderr": stderr,
+        "negotiated_protocol": negotiated_protocol,
+        "negotiated_cipher": negotiated_cipher,
         "version": version,
         "executable": executable,
+        "client_policy_relaxed": client_policy_relaxed,
     }
 
 
@@ -1087,6 +1132,165 @@ def run_optional_openssl(hostname: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def normalize_protocol_evidence(
+    nmap_protocols: list[dict[str, Any]],
+    openssl_protocols: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Combine Nmap and OpenSSL protocol observations without overstating absence."""
+    nmap_by_name = {
+        str(item.get("name")): item
+        for item in nmap_protocols
+        if isinstance(item, dict)
+    }
+    openssl_by_name = {
+        str(item.get("protocol")): item
+        for item in openssl_protocols
+        if isinstance(item, dict)
+    }
+
+    normalized: list[dict[str, Any]] = []
+    for protocol in TLS_PROTOCOLS:
+        nmap_item = nmap_by_name.get(protocol, {})
+        openssl_item = openssl_by_name.get(protocol, {})
+        nmap_status = str(nmap_item.get("status", "not-observed"))
+        openssl_status = str(openssl_item.get("status", "not-run"))
+
+        if nmap_status == "accepted" or openssl_status == "accepted":
+            final_status = "accepted"
+        elif openssl_status == "rejected":
+            final_status = "rejected"
+        elif openssl_status in {"error", "timeout"} and nmap_status == "not-observed":
+            final_status = "not-observed"
+        else:
+            final_status = "not-observed"
+
+        sources: list[str] = []
+        if nmap_status == "accepted":
+            sources.append("nmap")
+        if openssl_status in {"accepted", "rejected"}:
+            sources.append("openssl")
+
+        if final_status == "accepted":
+            evidence = "positive protocol observation from one or more probes"
+        elif final_status == "rejected":
+            evidence = "OpenSSL server-rejection evidence"
+        elif openssl_status in {"error", "timeout"}:
+            evidence = "no positive observation; OpenSSL probe did not establish rejection"
+        else:
+            evidence = "not observed by available probes; not asserted as cryptographic rejection"
+
+        normalized.append(
+            {
+                "name": protocol,
+                "status": final_status,
+                "nmap_status": nmap_status,
+                "openssl_status": openssl_status,
+                "source": "+".join(sources) if sources else "nmap+openssl",
+                "evidence": evidence,
+            }
+        )
+
+    return normalized
+
+
+def classify_cipher(name: str, protocol: str, strength_bits: int | None) -> str:
+    for pattern in LEGACY_CIPHER_PATTERNS:
+        if pattern.search(name):
+            return "legacy-review"
+
+    if not name or not CIPHER_NAME_PATTERN.match(name):
+        return "unknown"
+
+    if any(pattern.search(name) for pattern in CIPHER_STRENGTH_PATTERNS):
+        return "modern"
+
+    if strength_bits is not None and strength_bits >= 128:
+        return "modern"
+
+    return "unknown"
+
+
+def merge_cipher_evidence(
+    nmap_ciphers: list[dict[str, Any]],
+    openssl_protocols: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge Nmap enumerated and OpenSSL negotiated cipher observations.
+
+    OpenSSL s_client performs a negotiated handshake, not exhaustive cipher
+    enumeration. Therefore all OpenSSL-derived cipher records are explicitly
+    marked observation='negotiated' and enumeration='not-complete'.
+    """
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
+
+    for raw in nmap_ciphers:
+        protocol = str(raw.get("protocol", "")).strip()
+        name = str(raw.get("name", "")).strip()
+        if not protocol or not name:
+            continue
+        key = (protocol, name)
+        existing = merged.get(key)
+        record = {
+            "protocol": protocol,
+            "name": name,
+            "strength_bits": raw.get("strength_bits"),
+            "kex": raw.get("kex", ""),
+            "authentication": raw.get("authentication", ""),
+            "mac": raw.get("mac", ""),
+            "classification": str(raw.get("classification", "unknown")),
+            "source": "nmap",
+            "sources": ["nmap"],
+            "observation": "enumerated",
+            "enumeration": "observed-by-nmap",
+        }
+        if existing:
+            existing["sources"] = sorted(set(existing.get("sources", [])) | {"nmap"})
+            existing["source"] = "+".join(existing["sources"])
+            if existing.get("observation") != "negotiated":
+                existing["observation"] = "enumerated"
+        else:
+            merged[key] = record
+
+    for raw in openssl_protocols:
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("status") != "accepted":
+            continue
+        protocol = str(raw.get("negotiated_protocol") or raw.get("protocol") or "").strip()
+        name = str(raw.get("negotiated_cipher") or "").strip()
+        if not protocol or not name:
+            continue
+        key = (protocol, name)
+        existing = merged.get(key)
+        classification = classify_cipher(name, protocol, None)
+        if existing:
+            sources = sorted(set(existing.get("sources", [])) | {"openssl"})
+            existing["sources"] = sources
+            existing["source"] = "+".join(sources)
+            existing["observation"] = "enumerated-and-negotiated"
+            existing["enumeration"] = "nmap-enumerated-and-openssl-negotiated"
+            if existing.get("classification") == "unknown" and classification != "unknown":
+                existing["classification"] = classification
+        else:
+            merged[key] = {
+                "protocol": protocol,
+                "name": name,
+                "strength_bits": None,
+                "kex": "",
+                "authentication": "",
+                "mac": "",
+                "classification": classification,
+                "source": "openssl",
+                "sources": ["openssl"],
+                "observation": "negotiated",
+                "enumeration": "not-complete",
+            }
+
+    return sorted(
+        merged.values(),
+        key=lambda item: (str(item.get("protocol", "")), str(item.get("name", ""))),
+    )
+
+
 def assess_protocol(protocols: list[dict[str, Any]], sslv3_observed: bool) -> dict[str, Any]:
     accepted = {
         str(item.get("name")): str(item.get("status"))
@@ -1102,13 +1306,21 @@ def assess_protocol(protocols: list[dict[str, Any]], sslv3_observed: bool) -> di
         protocol for protocol in TLS_PROTOCOLS
         if protocol in MODERN_PROTOCOLS and accepted.get(protocol) == "accepted"
     ]
+    rejected_legacy = [
+        protocol for protocol in TLS_PROTOCOLS
+        if protocol in LEGACY_PROTOCOLS and accepted.get(protocol) == "rejected"
+    ]
+    legacy_not_confirmed = [
+        protocol for protocol in TLS_PROTOCOLS
+        if protocol in LEGACY_PROTOCOLS and accepted.get(protocol) not in {"accepted", "rejected"}
+    ]
 
     if accepted_legacy:
         result = "legacy-protocol-observed"
         requires_review = True
     elif accepted_modern:
         result = "modern-protocols-observed"
-        requires_review = False
+        requires_review = bool(legacy_not_confirmed)
     else:
         result = "no-accepted-tls-protocol-observed"
         requires_review = True
@@ -1118,18 +1330,48 @@ def assess_protocol(protocols: list[dict[str, Any]], sslv3_observed: bool) -> di
         "requires_review": requires_review,
         "accepted_legacy": accepted_legacy,
         "accepted_modern": accepted_modern,
+        "rejected_legacy": rejected_legacy,
+        "legacy_not_confirmed": legacy_not_confirmed,
         "sslv3_observed": sslv3_observed,
         "note": (
-            "not-observed is not equivalent to cryptographic rejection; "
-            "it reflects the Nmap enumeration evidence."
+            "Protocol status is normalized from Nmap and optional OpenSSL probes; "
+            "not-observed is not equivalent to cryptographic rejection."
         ),
     }
 
 
-def assess_cipher(ciphers: list[dict[str, Any]]) -> dict[str, Any]:
-    legacy = sorted({str(item.get("name")) for item in ciphers if item.get("classification") == "legacy-review"})
-    unknown = sorted({str(item.get("name")) for item in ciphers if item.get("classification") == "unknown"})
-    modern = sorted({str(item.get("name")) for item in ciphers if item.get("classification") == "modern"})
+def assess_cipher(
+    ciphers: list[dict[str, Any]],
+    nmap_cipher_count: int,
+    openssl_negotiated_count: int,
+) -> dict[str, Any]:
+    legacy = sorted(
+        {
+            str(item.get("name"))
+            for item in ciphers
+            if item.get("classification") == "legacy-review"
+        }
+    )
+    unknown = sorted(
+        {
+            str(item.get("name"))
+            for item in ciphers
+            if item.get("classification") == "unknown"
+        }
+    )
+    modern = sorted(
+        {
+            str(item.get("name"))
+            for item in ciphers
+            if item.get("classification") == "modern"
+        }
+    )
+
+    # OpenSSL s_client only reports the cipher selected by one handshake; it
+    # does not enumerate every cipher accepted by the server. Therefore the
+    # normalized evidence must never claim complete cipher enumeration.
+    enumeration_complete = False
+    coverage = "partial"
 
     if legacy:
         result = "legacy-cipher-observed"
@@ -1138,8 +1380,8 @@ def assess_cipher(ciphers: list[dict[str, Any]]) -> dict[str, Any]:
         result = "unknown-cipher-observed"
         requires_review = True
     elif modern:
-        result = "no-legacy-observed"
-        requires_review = False
+        result = "modern-ciphers-observed-partial"
+        requires_review = True
     else:
         result = "no-cipher-observed"
         requires_review = True
@@ -1150,6 +1392,14 @@ def assess_cipher(ciphers: list[dict[str, Any]]) -> dict[str, Any]:
         "legacy_observed": legacy,
         "unknown_observed": unknown,
         "modern_observed": modern,
+        "nmap_cipher_count": nmap_cipher_count,
+        "openssl_negotiated_cipher_count": openssl_negotiated_count,
+        "enumeration_complete": enumeration_complete,
+        "coverage": coverage,
+        "note": (
+            "Cipher evidence contains Nmap enumeration observations and/or OpenSSL "
+            "negotiated observations. OpenSSL s_client is not a complete cipher enumeration."
+        ),
     }
 
 
@@ -1160,11 +1410,37 @@ def build_document(
     openssl_result: dict[str, Any],
 ) -> dict[str, Any]:
     parsed = parse_nmap_xml(nmap_result["stdout"])
-    protocol_assessment = assess_protocol(
+
+    openssl_protocols = openssl_result.get("protocols", [])
+    if not isinstance(openssl_protocols, list):
+        openssl_protocols = []
+
+    normalized_protocols = normalize_protocol_evidence(
         parsed["protocols"],
+        openssl_protocols,
+    )
+    normalized_ciphers = merge_cipher_evidence(
+        parsed["ciphers"],
+        openssl_protocols,
+    )
+
+    openssl_negotiated_count = sum(
+        1
+        for item in openssl_protocols
+        if isinstance(item, dict)
+        and item.get("status") == "accepted"
+        and str(item.get("negotiated_cipher", "")).strip()
+    )
+
+    protocol_assessment = assess_protocol(
+        normalized_protocols,
         parsed["sslv3_observed"],
     )
-    cipher_assessment = assess_cipher(parsed["ciphers"])
+    cipher_assessment = assess_cipher(
+        normalized_ciphers,
+        len(parsed["ciphers"]),
+        openssl_negotiated_count,
+    )
     overall_review = bool(
         protocol_assessment["requires_review"]
         or cipher_assessment["requires_review"]
@@ -1188,7 +1464,7 @@ def build_document(
             "available": bool(openssl_result.get("available")),
             "path": openssl_result.get("executable", ""),
             "version": openssl_result.get("version", ""),
-            "role": "optional corroboration",
+            "role": "optional corroboration and negotiated-cipher observation",
         },
     }
     tls["probe"] = {
@@ -1201,14 +1477,23 @@ def build_document(
         "xml_sha256": xml_hash,
         "stderr_sha256": stderr_hash,
     }
-    tls["protocols"] = parsed["protocols"]
-    tls["ciphers"] = parsed["ciphers"]
+    tls["protocols"] = normalized_protocols
+    tls["ciphers"] = normalized_ciphers
     tls["assessment"] = {
         "protocol": protocol_assessment,
         "cipher": cipher_assessment,
         "overall_requires_review": overall_review,
     }
     tls["openssl_corroboration"] = openssl_result
+    tls["notes"] = [
+        "Protocol status is normalized from Nmap ssl-enum-ciphers and optional OpenSSL handshake corroboration.",
+        "A protocol absent from both probes is recorded as not-observed; it is not asserted as rejected.",
+        "OpenSSL rejected status is only used when the output contains server-side protocol rejection evidence; generic client errors remain error/not-observed.",
+        "OpenSSL s_client reports the negotiated cipher from one handshake and does not constitute complete cipher enumeration.",
+        "Cipher enumeration_complete is therefore false unless a future dedicated exhaustive enumeration method is added and verified.",
+        "Certificate validation is deferred to checklist 3-010.",
+        "TLS protocol and cipher evidence are kept separate from vulnerability findings.",
+    ]
     tls["generated_at"] = now_iso()
     tls["errors"] = []
 
@@ -1287,9 +1572,13 @@ def cmd_analyze() -> int:
     print(f"TLS LEGACY ACCEPTED      : {', '.join(protocol_assessment['accepted_legacy']) if protocol_assessment['accepted_legacy'] else '-'}")
     print(f"TLS 3-008 RESULT         : {protocol_assessment['result']}")
     print(f"CIPHER COUNT             : {len(tls['ciphers'])}")
+    print(f"NMAP CIPHER COUNT        : {cipher_assessment.get('nmap_cipher_count', 0)}")
+    print(f"OPENSSL NEGOTIATED       : {cipher_assessment.get('openssl_negotiated_cipher_count', 0)}")
     print(f"CIPHER 3-009 RESULT      : {cipher_assessment['result']}")
     print(f"LEGACY CIPHERS           : {len(cipher_assessment['legacy_observed'])}")
     print(f"UNKNOWN CIPHERS          : {len(cipher_assessment['unknown_observed'])}")
+    print(f"ENUMERATION COMPLETE     : {bool(cipher_assessment.get('enumeration_complete'))}")
+    print(f"CIPHER COVERAGE          : {cipher_assessment.get('coverage', '-')}")
     print(f"REQUIRES REVIEW          : {int(bool(tls['assessment']['overall_requires_review']))}")
     print(f"OPENSSL AVAILABLE        : {bool(openssl_result.get('available'))}")
     print(f"FILE                     : {tls_file()}")
@@ -1325,6 +1614,8 @@ def cmd_list() -> int:
     print(f"3-008 RESULT        : {protocol.get('result', '-')}")
     print(f"3-009 RESULT        : {cipher.get('result', '-')}")
     print(f"CIPHERS             : {len(tls.get('ciphers', []))}")
+    print(f"ENUM COMPLETE       : {bool(cipher.get('enumeration_complete'))}")
+    print(f"CIPHER COVERAGE     : {cipher.get('coverage', '-')}")
     print(f"REQUIRES REVIEW     : {int(bool(assessment.get('overall_requires_review')))}")
     return 0
 
@@ -1405,10 +1696,14 @@ def validate_document(data: dict[str, Any]) -> list[str]:
                 errors.append("Item tls.protocols bukan mapping.")
                 continue
             status_value = str(item.get("status", "")).strip()
-            if status_value not in {"accepted", "not-observed"}:
+            if status_value not in {"accepted", "rejected", "not-observed"}:
                 errors.append(
                     f"Status protocol {item.get('name', '-')} tidak valid: {status_value or '-'}"
                 )
+            if item.get("nmap_status") not in {"accepted", "not-observed"}:
+                errors.append(f"nmap_status protocol {item.get('name', '-')} tidak valid.")
+            if item.get("openssl_status") not in {"accepted", "rejected", "not-run", "error", "timeout"}:
+                errors.append(f"openssl_status protocol {item.get('name', '-')} tidak valid.")
 
     ciphers = tls.get("ciphers")
     if not isinstance(ciphers, list):
@@ -1428,6 +1723,20 @@ def validate_document(data: dict[str, Any]) -> list[str]:
                 errors.append(
                     f"Klasifikasi cipher tidak valid: {item.get('classification', '-')}."
                 )
+            if str(item.get("observation", "")) not in {
+                "enumerated",
+                "negotiated",
+                "enumerated-and-negotiated",
+            }:
+                errors.append(f"Observation cipher tidak valid: {item.get('observation', '-')}." )
+            if not isinstance(item.get("sources"), list) or not item.get("sources"):
+                errors.append(f"Sources cipher tidak valid: {item.get('name', '-')}." )
+            if str(item.get("enumeration", "")) not in {
+                "observed-by-nmap",
+                "not-complete",
+                "nmap-enumerated-and-openssl-negotiated",
+            }:
+                errors.append(f"Enumeration marker cipher tidak valid: {item.get('name', '-')}." )
 
     assessment = tls.get("assessment")
     if not isinstance(assessment, dict):
@@ -1436,6 +1745,12 @@ def validate_document(data: dict[str, Any]) -> list[str]:
         for section in ("protocol", "cipher"):
             if not isinstance(assessment.get(section), dict):
                 errors.append(f"Assessment section '{section}' tidak valid.")
+        cipher_assessment = assessment.get("cipher")
+        if isinstance(cipher_assessment, dict):
+            if cipher_assessment.get("enumeration_complete") is not False:
+                errors.append("tls.assessment.cipher.enumeration_complete harus false pada schema 1.2.")
+            if cipher_assessment.get("coverage") not in {"partial", "not-assessed"}:
+                errors.append("tls.assessment.cipher.coverage harus partial atau not-assessed.")
 
     evidence = tls.get("evidence")
     if not isinstance(evidence, dict):
@@ -1443,6 +1758,9 @@ def validate_document(data: dict[str, Any]) -> list[str]:
     else:
         if not nmap_xml_file().exists():
             errors.append("Evidence Nmap XML tidak ditemukan.")
+        if isinstance(tls.get("openssl_corroboration"), dict) and tls["openssl_corroboration"].get("available"):
+            if not openssl_evidence_file().exists():
+                errors.append("Evidence OpenSSL JSON tidak ditemukan.")
 
     errors_field = tls.get("errors")
     if not isinstance(errors_field, list):
@@ -1502,6 +1820,8 @@ def cmd_verify() -> int:
     print(f"[PASS] 3-008     : {protocol.get('result', '-')}")
     print(f"[PASS] 3-009     : {cipher.get('result', '-')}")
     print(f"[PASS] Ciphers   : {len(tls.get('ciphers', []))}")
+    print(f"[PASS] Enumerate : {bool(cipher.get('enumeration_complete'))}")
+    print(f"[PASS] Coverage  : {cipher.get('coverage', '-')}")
     print(f"[PASS] Review    : {int(bool(assessment.get('overall_requires_review')))}")
     print(
         "[PASS] Assessment: TLS protocol/cipher dicatat sebagai evidence; "
@@ -1538,6 +1858,8 @@ def cmd_status() -> int:
     print(f"3-008 RESULT        : {protocol.get('result', '-')}")
     print(f"3-009 RESULT        : {cipher.get('result', '-')}")
     print(f"CIPHERS             : {len(tls.get('ciphers', []))}")
+    print(f"ENUM COMPLETE       : {bool(cipher.get('enumeration_complete'))}")
+    print(f"CIPHER COVERAGE     : {cipher.get('coverage', '-')}")
     print(f"REQUIRES REVIEW     : {int(bool(assessment.get('overall_requires_review')))}")
     print(f"ERRORS              : {len(tls.get('errors', [])) if isinstance(tls.get('errors'), list) else '-'}")
     print(f"FILE                : {path}")
@@ -1573,8 +1895,8 @@ def cmd_version() -> int:
     print("Optional : OpenSSL s_client corroboration")
     print("Baseline : 02-reconnaissance/network/network.yaml")
     print("Scope    : 01-preparation/scope/scope.yaml")
-    print("Rule     : accepted TLS 1.0/1.1 = REVIEW; modern TLS 1.2/1.3 observations = acceptable evidence")
-    print("Cipher   : legacy/unknown observations = REVIEW; no automatic vulnerability finding")
+    print("Rule     : protocol status is normalized from Nmap + optional OpenSSL; accepted TLS 1.0/1.1 = REVIEW")
+    print("Cipher   : Nmap enumeration + OpenSSL negotiated observations; full cipher enumeration is NOT claimed")
     print("Boundary : certificate validation is deferred to 3-010")
     return 0
 
@@ -1603,6 +1925,7 @@ def print_help() -> None:
         "  - Uses Nmap ssl-enum-ciphers as the primary evidence source.\n"
         "  - Keeps raw Nmap XML and stderr as evidence.\n"
         "  - Optional OpenSSL corroboration is used when available.\n"
+        "  - OpenSSL negotiated ciphers are observations from one handshake, not complete enumeration.\n"
         "  - Not-observed is not reported as cryptographic rejection.\n"
         "  - Certificate validation is deferred to checklist 3-010.\n"
         "  - No authentication testing, brute force, exploitation, or destructive methods.\n"
