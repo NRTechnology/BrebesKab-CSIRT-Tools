@@ -101,8 +101,8 @@ except ImportError as exc:
 # Constants
 # ---------------------------------------------------------------------------
 
-SCRIPT_VERSION = "1.0.0"
-SCHEMA_VERSION = "1.0"
+SCRIPT_VERSION = "1.0.1"
+SCHEMA_VERSION = "1.1"
 
 CHECKLIST_PROTOCOL = "3-008"
 CHECKLIST_PROTOCOL_NAME = "TLS protocol"
@@ -187,6 +187,9 @@ GENERIC_CIPHER_TABLE_KEYS = {
     "authentication",
     "mac",
     "compression",
+    "compressors",
+    "cipher preference",
+    "least strength",
     "warnings",
 }
 
@@ -617,9 +620,43 @@ def ensure_nmap() -> tuple[str, str]:
 
 
 def discover_openssl() -> tuple[str, str]:
+    # The installer updates the User PATH. A PowerShell parent process that
+    # launched the elevated installer does not automatically inherit that
+    # modified environment, so PATH-only discovery can miss a freshly
+    # installed OpenSSL until a new shell is opened. Check PATH first, then
+    # the same trusted Windows locations used by install-requirements.ps1.
     executable = find_executable(OPENSSL_EXECUTABLE)
+
+    if not executable and sys.platform == "win32":
+        program_files = Path(
+            __import__("os").environ.get("ProgramFiles", r"C:\\Program Files")
+        )
+        program_files_x86 = Path(
+            __import__("os").environ.get("ProgramFiles(x86)", r"C:\\Program Files (x86)")
+        )
+        local_app_data = Path(
+            __import__("os").environ.get(
+                "LOCALAPPDATA", str(Path.home() / "AppData" / "Local")
+            )
+        )
+
+        candidates = (
+            program_files / "OpenSSL-Win64" / "bin" / "openssl.exe",
+            program_files / "OpenSSL-Win32" / "bin" / "openssl.exe",
+            program_files / "OpenSSL" / "bin" / "openssl.exe",
+            program_files_x86 / "OpenSSL-Win32" / "bin" / "openssl.exe",
+            program_files_x86 / "OpenSSL" / "bin" / "openssl.exe",
+            local_app_data / "Programs" / "OpenSSL" / "bin" / "openssl.exe",
+        )
+
+        executable = next(
+            (str(candidate) for candidate in candidates if candidate.is_file()),
+            "",
+        )
+
     if not executable:
         return "", ""
+
     version = command_output_version(executable, ["version"])
     return executable, version
 
@@ -794,35 +831,26 @@ def classify_cipher(name: str, protocol: str, strength_bits: int | None) -> str:
 
 
 def collect_cipher_tables(protocol_table: ET.Element, protocol: str) -> list[dict[str, Any]]:
-    candidates: list[ET.Element] = []
-
-    for table in protocol_table.iter("table"):
-        key = str(table.get("key", "")).strip()
-        if not key or key.lower() in GENERIC_CIPHER_TABLE_KEYS:
-            continue
-        if looks_like_protocol(key):
-            continue
-        if CIPHER_NAME_PATTERN.match(key):
-            candidates.append(table)
-
-    # De-duplicate by cipher name while keeping first evidence occurrence.
+    # Nmap/NSE XML has appeared in more than one structural form across
+    # versions: some outputs represent ciphers as child <table key="...">
+    # entries, while others expose a <elem key="cipher"> value. Support both
+    # forms and explicitly exclude metadata such as "compressors".
     found: dict[str, dict[str, Any]] = {}
 
-    for table in candidates:
-        name = str(table.get("key", "")).strip()
-        if not name or name in found:
-            continue
-
-        strength_raw = (
-            direct_or_nested_elem(table, "strength_bits")
-            or direct_or_nested_elem(table, "strength")
-        )
-        strength_bits = parse_int(strength_raw)
-
-        kex = direct_or_nested_elem(table, "kex")
-        auth = direct_or_nested_elem(table, "authentication")
-        mac = direct_or_nested_elem(table, "mac")
-
+    def add_cipher(
+        name: str,
+        strength_bits: int | None = None,
+        kex: str = "",
+        auth: str = "",
+        mac: str = "",
+    ) -> None:
+        name = name.strip()
+        if not name or name.lower() in GENERIC_CIPHER_TABLE_KEYS:
+            return
+        if not CIPHER_NAME_PATTERN.match(name):
+            return
+        if name in found:
+            return
         found[name] = {
             "protocol": protocol,
             "name": name,
@@ -832,6 +860,36 @@ def collect_cipher_tables(protocol_table: ET.Element, protocol: str) -> list[dic
             "mac": mac,
             "classification": classify_cipher(name, protocol, strength_bits),
         }
+
+    for table in protocol_table.iter("table"):
+        key = str(table.get("key", "")).strip()
+        if not key or key.lower() in GENERIC_CIPHER_TABLE_KEYS:
+            continue
+        if looks_like_protocol(key):
+            continue
+        if not CIPHER_NAME_PATTERN.match(key):
+            continue
+
+        strength_raw = (
+            direct_or_nested_elem(table, "strength_bits")
+            or direct_or_nested_elem(table, "strength")
+        )
+        add_cipher(
+            key,
+            parse_int(str(strength_raw)),
+            direct_or_nested_elem(table, "kex"),
+            direct_or_nested_elem(table, "authentication"),
+            direct_or_nested_elem(table, "mac"),
+        )
+
+    # Fallback/alternate representation: <elem key="cipher">NAME</elem>.
+    for elem in protocol_table.iter("elem"):
+        key = str(elem.get("key", "")).strip().lower()
+        if key != "cipher":
+            continue
+        value = (elem.text or "").strip()
+        if value:
+            add_cipher(value)
 
     return list(found.values())
 
@@ -934,6 +992,14 @@ def run_openssl_probe(hostname: str, protocol: str) -> dict[str, Any]:
         "-brief",
         "-no_ticket",
     ]
+
+    # OpenSSL 3.x/4.x can reject TLS 1.0/1.1 on the client side because of
+    # its local security policy. Lower the client cipher security level only
+    # for the legacy-protocol corroboration probes so a client-side policy is
+    # less likely to masquerade as a server-side rejection. This does not
+    # relax TLS 1.2/1.3 probes.
+    if protocol in {"TLSv1.0", "TLSv1.1"}:
+        command.extend(["-cipher", "DEFAULT:@SECLEVEL=0"])
 
     try:
         result = subprocess.run(
