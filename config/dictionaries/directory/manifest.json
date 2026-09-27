@@ -1,0 +1,161 @@
+﻿{
+    "schema_version":  1,
+    "generated_at":  "2026-09-27T18:34:02.5292005+07:00",
+    "root":  "config/dictionaries/directory",
+    "sources":  [
+                    {
+                        "name":  "SecLists",
+                        "repository":  "danielmiessler/SecLists",
+                        "license":  "MIT",
+                        "purpose":  "Generic web-content discovery"
+                    },
+                    {
+                        "name":  "Assetnote Wordlists",
+                        "repository":  "assetnote/wordlists",
+                        "license":  "Apache-2.0",
+                        "purpose":  "HTTP Archive generic and technology-specific content discovery"
+                    }
+                ],
+    "wordlists":  [
+                      {
+                          "category":  "generic/seclists",
+                          "name":  "common",
+                          "path":  "config/dictionaries/directory/generic/seclists/common.txt",
+                          "source":  "danielmiessler/SecLists",
+                          "url":  "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt",
+                          "version":  "",
+                          "line_count":  0,
+                          "file_size":  ""
+                      },
+                      {
+                          "category":  "generic/seclists",
+                          "name":  "quickhits",
+                          "path":  "config/dictionaries/directory/generic/seclists/quickhits.txt",
+                          "source":  "danielmiessler/SecLists",
+                          "url":  "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/quickhits.txt",
+                          "version":  "",
+                          "line_count":  0,
+                          "file_size":  ""
+                      },
+                      {
+                          "category":  "generic/seclists",
+                          "name":  "raft-small-directories",
+                          "path":  "config/dictionaries/directory/generic/seclists/raft-small-directories.txt",
+                          "source":  "danielmiessler/SecLists",
+                          "url":  "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-small-directories.txt",
+                          "version":  "",
+                          "line_count":  0,
+                          "file_size":  ""
+                      },
+                      {
+                          "category":  "generic/seclists",
+                          "name":  "raft-medium-directories",
+                          "path":  "config/dictionaries/directory/generic/seclists/raft-medium-directories.txt",
+                          "source":  "danielmiessler/SecLists",
+                          "url":  "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-medium-directories.txt",
+                          "version":  "",
+                          "line_count":  0,
+                          "file_size":  ""
+                      },
+                      {
+                          "category":  "generic/seclists",
+                          "name":  "raft-large-directories",
+                          "path":  "config/dictionaries/directory/generic/seclists/raft-large-directories.txt",
+                          "source":  "danielmiessler/SecLists",
+                          "url":  "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-large-directories.txt",
+                          "version":  "",
+                          "line_count":  0,
+                          "file_size":  ""
+                      },
+                      {
+                          "category":  "generic/assetnote",
+                          "name":  "httparchive-directories-1m",
+                          "path":  "config/dictionaries/directory/generic/assetnote/httparchive_directories_1m_2026_02_27.txt",
+                          "source":  "assetnote/wordlists",
+                          "url":  "https://wordlists-cdn.assetnote.io/data/automated/httparchive_directories_1m_2026_02_27.txt",
+                          "version":  "httparchive_directories_1m_2026_02_27.txt",
+                          "line_count":  703323,
+                          "file_size":  "19.5mb"
+                      },
+                      {
+                          "category":  "technology/assetnote",
+                          "name":  "httparchive-php",
+                          "path":  "config/dictionaries/directory/technology/assetnote/httparchive_php_2026_02_27.txt",
+                          "source":  "assetnote/wordlists",
+                          "url":  "https://wordlists-cdn.assetnote.io/data/automated/httparchive_php_2026_02_27.txt",
+                          "version":  "httparchive_php_2026_02_27.txt",
+                          "line_count":  177015,
+                          "file_size":  "3.3mb"
+                      },
+                      {
+                          "category":  "technology/assetnote",
+                          "name":  "httparchive-jsp-jspa-do-action",
+                          "path":  "config/dictionaries/directory/technology/assetnote/httparchive_jsp_jspa_do_action_2026_02_27.txt",
+                          "source":  "assetnote/wordlists",
+                          "url":  "https://wordlists-cdn.assetnote.io/data/automated/httparchive_jsp_jspa_do_action_2026_02_27.txt",
+                          "version":  "httparchive_jsp_jspa_do_action_2026_02_27.txt",
+                          "line_count":  20670,
+                          "file_size":  "356.2kb"
+                      },
+                      {
+                          "category":  "technology/assetnote",
+                          "name":  "httparchive-aspx-asp-cfm-svc-ashx-asmx",
+                          "path":  "config/dictionaries/directory/technology/assetnote/httparchive_aspx_asp_cfm_svc_ashx_asmx_2026_02_27.txt",
+                          "source":  "assetnote/wordlists",
+                          "url":  "https://wordlists-cdn.assetnote.io/data/automated/httparchive_aspx_asp_cfm_svc_ashx_asmx_2026_02_27.txt",
+                          "version":  "httparchive_aspx_asp_cfm_svc_ashx_asmx_2026_02_27.txt",
+                          "line_count":  80989,
+                          "file_size":  "1.7mb"
+                      },
+                      {
+                          "category":  "technology/assetnote",
+                          "name":  "assetnote-django",
+                          "path":  "config/dictionaries/directory/technology/assetnote/httparchive_django_2026_02_27.txt",
+                          "source":  "assetnote/wordlists",
+                          "url":  "https://wordlists-cdn.assetnote.io/data/technologies/httparchive_django_2026_02_27.txt",
+                          "version":  "httparchive_django_2026_02_27.txt",
+                          "line_count":  47577,
+                          "file_size":  "1.3mb"
+                      },
+                      {
+                          "category":  "technology/assetnote",
+                          "name":  "assetnote-express",
+                          "path":  "config/dictionaries/directory/technology/assetnote/httparchive_express_2026_02_27.txt",
+                          "source":  "assetnote/wordlists",
+                          "url":  "https://wordlists-cdn.assetnote.io/data/technologies/httparchive_express_2026_02_27.txt",
+                          "version":  "httparchive_express_2026_02_27.txt",
+                          "line_count":  145109,
+                          "file_size":  "4.2mb"
+                      },
+                      {
+                          "category":  "technology/assetnote",
+                          "name":  "assetnote-flask",
+                          "path":  "config/dictionaries/directory/technology/assetnote/httparchive_flask_2026_02_27.txt",
+                          "source":  "assetnote/wordlists",
+                          "url":  "https://wordlists-cdn.assetnote.io/data/technologies/httparchive_flask_2026_02_27.txt",
+                          "version":  "httparchive_flask_2026_02_27.txt",
+                          "line_count":  1539,
+                          "file_size":  "43.1kb"
+                      },
+                      {
+                          "category":  "technology/assetnote",
+                          "name":  "assetnote-laravel",
+                          "path":  "config/dictionaries/directory/technology/assetnote/httparchive_laravel_2026_02_27.txt",
+                          "source":  "assetnote/wordlists",
+                          "url":  "https://wordlists-cdn.assetnote.io/data/technologies/httparchive_laravel_2026_02_27.txt",
+                          "version":  "httparchive_laravel_2026_02_27.txt",
+                          "line_count":  181313,
+                          "file_size":  "5.0mb"
+                      },
+                      {
+                          "category":  "technology/assetnote",
+                          "name":  "assetnote-rails",
+                          "path":  "config/dictionaries/directory/technology/assetnote/httparchive_rails_2026_02_27.txt",
+                          "source":  "assetnote/wordlists",
+                          "url":  "https://wordlists-cdn.assetnote.io/data/technologies/httparchive_rails_2026_02_27.txt",
+                          "version":  "httparchive_rails_2026_02_27.txt",
+                          "line_count":  213922,
+                          "file_size":  "6.4mb"
+                      }
+                  ]
+}

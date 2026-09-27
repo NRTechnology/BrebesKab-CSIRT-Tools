@@ -1,5 +1,5 @@
-﻿#requires -Version 5.1
-# BrebesKab-CSIRT-Tools install-requirements.ps1 v2.18
+#requires -Version 5.1
+# BrebesKab-CSIRT-Tools install-requirements.ps1 v2.20
 # CLI version verification is based on executable availability and non-empty version output.
 [CmdletBinding()]
 param(
@@ -23,6 +23,17 @@ $LogFile = Join-Path $LogRoot 'install-requirements.log'
 $StateFile = Join-Path $StateRoot 'install-state.json'
 $NucleiDir = Join-Path $ToolsRoot 'nuclei'
 $HttpxDir = Join-Path $ToolsRoot 'httpx'
+$GobusterDir = Join-Path $ToolsRoot 'gobuster'
+$GobusterExe = Join-Path $GobusterDir 'gobuster.exe'
+
+# Wordlists used by RECON directory discovery.
+# Source-oriented layout keeps upstream data traceable while allowing
+# directory.py to build technology-aware composite wordlists later.
+$WordlistsRoot = Join-Path $RepoRoot 'config\dictionaries\directory'
+$SecListsWordlistsDir = Join-Path $WordlistsRoot 'generic\seclists'
+$AssetnoteAutomatedDir = Join-Path $WordlistsRoot 'generic\assetnote'
+$AssetnoteTechnologyDir = Join-Path $WordlistsRoot 'technology\assetnote'
+$WordlistManifest = Join-Path $WordlistsRoot 'manifest.json'
 $VenvDir = Join-Path $RepoRoot '.venv'
 $VenvPython = Join-Path $VenvDir 'Scripts\python.exe'
 $VenvScripts = Join-Path $VenvDir 'Scripts'
@@ -65,7 +76,7 @@ $GitHubHeaders = @{
 }
 
 $script:State = [ordered]@{
-    schema_version=2.18
+    schema_version=2.19
     started_at=(Get-Date).ToString('o')
     repo_root=$RepoRoot
     dry_run=[bool]$DryRun
@@ -75,6 +86,7 @@ $script:State = [ordered]@{
     python_base=$null
     curl_reference=$null
     openssl_reference=$null
+    gobuster_reference=$null
     completed=$false
 }
 
@@ -612,6 +624,442 @@ function Install-GitHubZipTool {
     Write-Log "$ToolName $($release.tag_name) berhasil diinstall: $existing" 'OK'
 }
 
+
+function Get-LatestAssetnoteWordlist {
+    param(
+        [Parameter(Mandatory=$true)][string]$MetadataUrl,
+        [Parameter(Mandatory=$true)][string]$FilePrefix
+    )
+
+    try{
+        $metadata = Invoke-RestMethod -Uri $MetadataUrl -Method Get
+        $matches = @($metadata.data | Where-Object {
+            $_.Filename -like "$FilePrefix*.txt" -and
+            $_.Download
+        })
+    }
+    catch{
+        Write-Log "Gagal mengambil metadata Assetnote [$FilePrefix]: $($_.Exception.Message). Wordlist dilewati." 'WARN'
+        return $null
+    }
+
+    if($matches.Count -eq 0){
+        Write-Log "Assetnote wordlist tidak ditemukan pada metadata [$FilePrefix]. Wordlist dilewati." 'WARN'
+        return $null
+    }
+
+    # Metadata is generated from the current Assetnote dataset. Prefer the
+    # newest timestamp rather than hard-coding a monthly filename.
+    $selected = $matches |
+        Sort-Object { [double]$_.Date } -Descending |
+        Select-Object -First 1
+
+    $downloadHtml=[string]$selected.Download
+    $downloadUrl=$null
+    if($downloadHtml -match 'href=["'']([^"'']+)["'']'){
+        $downloadUrl=$Matches[1]
+    }
+    if([string]::IsNullOrWhiteSpace($downloadUrl)){
+        Write-Log "URL download Assetnote tidak dapat diparse [$($selected.Filename)]. Wordlist dilewati." 'WARN'
+        return $null
+    }
+
+    [pscustomobject]@{
+        Filename = [string]$selected.Filename
+        Url      = $downloadUrl
+        LineCount = [int64]$selected.'Line Count'
+        FileSize = [string]$selected.'File Size'
+    }
+}
+
+function Get-RepoRelativePath {
+    param([Parameter(Mandatory=$true)][string]$Path)
+
+    $full=[IO.Path]::GetFullPath($Path)
+    $root=[IO.Path]::GetFullPath($RepoRoot).TrimEnd('\') + '\'
+
+    if($full.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)){
+        return $full.Substring($root.Length).Replace('\','/')
+    }
+
+    return $full.Replace('\','/')
+}
+
+function Download-Wordlist {
+    param(
+        [Parameter(Mandatory=$true)][string]$Name,
+        [Parameter(Mandatory=$true)][string]$Url,
+        [Parameter(Mandatory=$true)][string]$Destination,
+        [string]$Source='unknown',
+        [string]$Version='',
+        [string]$ExpectedSha256=''
+    )
+
+    if(Test-Path $Destination){
+        Write-Log "Wordlist sudah tersedia: $Destination" 'OK'
+        return $false
+    }
+
+    if($DryRun){
+        Write-Log "DryRun: download wordlist [$Source] $Name -> $Destination" 'DRYRUN'
+        return $false
+    }
+
+    $temp = "$Destination.download"
+    try{
+        New-Item -ItemType Directory -Path (Split-Path -Parent $Destination) -Force | Out-Null
+        Write-Log "Download wordlist [$Source] $Name..." 'STEP'
+        Invoke-WebRequest -Uri $Url -OutFile $temp -UseBasicParsing
+
+        if(-not (Test-Path $temp)){
+            throw "File hasil download tidak ditemukan: $temp"
+        }
+
+        if($ExpectedSha256){
+            $actual=(Get-FileHash $temp -Algorithm SHA256).Hash.ToLowerInvariant()
+            if($actual -ne $ExpectedSha256.ToLowerInvariant()){
+                throw "Wordlist SHA-256 mismatch [$Name]. Expected $ExpectedSha256, got $actual"
+            }
+        }
+
+        Move-Item $temp $Destination -Force
+        Write-Log "Wordlist berhasil disimpan: $Destination" 'OK'
+        return $true
+    }
+    catch{
+        Remove-Item $temp -Force -ErrorAction SilentlyContinue
+        Write-Log "Gagal download wordlist [$Source] $Name dari ${Url}: $($_.Exception.Message). Wordlist dilewati." 'WARN'
+        return $false
+    }
+}
+
+function Add-WordlistManifestEntry {
+    param(
+        [Parameter(Mandatory=$true)][System.Collections.IList]$Manifest,
+        [Parameter(Mandatory=$true)][string]$Category,
+        [Parameter(Mandatory=$true)][string]$Name,
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$Source,
+        [string]$Url='',
+        [string]$Version='',
+        [int64]$LineCount=0,
+        [string]$FileSize=''
+    )
+
+    $Manifest.Add([ordered]@{
+        category=$Category
+        name=$Name
+        path=$Path
+        source=$Source
+        url=$Url
+        version=$Version
+        line_count=$LineCount
+        file_size=$FileSize
+    }) | Out-Null
+}
+
+function Install-Gobuster {
+    $existing = Find-ToolExecutable 'gobuster'
+
+    if($existing -and -not $Force){
+        Write-Log "Gobuster sudah tersedia: $existing" 'OK'
+        return $existing
+    }
+
+    if($DryRun){
+        Write-Log 'DryRun: resolve/download official Gobuster Windows AMD64 release dari OJ/gobuster.' 'DRYRUN'
+        return $GobusterExe
+    }
+
+    $release = Get-GitHubLatestRelease 'OJ/gobuster'
+
+    $patterns = @(
+        '^gobuster_.*_Windows_x86_64\.zip$',
+        '^gobuster_.*_windows_amd64\.zip$',
+        '^gobuster_.*_Windows_amd64\.zip$',
+        '^gobuster_.*_windows_x86_64\.zip$',
+        '^gobuster-windows-amd64\.zip$',
+        '^gobuster.*windows.*(amd64|x86_64).*\.zip$'
+    )
+
+    $asset = $null
+    foreach($pattern in $patterns){
+        $asset = @($release.assets |
+            Where-Object { $_.name -match $pattern } |
+            Select-Object -First 1)
+        if($asset.Count -gt 0){
+            $asset=$asset[0]
+            break
+        }
+    }
+
+    if(-not $asset){
+        throw "Asset Gobuster Windows AMD64 tidak ditemukan pada release $($release.tag_name)."
+    }
+
+    $zip = Join-Path $DownloadRoot $asset.name
+    New-Item -ItemType Directory -Path $DownloadRoot,$GobusterDir -Force | Out-Null
+
+    Write-Log "Download Gobuster $($release.tag_name): $($asset.name)" 'STEP'
+    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zip -Headers $GitHubHeaders
+
+    if($asset.digest -and $asset.digest -match '^sha256:([0-9a-fA-F]{64})$'){
+        $expected=$Matches[1].ToLowerInvariant()
+        $actual=(Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+
+        if($actual -ne $expected){
+            throw "Gobuster checksum mismatch. Expected $expected, got $actual"
+        }
+
+        Write-Log 'Gobuster SHA-256 checksum OK.' 'OK'
+    }
+    else{
+        Write-Log 'Gobuster release tidak menyediakan digest SHA-256 via GitHub API; lanjut dengan official release asset.' 'WARN'
+    }
+
+    if(Test-Path $GobusterDir){
+        Get-ChildItem $GobusterDir -Force -ErrorAction SilentlyContinue |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    New-Item -ItemType Directory -Path $GobusterDir -Force | Out-Null
+    Expand-Archive -Path $zip -DestinationPath $GobusterDir -Force
+
+    $exe=Get-ChildItem $GobusterDir -Filter 'gobuster.exe' -File -Recurse |
+        Select-Object -First 1
+
+    if(-not $exe){
+        throw "Gobuster executable tidak ditemukan setelah extraction."
+    }
+
+    if($exe.FullName -ne $GobusterExe){
+        Copy-Item $exe.FullName $GobusterExe -Force
+    }
+
+    Add-InstalledComponent 'github-binary' 'Gobuster' 'OJ/gobuster' $release.tag_name $GobusterDir
+    Add-UserPath $GobusterDir
+    Refresh-Path
+
+    Write-Log "Gobuster $($release.tag_name) berhasil diinstall: $GobusterExe" 'OK'
+    return $GobusterExe
+}
+
+function Install-Wordlists {
+    if($DryRun){
+        Write-Log 'DryRun: wordlist installation akan menggunakan layout generic/technology dan manifest.json.' 'DRYRUN'
+    }
+
+    New-Item -ItemType Directory -Path `
+        $SecListsWordlistsDir,
+        $AssetnoteAutomatedDir,
+        $AssetnoteTechnologyDir `
+        -Force | Out-Null
+
+    $manifest = New-Object System.Collections.ArrayList
+
+    # SecLists: compact-to-broad directory discovery tiers.
+    # Wordlist download failures are non-fatal; failed URLs are logged and skipped.
+    $secLists = @(
+        [pscustomobject]@{
+            Name='common'
+            Category='generic/seclists'
+            File='common.txt'
+        },
+        [pscustomobject]@{
+            Name='quickhits'
+            Category='generic/seclists'
+            File='quickhits.txt'
+        },
+        [pscustomobject]@{
+            Name='raft-small-directories'
+            Category='generic/seclists'
+            File='raft-small-directories.txt'
+        },
+        [pscustomobject]@{
+            Name='raft-medium-directories'
+            Category='generic/seclists'
+            File='raft-medium-directories.txt'
+        },
+        [pscustomobject]@{
+            Name='raft-large-directories'
+            Category='generic/seclists'
+            File='raft-large-directories.txt'
+        }
+    )
+
+    foreach($item in $secLists){
+        $url="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/$($item.File)"
+        $destination=Join-Path $SecListsWordlistsDir $item.File
+
+        Download-Wordlist `
+            -Name $item.Name `
+            -Url $url `
+            -Destination $destination `
+            -Source 'SecLists'
+
+        if(Test-Path $destination){
+            Add-WordlistManifestEntry `
+                -Manifest $manifest `
+                -Category $item.Category `
+                -Name $item.Name `
+                -Path (Get-RepoRelativePath $destination) `
+                -Source 'danielmiessler/SecLists' `
+                -Url $url
+        }
+    }
+
+    # Assetnote metadata is used instead of hard-coding monthly filenames.
+    # This keeps the installer aligned with the latest published dataset.
+    $automatedMetadataUrl='https://raw.githubusercontent.com/assetnote/wordlists/master/data/automated.json'
+    $technologyMetadataUrl='https://raw.githubusercontent.com/assetnote/wordlists/master/data/technologies.json'
+
+    $assetnoteAutomated = @(
+        [pscustomobject]@{
+            Name='httparchive-directories-1m'
+            Prefix='httparchive_directories_1m_'
+            Category='generic/assetnote'
+        },
+        [pscustomobject]@{
+            Name='httparchive-php'
+            Prefix='httparchive_php_'
+            Category='technology/assetnote'
+        },
+        [pscustomobject]@{
+            Name='httparchive-jsp-jspa-do-action'
+            Prefix='httparchive_jsp_jspa_do_action_'
+            Category='technology/assetnote'
+        },
+        [pscustomobject]@{
+            Name='httparchive-aspx-asp-cfm-svc-ashx-asmx'
+            Prefix='httparchive_aspx_asp_cfm_svc_ashx_asmx_'
+            Category='technology/assetnote'
+        }
+    )
+
+    foreach($item in $assetnoteAutomated){
+        $meta=Get-LatestAssetnoteWordlist -MetadataUrl $automatedMetadataUrl -FilePrefix $item.Prefix
+        if(-not $meta){
+            continue
+        }
+
+        $destinationRoot = if($item.Category -eq 'generic/assetnote'){
+            $AssetnoteAutomatedDir
+        }
+        else{
+            $AssetnoteTechnologyDir
+        }
+
+        $destination=Join-Path $destinationRoot $meta.Filename
+
+        Download-Wordlist `
+            -Name $item.Name `
+            -Url $meta.Url `
+            -Destination $destination `
+            -Source 'Assetnote' `
+            -Version $meta.Filename
+
+        if(Test-Path $destination){
+            Add-WordlistManifestEntry `
+                -Manifest $manifest `
+                -Category $item.Category `
+                -Name $item.Name `
+                -Path (Get-RepoRelativePath $destination) `
+                -Source 'assetnote/wordlists' `
+                -Url $meta.Url `
+                -Version $meta.Filename `
+                -LineCount $meta.LineCount `
+                -FileSize $meta.FileSize
+        }
+    }
+
+    # Technology-specific Assetnote lists. These are selected because they
+    # map directly to the technology-aware discovery design. We intentionally
+    # skip extremely large lists such as Nginx (>100 MB in current metadata);
+    # directory.py can add them later as an explicit deep-scan profile.
+    $technologyLists = @(
+        'apache',
+        'django',
+        'express',
+        'flask',
+        'laravel',
+        'rails',
+        'spring',
+        'symfony',
+        'tomcat',
+        'yii',
+        'zend',
+        'coldfusion'
+    )
+
+    foreach($technology in $technologyLists){
+        $meta=Get-LatestAssetnoteWordlist `
+            -MetadataUrl $technologyMetadataUrl `
+            -FilePrefix "httparchive_${technology}_"
+
+        if(-not $meta){
+            continue
+        }
+
+        if($meta.LineCount -eq 0){
+            Write-Log "Assetnote technology wordlist kosong; dilewati: $technology" 'WARN'
+            continue
+        }
+
+        $destination=Join-Path $AssetnoteTechnologyDir $meta.Filename
+
+        Download-Wordlist `
+            -Name "assetnote-$technology" `
+            -Url $meta.Url `
+            -Destination $destination `
+            -Source 'Assetnote' `
+            -Version $meta.Filename
+
+        if(Test-Path $destination){
+            Add-WordlistManifestEntry `
+                -Manifest $manifest `
+                -Category 'technology/assetnote' `
+                -Name "assetnote-$technology" `
+                -Path (Get-RepoRelativePath $destination) `
+                -Source 'assetnote/wordlists' `
+                -Url $meta.Url `
+                -Version $meta.Filename `
+                -LineCount $meta.LineCount `
+                -FileSize $meta.FileSize
+        }
+    }
+
+    $manifestDocument=[ordered]@{
+        schema_version=1
+        generated_at=(Get-Date).ToString('o')
+        root=(Get-RepoRelativePath $WordlistsRoot)
+        sources=@(
+            [ordered]@{
+                name='SecLists'
+                repository='danielmiessler/SecLists'
+                license='MIT'
+                purpose='Generic web-content discovery'
+            },
+            [ordered]@{
+                name='Assetnote Wordlists'
+                repository='assetnote/wordlists'
+                license='Apache-2.0'
+                purpose='HTTP Archive generic and technology-specific content discovery'
+            }
+        )
+        wordlists=$manifest
+    }
+
+    if(-not $DryRun){
+        $manifestDocument | ConvertTo-Json -Depth 10 |
+            Set-Content -Path $WordlistManifest -Encoding UTF8
+
+        Write-Log "Wordlist manifest berhasil dibuat: $WordlistManifest" 'OK'
+    }
+    else{
+        Write-Log "DryRun: manifest akan dibuat di $WordlistManifest" 'DRYRUN'
+    }
+}
+
 function Add-UserPath {
     param([string]$PathToAdd)
 
@@ -856,6 +1304,7 @@ function Find-ToolExecutable {
     $candidate=switch($Name){
         nuclei {Join-Path $NucleiDir 'nuclei.exe'}
         httpx {Join-Path $HttpxDir 'httpx.exe'}
+        gobuster {$GobusterExe}
         'curl.exe' {Find-CurlExecutable}
         'curl' {Find-CurlExecutable}
         'openssl.exe' {Find-OpenSSLExecutable}
@@ -1183,17 +1632,17 @@ try{
         -Force | Out-Null
 
     Write-Log '============================================================' 'STEP'
-    Write-Log 'BrebesKab-CSIRT-Tools install-requirements.ps1 v2.18' 'STEP'
+    Write-Log 'BrebesKab-CSIRT-Tools install-requirements.ps1 v2.20' 'STEP'
     Write-Log '============================================================' 'STEP'
 
     Request-Administrator
 
     if(-not(Test-Administrator)){
-        throw 'Installer v2.18 tidak berjalan sebagai Administrator setelah proses elevation.'
+        throw 'Installer v2.19 tidak berjalan sebagai Administrator setelah proses elevation.'
     }
 
     if(-not [Environment]::Is64BitOperatingSystem){
-        throw 'Installer v2.18 membutuhkan Windows 64-bit.'
+        throw 'Installer v2.19 membutuhkan Windows 64-bit.'
     }
 
     if(-not(Find-Command 'winget')){
@@ -1227,10 +1676,14 @@ try{
 
     Install-GitHubZipTool 'nuclei' 'projectdiscovery/nuclei' $NucleiDir 'nuclei.exe'
     Install-GitHubZipTool 'httpx' 'projectdiscovery/httpx' $HttpxDir 'httpx.exe'
+    Install-Gobuster
 
     Add-UserPath $NucleiDir
     Add-UserPath $HttpxDir
+    Add-UserPath $GobusterDir
     Refresh-Path
+
+    Install-Wordlists
 
     Install-ZAP
 
@@ -1241,6 +1694,7 @@ try{
     Verify-Command 'ffuf' @('-V')
     Verify-Nuclei
     Verify-Command 'httpx' @('-version')
+    Verify-Command 'gobuster' @('version')
     Verify-Command 'curl.exe' @('--version')
     Verify-Command 'openssl.exe' @('version')
 
@@ -1271,6 +1725,7 @@ try{
 
     $script:State.curl_reference = $curlPath
     $script:State.openssl_reference = $opensslPath
+    $script:State.gobuster_reference = $GobusterExe
     $script:State.completed=$true
     $script:State.completed_at=(Get-Date).ToString('o')
     Save-State
