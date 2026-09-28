@@ -3,7 +3,7 @@
 BrebesKab-CSIRT-Tools
 Reconnaissance - Directory Enumeration & Adaptive Scoring Engine
 
-Version: 2.0.0
+Version: 2.1.0
 
 Checklist mapping:
     02-006 - Directory discovery
@@ -37,6 +37,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -82,7 +83,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2.0.2"
+SCRIPT_VERSION = "2.1.1"
 SCHEMA_VERSION = "2.0"
 CHECKLIST_ID = "2-006"
 CHECKLIST_NAME = "Directory discovery"
@@ -172,6 +173,15 @@ def project_wordlists_dir() -> Path:
 
 def selection_file() -> Path:
     return project_wordlists_dir() / "selected" / "selection.yaml"
+
+
+def technology_file() -> Path:
+    return (
+        project_root()
+        / "02-reconnaissance"
+        / "technology"
+        / "technology.yaml"
+    )
 
 
 def scoring_config_file() -> Path:
@@ -764,6 +774,243 @@ def _tier_for_score(
     return "Exploration"
 
 
+def _technology_aliases(name: str) -> set[str]:
+    """Return normalized aliases used for technology-aware wordlist matching."""
+    normalized = str(name or "").strip().lower()
+    if not normalized:
+        return set()
+
+    aliases = {
+        normalized,
+        normalized.replace(" ", "-"),
+        normalized.replace(" ", ""),
+    }
+
+    groups = {
+        "codeigniter": {
+            "codeigniter",
+            "codeigniter4",
+            "ci",
+            "ci4",
+            "php",
+        },
+        "php": {"php"},
+        "apache": {"apache", "apache-http-server"},
+        "django": {"django", "python"},
+        "laravel": {"laravel", "php"},
+        "symfony": {"symfony", "php"},
+        "yii": {"yii", "php"},
+        "zend": {"zend", "php"},
+        "express": {"express", "node", "nodejs", "javascript"},
+        "flask": {"flask", "python"},
+        "rails": {"rails", "ruby"},
+        "spring": {"spring", "java"},
+        "asp.net": {"asp.net", "aspnet", "dotnet", "iis"},
+        "aspnet": {"asp.net", "aspnet", "dotnet", "iis"},
+        "iis": {"iis", "asp.net", "aspnet"},
+        "node.js": {"node", "nodejs", "javascript"},
+        "nodejs": {"node", "nodejs", "javascript"},
+        "python": {"python"},
+        "java": {"java"},
+        "ruby": {"ruby"},
+    }
+
+    for key, values in groups.items():
+        if normalized == key or normalized in values:
+            aliases.update(values)
+            aliases.add(key)
+
+    return {item for item in aliases if item}
+
+
+def _technology_context() -> dict[str, Any]:
+    """Load technology reconnaissance context for wordlist ranking.
+
+    Missing technology.yaml is not fatal. Directory discovery can still use
+    the global manifest and adaptive scoring without technology context.
+    """
+    context: dict[str, Any] = {
+        "available": False,
+        "technologies": [],
+        "aliases": set(),
+    }
+
+    path = technology_file()
+    if not path.is_file():
+        return context
+
+    try:
+        data = _load_yaml(path, "Technology reconnaissance")
+    except DirectoryError:
+        return context
+
+    technology = data.get("technology")
+    if not isinstance(technology, dict):
+        return context
+
+    names: list[str] = []
+    for key in ("technologies", "fingerprints"):
+        values = technology.get(key)
+        if not isinstance(values, list):
+            continue
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            for field in ("name", "id"):
+                value = str(item.get(field) or "").strip()
+                if value and value.lower() not in {x.lower() for x in names}:
+                    names.append(value)
+
+    aliases: set[str] = set()
+    for name in names:
+        aliases.update(_technology_aliases(name))
+
+    context["available"] = bool(names)
+    context["technologies"] = names
+    context["aliases"] = aliases
+    return context
+
+
+def _wordlist_metadata_tokens(item: dict[str, Any]) -> set[str]:
+    """Extract searchable technology metadata from a manifest item."""
+    tokens: set[str] = set()
+    keys = (
+        "wordlist_id",
+        "id",
+        "name",
+        "description",
+        "technology",
+        "technologies",
+        "technology_id",
+        "technology_ids",
+        "framework",
+        "frameworks",
+        "tags",
+        "categories",
+        "category",
+        "type",
+        "provider",
+        "source",
+        "path",
+    )
+
+    def add(value: Any) -> None:
+        if isinstance(value, str):
+            value = value.strip().lower()
+            if value:
+                tokens.add(value)
+                tokens.update(
+                    part
+                    for part in value.replace("/", " ")
+                    .replace("_", " ")
+                    .replace("-", " ")
+                    .replace(".", " ")
+                    .split()
+                    if part
+                )
+        elif isinstance(value, list):
+            for child in value:
+                add(child)
+        elif isinstance(value, dict):
+            for child in value.values():
+                add(child)
+
+    for key in keys:
+        if key in item:
+            add(item.get(key))
+
+    return tokens
+
+
+def _technology_specific_mismatch(
+    item: dict[str, Any],
+    context: dict[str, Any],
+) -> bool:
+    """Identify framework/runtime-specific lists that do not match the target."""
+    if not context.get("available"):
+        return False
+
+    tokens = _wordlist_metadata_tokens(item)
+    tech_keywords = {
+        "django", "flask", "laravel", "symfony", "yii", "zend",
+        "rails", "express", "spring", "aspnet", "asp", "iis",
+        "node", "nodejs", "python", "ruby", "java",
+    }
+
+    specific = tokens & tech_keywords
+    if not specific:
+        return False
+
+    aliases = context.get("aliases") or set()
+
+    # A framework-specific list is not a mismatch when another technology
+    # token in its metadata matches the target context (for example a
+    # Laravel list tagged with PHP for a PHP/CodeIgniter target).
+    if tokens & aliases:
+        return False
+
+    return True
+
+
+def _technology_relevance(
+    item: dict[str, Any],
+    context: dict[str, Any],
+) -> tuple[float, list[str]]:
+    """Return technology relevance in [0, 1] plus matched technologies."""
+    if not context.get("available"):
+        return 0.0, []
+
+    metadata = _wordlist_metadata_tokens(item)
+    matched: list[str] = []
+
+    for technology in context.get("technologies", []):
+        aliases = _technology_aliases(technology)
+        if metadata & aliases:
+            matched.append(str(technology))
+
+    if not matched:
+        return 0.0, []
+
+    unique = []
+    seen = set()
+    for item_name in matched:
+        key = item_name.lower()
+        if key not in seen:
+            unique.append(item_name)
+            seen.add(key)
+
+    # Direct technology matches are strong evidence. Multiple matches increase
+    # relevance but the result remains bounded to 1.0.
+    score = min(1.0, 0.85 + (0.10 * max(0, len(unique) - 1)))
+    return score, unique
+
+
+def _effective_wordlist_score(
+    base_score: float,
+    technology_score: float,
+    mismatch: bool,
+    context_available: bool,
+) -> float:
+    """Combine manifest prior and technology evidence for the initial rank."""
+    base = _clamp(base_score)
+
+    if not context_available:
+        return base
+
+    if technology_score > 0:
+        # Technology context dominates generic priors for the first run.
+        score = (base * 0.25) + (technology_score * 0.75)
+    elif mismatch:
+        # Keep mismatched technology lists available for Exploration, but make
+        # them much less likely to outrank matching/generic candidates.
+        score = base - 0.30
+    else:
+        # Generic lists remain useful and retain most of their manifest prior.
+        score = base * 0.80
+
+    return _clamp(score)
+
+
 def _selection_candidates(
     selection: dict[str, Any],
     manifest_items: list[dict[str, Any]],
@@ -775,6 +1022,7 @@ def _selection_candidates(
         selected = []
 
     result: list[dict[str, Any]] = []
+    technology_context = _technology_context()
 
     for raw in selected:
         if not isinstance(raw, dict):
@@ -816,18 +1064,45 @@ def _selection_candidates(
                 )
             )
 
-        initial = _clamp(
+        manifest_initial = _initial_score_for_item(manifest)
+        # selection.yaml may already contain a technology-adjusted
+        # initial_score. Never use that adjusted value as the next
+        # baseline, otherwise repeated `init`/`wordlists` calls would
+        # compound the technology weighting. The canonical baseline is
+        # stored separately as manifest_initial_score.
+        base_initial = _clamp(
             _safe_float(
-                merged.get("initial_score"),
-                _initial_score_for_item(manifest),
+                raw.get("manifest_initial_score"),
+                manifest_initial,
             )
         )
 
-        merged["initial_score"] = initial
+        technology_score, technology_matches = _technology_relevance(
+            merged,
+            technology_context,
+        )
+        technology_mismatch = _technology_specific_mismatch(
+            merged,
+            technology_context,
+        )
+        effective_initial = _effective_wordlist_score(
+            base_initial,
+            technology_score,
+            technology_mismatch,
+            bool(technology_context.get("available")),
+        )
+
+        merged["manifest_initial_score"] = base_initial
+        merged["technology_score"] = round(technology_score, 6)
+        merged["technology_relevance"] = round(technology_score, 6)
+        merged["technology_matches"] = technology_matches
+        merged["technology_mismatch"] = technology_mismatch
+        merged["effective_score"] = round(effective_initial, 6)
+        merged["initial_score"] = effective_initial
         merged["score"] = _clamp(
             _safe_float(
                 merged.get("final_score"),
-                initial,
+                effective_initial,
             )
         )
         merged["tier"] = _tier_for_score(
@@ -850,7 +1125,13 @@ def _bootstrap_selection_from_manifest(
     scoring_config: dict[str, Any],
     limit: int | None = None,
 ) -> dict[str, Any]:
-    manifest_path, manifest_items = _load_manifest()
+    """Bootstrap missing project wordlist references from the global manifest.
+
+    The initial technology-aware scoring itself is performed by
+    ``_score_selection_for_init`` during ``init``. This function only adds
+    missing references with the immutable manifest baseline.
+    """
+    _, manifest_items = _load_manifest()
     selection = _load_selection()
 
     existing = {
@@ -862,27 +1143,18 @@ def _bootstrap_selection_from_manifest(
     added = 0
 
     for item in manifest_items:
-        wordlist_id = str(
-            item.get("wordlist_id", "")
-        ).strip()
+        wordlist_id = str(item.get("wordlist_id", "")).strip()
 
-        if (
-            not wordlist_id
-            or wordlist_id.lower() in existing
-        ):
+        if not wordlist_id or wordlist_id.lower() in existing:
             continue
 
         path = str(item.get("path", "")).strip()
-
         if not path:
             continue
 
-        score = _initial_score_for_item(item)
+        manifest_initial = _initial_score_for_item(item)
 
-        selection.setdefault(
-            "wordlists",
-            [],
-        ).append(
+        selection.setdefault("wordlists", []).append(
             {
                 "wordlist_id": wordlist_id,
                 "source": str(
@@ -893,29 +1165,154 @@ def _bootstrap_selection_from_manifest(
                 "manifest_path": CANONICAL_WORDLIST_MANIFEST,
                 "path": path,
                 "enabled": True,
-                "initial_score": score,
+                "manifest_initial_score": manifest_initial,
+                "initial_score": manifest_initial,
+                "effective_score": manifest_initial,
                 "tier": _tier_for_score(
-                    score,
+                    manifest_initial,
                     scoring_config,
                 ),
+                "technology_score": 0.0,
+                "technology_relevance": 0.0,
+                "technology_matches": [],
+                "technology_mismatch": False,
                 "confidence": 0.0,
-                "notes": (
-                    "Auto-bootstrapped from global manifest."
-                ),
+                "notes": "Auto-bootstrapped from global manifest.",
             }
         )
 
         existing.add(wordlist_id.lower())
         added += 1
 
-        if (
-            limit is not None
-            and added >= limit
-        ):
+        if limit is not None and added >= limit:
             break
 
     _write_selection(selection)
     return selection
+
+
+def _score_selection_for_init(
+    selection: dict[str, Any],
+    manifest_items: list[dict[str, Any]],
+    scoring_config: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Apply the initial technology-aware ranking and persist it.
+
+    ``manifest_initial_score`` is the immutable project baseline copied from
+    the canonical manifest. ``initial_score``/``effective_score`` are the
+    technology-aware values used for the first ranking. Existing runtime
+    ``final_score`` values are preserved so re-running init does not erase
+    enumeration history.
+    """
+    context = _technology_context()
+    items = selection.get("wordlists")
+
+    if not isinstance(items, list):
+        items = []
+        selection["wordlists"] = items
+
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+
+        wordlist_id = str(
+            raw.get("wordlist_id")
+            or raw.get("id")
+            or ""
+        ).strip()
+
+        if not wordlist_id:
+            continue
+
+        manifest = _manifest_item_by_id(
+            manifest_items,
+            wordlist_id,
+        ) or {}
+
+        if manifest:
+            raw["manifest_path"] = CANONICAL_WORDLIST_MANIFEST
+            raw["path"] = str(
+                manifest.get("path")
+                or raw.get("path")
+                or ""
+            ).strip()
+
+            if manifest.get("source") or manifest.get("provider"):
+                raw["source"] = str(
+                    manifest.get("source")
+                    or manifest.get("provider")
+                    or raw.get("source")
+                    or "unknown"
+                )
+
+        manifest_initial = _initial_score_for_item(manifest)
+        # For legacy selection files, fall back to their existing initial
+        # score once, then persist that value as the immutable baseline.
+        baseline = _clamp(
+            _safe_float(
+                raw.get("manifest_initial_score"),
+                _safe_float(
+                    raw.get("initial_score"),
+                    manifest_initial,
+                ),
+            )
+        )
+
+        technology_score, technology_matches = _technology_relevance(
+            manifest or raw,
+            context,
+        )
+        technology_mismatch = _technology_specific_mismatch(
+            manifest or raw,
+            context,
+        )
+
+        effective_score = _effective_wordlist_score(
+            baseline,
+            technology_score,
+            technology_mismatch,
+            bool(context.get("available")),
+        )
+
+        raw["manifest_initial_score"] = round(baseline, 6)
+        raw["technology_score"] = round(technology_score, 6)
+        raw["technology_relevance"] = round(technology_score, 6)
+        raw["technology_matches"] = technology_matches
+        raw["technology_mismatch"] = technology_mismatch
+        raw["effective_score"] = round(effective_score, 6)
+        raw["initial_score"] = round(effective_score, 6)
+
+        # Do not destroy feedback from previous discovery runs. Until a run
+        # exists, the effective initial score is also the current score.
+        if "final_score" not in raw:
+            raw["score"] = round(effective_score, 6)
+        else:
+            raw["score"] = _clamp(
+                _safe_float(
+                    raw.get("final_score"),
+                    effective_score,
+                )
+            )
+
+        raw["tier"] = _tier_for_score(
+            raw["score"],
+            scoring_config,
+        )
+        raw["initial_tier"] = _tier_for_score(
+            effective_score,
+            scoring_config,
+        )
+        raw["last_ranked_at"] = now_iso()
+
+    selection["technology_context"] = {
+        "available": bool(context.get("available")),
+        "technologies": list(context.get("technologies") or []),
+        "ranked_at": now_iso(),
+        "method": "technology-aware-initial-score",
+    }
+
+    _write_selection(selection)
+    return selection, context
 
 
 def list_wordlists() -> int:
@@ -928,71 +1325,74 @@ def list_wordlists() -> int:
         return 1
 
     selection = _load_selection()
-
     selected = _selection_candidates(
         selection,
         manifest_items,
         scoring_config,
     )
 
+    technology_context = _technology_context()
     selected_ids = {
         str(item.get("wordlist_id", "")).lower()
         for item in selected
     }
 
-    print(
-        "MANIFEST : "
-        f"{CANONICAL_WORDLIST_MANIFEST}"
-    )
-    print(
-        "PATH     : "
-        f"{manifest_path}"
-    )
+    print("=" * 88)
+    print(" BrebesKab-CSIRT-Tools - Wordlist Selection")
+    print("=" * 88)
+    print(f"MANIFEST : {CANONICAL_WORDLIST_MANIFEST}")
+    print(f"PATH     : {manifest_path}")
     print(f"TOTAL    : {len(manifest_items)}")
     print(f"SELECTED : {len(selected)}")
+    if technology_context.get("available"):
+        technologies = technology_context.get("technologies") or []
+        print("TECHNOLOGY : " + ", ".join(str(x) for x in technologies))
+        print("MODE       : technology-aware ranking")
+    else:
+        print("TECHNOLOGY : not available")
+        print("MODE       : manifest ranking")
     print()
 
-    for item in sorted(
-        manifest_items,
-        key=lambda x: (
-            str(
-                x.get("wordlist_id", "")
-            ).lower() not in selected_ids,
-            -_initial_score_for_item(x),
-            str(
-                x.get("wordlist_id", "")
-            ).lower(),
+    ranked = sorted(
+        selected,
+        key=lambda item: (
+            -_safe_float(item.get("score"), 0.0),
+            -_safe_float(item.get("technology_score"), 0.0),
+            str(item.get("wordlist_id", "")).lower(),
         ),
-    ):
-        wid = str(
-            item.get("wordlist_id")
-        )
+    )
 
-        score = _initial_score_for_item(item)
-        marker = (
-            "*"
-            if wid.lower() in selected_ids
-            else " "
-        )
+    print(
+        f"{'#':>2}  {'WORDLIST':<34} {'SCORE':>7} "
+        f"{'TIER':<11} {'TECH':>6}  MATCH"
+    )
+    print("-" * 88)
 
-        path = str(
-            item.get("path")
-            or "-"
-        )
+    for index, item in enumerate(ranked, start=1):
+        wid = str(item.get("wordlist_id") or "-")
+        score = _safe_float(item.get("score"), 0.0)
+        tech_score = _safe_float(item.get("technology_score"), 0.0)
+        tier_name = str(item.get("tier") or "-")
+        matches = item.get("technology_matches") or []
+        match_text = ", ".join(str(x) for x in matches)
+        if not match_text and item.get("technology_mismatch"):
+            match_text = "mismatch"
+        elif not match_text:
+            match_text = "generic"
 
+        marker = "*" if wid.lower() in selected_ids else " "
         print(
-            f"{marker} {wid:<32} "
-            f"score={score:.2f} "
-            f"tier={_tier_for_score(score, scoring_config):<11} "
-            f"path={path}"
+            f"{marker}{index:>2}  {wid:<34} {score:>7.3f} "
+            f"{tier_name:<11} {tech_score:>6.2f}  {match_text}"
         )
+
+    print()
+    print("[INFO] SCORE = adaptive initial score after technology relevance.")
+    print("[INFO] TECH  = technology relevance score.")
+    print("[INFO] Exploration candidates tetap dipertahankan.")
 
     return 0
 
-
-# ---------------------------------------------------------------------------
-# Scoring configuration
-# ---------------------------------------------------------------------------
 
 def _load_scoring_config() -> dict[str, Any]:
     if not scoring_config_file().is_file():
@@ -2409,19 +2809,43 @@ def _run_command(
     command: list[str],
     stderr_path: Path,
 ) -> subprocess.CompletedProcess[str]:
+    """Run an enumeration tool with a visible heartbeat.
+
+    ffuf/Gobuster write their normalized result to a file, so their stdout is
+    intentionally not streamed as the primary UI. A periodic heartbeat keeps
+    the CLI responsive and makes long network-bound runs visibly active.
+    """
+    started = time.monotonic()
+
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             command,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
-            check=False,
         )
     except OSError as exc:
         raise DirectoryError(
             f"Gagal menjalankan tool: {exc}"
         ) from exc
+
+    last_heartbeat = 0.0
+
+    while process.poll() is None:
+        elapsed = int(time.monotonic() - started)
+        if elapsed == 0 or elapsed - last_heartbeat >= 5:
+            print(
+                f"[RUN] Enumeration berjalan... "
+                f"elapsed {elapsed // 60:02d}:{elapsed % 60:02d} "
+                f"| PID {process.pid}",
+                flush=True,
+            )
+            last_heartbeat = elapsed
+        time.sleep(1)
+
+    stdout, stderr = process.communicate()
 
     stderr_path.parent.mkdir(
         parents=True,
@@ -2429,11 +2853,24 @@ def _run_command(
     )
 
     stderr_path.write_text(
-        completed.stderr or "",
+        stderr or "",
         encoding="utf-8",
     )
 
-    return completed
+    elapsed = int(time.monotonic() - started)
+    print(
+        f"[PASS] Enumeration process selesai "
+        f"({elapsed // 60:02d}:{elapsed % 60:02d}) "
+        f"| exit={process.returncode}",
+        flush=True,
+    )
+
+    return subprocess.CompletedProcess(
+        args=command,
+        returncode=process.returncode,
+        stdout=stdout or "",
+        stderr=stderr or "",
+    )
 
 
 def _execute_tool(
@@ -2635,9 +3072,99 @@ def init() -> int:
             }
         )
 
+    # Init is the point where the project receives its initial, auditable
+    # technology-aware wordlist ranking. It bootstraps missing references,
+    # then persists the calculated score/tier into wordlists/selected/selection.yaml.
+    scoring_config = _load_scoring_config()
+    _, manifest_items = _load_manifest()
+
+    selection = _bootstrap_selection_from_manifest(
+        scoring_config,
+        limit=None,
+    )
+    selection, technology_context = _score_selection_for_init(
+        selection,
+        manifest_items,
+        scoring_config,
+    )
+
+    ranked = sorted(
+        _selection_candidates(
+            selection,
+            manifest_items,
+            scoring_config,
+        ),
+        key=lambda item: (
+            -_safe_float(item.get("score"), 0.0),
+            -_safe_float(item.get("technology_score"), 0.0),
+            str(item.get("wordlist_id", "")).lower(),
+        ),
+    )
+
     print(
         "[PASS] Directory Enumeration Engine "
         "berhasil diinisialisasi."
+    )
+    print(
+        f"PROJECT : {project_root().name}"
+    )
+    print(
+        f"TARGET  : {target['target_url']}"
+    )
+    print(
+        f"FILE    : {directory_file()}"
+    )
+    print()
+    print("Wordlist initial ranking:")
+    if technology_context.get("available"):
+        print(
+            "  TECHNOLOGY : "
+            + ", ".join(
+                str(x)
+                for x in technology_context.get("technologies") or []
+            )
+        )
+        print("  MODE       : technology-aware")
+    else:
+        print("  TECHNOLOGY : not available")
+        print("  MODE       : manifest baseline")
+
+    print(
+        f"  SELECTION  : {selection_file()}"
+    )
+    print(
+        f"  WORDLISTS  : {len(ranked)}"
+    )
+
+    print()
+    print(
+        f"{'#':>2}  {'WORDLIST':<34} {'SCORE':>7} "
+        f"{'TIER':<11} {'TECH':>6}  MATCH"
+    )
+    print("-" * 88)
+
+    for index, item in enumerate(ranked, start=1):
+        wid = str(item.get("wordlist_id") or "-")
+        score = _safe_float(item.get("score"), 0.0)
+        tech_score = _safe_float(item.get("technology_score"), 0.0)
+        tier_name = str(item.get("tier") or "-")
+        matches = item.get("technology_matches") or []
+        match_text = ", ".join(str(x) for x in matches)
+
+        if not match_text and item.get("technology_mismatch"):
+            match_text = "mismatch"
+        elif not match_text:
+            match_text = "generic"
+
+        print(
+            f"{index:>2}  {wid:<34} {score:>7.3f} "
+            f"{tier_name:<11} {tech_score:>6.2f}  {match_text}"
+        )
+
+    print()
+    print(
+        "[INFO] Initial SCORE/TIER telah dihitung berdasarkan "
+        "technology.yaml dan disimpan ke selection.yaml."
     )
     print(
         f"PROJECT : {project_root().name}"
@@ -2870,6 +3397,21 @@ def discover(
                 "dan memenuhi filter."
             )
 
+        ranked_candidates = sorted(
+            candidates,
+            key=lambda item: (
+                -_safe_float(
+                    item.get("score"),
+                    DEFAULT_INITIAL_SCORE,
+                ),
+                -_safe_float(
+                    item.get("technology_score"),
+                    0.0,
+                ),
+                str(item.get("wordlist_id", "")).lower(),
+            ),
+        )
+
         if adaptive:
             candidates.sort(
                 key=lambda item: (
@@ -2878,6 +3420,12 @@ def discover(
                             "score"
                         ),
                         DEFAULT_INITIAL_SCORE,
+                    ),
+                    -_safe_float(
+                        item.get(
+                            "technology_score"
+                        ),
+                        0.0,
                     ),
                     -_safe_float(
                         item.get(
@@ -2998,7 +3546,9 @@ def discover(
     run = run_id()
     started_at = now_iso()
 
-    print("=" * 68)
+    technology_context = _technology_context()
+
+    print("=" * 72)
     print(
         " BrebesKab-CSIRT-Tools - Directory Enumeration"
     )
@@ -3021,6 +3571,55 @@ def discover(
     print(
         f"Wordlist         : {selected_wordlist_id}"
     )
+    if technology_context.get("available"):
+        technologies = technology_context.get("technologies") or []
+        print(
+            "Technology       : "
+            + ", ".join(str(item) for item in technologies)
+        )
+        matches = candidate.get("technology_matches") or []
+        relevance = _safe_float(
+            candidate.get("technology_score"),
+            0.0,
+        )
+        if matches:
+            print(
+                "Wordlist match   : "
+                + ", ".join(str(item) for item in matches)
+                + f" (relevance {relevance:.2f})"
+            )
+        elif candidate.get("technology_mismatch"):
+            print(
+                "Wordlist match   : mismatch with detected technology"
+            )
+        else:
+            print(
+                "Wordlist match   : generic / technology-neutral"
+            )
+    print(
+        "Selection mode   : "
+        + ("adaptive + technology-aware" if adaptive else "technology-aware")
+    )
+
+    if not wordlist and technology_context.get("available"):
+        preview = locals().get("ranked_candidates", [])
+        if preview:
+            print("[INFO] Top wordlist candidates:")
+            for index, item in enumerate(preview[:5], start=1):
+                matches = item.get("technology_matches") or []
+                match_text = ", ".join(str(x) for x in matches)
+                if not match_text and item.get("technology_mismatch"):
+                    match_text = "mismatch"
+                elif not match_text:
+                    match_text = "generic"
+                print(
+                    f"       {index}. "
+                    f"{str(item.get('wordlist_id', '')):<28} "
+                    f"score={_safe_float(item.get('score'), 0.0):.3f} "
+                    f"tier={str(item.get('tier', '')):<11} "
+                    f"match={match_text}"
+                )
+
     print(
         f"Initial score    : {initial_score:.4f}"
     )
@@ -3134,6 +3733,15 @@ def discover(
         f"{', '.join(extensions) if extensions else '-'}"
     )
     print()
+
+    print(
+        "[RUN] Menjalankan "
+        + selected_tool
+        + " dengan wordlist "
+        + selected_wordlist_id
+        + "...",
+        flush=True,
+    )
 
     try:
         (
@@ -3313,6 +3921,25 @@ def discover(
             else ""
         ),
         "adaptive": adaptive,
+        "technology_context": (
+            technology_context.get("technologies", [])
+            if technology_context.get("available")
+            else []
+        ),
+        "technology_matches": candidate.get(
+            "technology_matches",
+            [],
+        ),
+        "technology_score": round(
+            _safe_float(
+                candidate.get("technology_score"),
+                0.0,
+            ),
+            6,
+        ),
+        "technology_mismatch": bool(
+            candidate.get("technology_mismatch", False)
+        ),
         "initial_score": round(
             initial_score,
             6,
