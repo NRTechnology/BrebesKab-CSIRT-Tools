@@ -3,7 +3,7 @@
 BrebesKab-CSIRT-Tools
 Reconnaissance - Directory Enumeration & Adaptive Scoring Engine
 
-Version: 2.1.3
+Version: 2.1.5
 
 Checklist mapping:
     02-006 - Directory discovery
@@ -86,7 +86,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2.1.4"
+SCRIPT_VERSION = "2.1.5"
 SCHEMA_VERSION = "2.0"
 CHECKLIST_ID = "2-006"
 CHECKLIST_NAME = "Directory discovery"
@@ -3226,7 +3226,7 @@ def _execute_tool(
     Path,
     list[str],
 ]:
-    """Execute enumeration and persist complete run/debug evidence."""
+    """Execute enumeration and persist complete run evidence."""
     run_path = _run_directory(run)
     run_path.mkdir(parents=True, exist_ok=True)
 
@@ -3321,23 +3321,6 @@ def _execute_tool(
         }
         _save_yaml(command_evidence, command_payload)
 
-        print(
-            "[DEBUG] Command               : "
-            + command_payload["command_line"],
-            flush=True,
-        )
-        print(
-            "[DEBUG] Command evidence      : "
-            + str(command_evidence),
-            flush=True,
-        )
-        if bounded_evidence is not None:
-            print(
-                "[DEBUG] Bounded wordlist      : "
-                + str(bounded_evidence),
-                flush=True,
-            )
-
         completed = _run_command(command, stderr_path)
         execution_ended_at = now_iso()
 
@@ -3407,13 +3390,6 @@ def _execute_tool(
             "result_status": "not-parsed",
         }
         _save_yaml(process_evidence, process_payload)
-
-        print(f"[DEBUG] PID                    : {process_payload['pid']}", flush=True)
-        print(f"[DEBUG] Return code            : {completed.returncode}", flush=True)
-        print(f"[DEBUG] stdout bytes           : {stdout_bytes:,}", flush=True)
-        print(f"[DEBUG] stderr bytes           : {stderr_bytes:,}", flush=True)
-        print(f"[DEBUG] Tool output            : {output_size:,} bytes", flush=True)
-        print(f"[DEBUG] Output evidence        : {evidence_output}", flush=True)
 
     return (
         completed.returncode,
@@ -4103,12 +4079,12 @@ def discover(
                         results = _deduplicate_results(results)
                         process_evidence = _run_directory(run) / "process.yaml"
                         if process_evidence.is_file():
-                            process_debug = _load_yaml(
+                            process_state = _load_yaml(
                                 process_evidence,
-                                "Process debug evidence",
+                                "Process evidence",
                             )
-                            process_debug["parsed_results"] = len(results)
-                            process_debug["result_status"] = "partial"
+                            process_state["parsed_results"] = len(results)
+                            process_state["result_status"] = "partial"
                             _save_yaml(process_evidence, process_debug)
 
                 except (DirectoryError, OSError, ValueError, json.JSONDecodeError):
@@ -4371,12 +4347,12 @@ def discover(
         results = _deduplicate_results(results)
         process_evidence = _run_directory(run) / "process.yaml"
         if process_evidence.is_file():
-            process_debug = _load_yaml(
+            process_state = _load_yaml(
                 process_evidence,
-                "Process debug evidence",
+                "Process evidence",
             )
-            process_debug["parsed_results"] = len(results)
-            process_debug["result_status"] = "complete"
+            process_state["parsed_results"] = len(results)
+            process_state["result_status"] = "complete"
             _save_yaml(process_evidence, process_debug)
 
         request_count = estimated_requests
