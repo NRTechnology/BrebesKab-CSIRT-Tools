@@ -1,12 +1,13 @@
 #requires -Version 5.1
-# BrebesKab-CSIRT-Tools install-requirements.ps1 v2.20
+# BrebesKab-CSIRT-Tools install-requirements.ps1 v2.25
 # CLI version verification is based on executable availability and non-empty version output.
 [CmdletBinding()]
 param(
     [switch]$DryRun,
     [switch]$SkipRollback,
     [switch]$SkipZAP,
-    [switch]$Force
+    [switch]$Force,
+    [switch]$UpdateWordlists
 )
 
 Set-StrictMode -Version Latest
@@ -37,6 +38,12 @@ $WordlistManifest = Join-Path $WordlistsRoot 'manifest.json'
 $VenvDir = Join-Path $RepoRoot '.venv'
 $VenvPython = Join-Path $VenvDir 'Scripts\python.exe'
 $VenvScripts = Join-Path $VenvDir 'Scripts'
+
+# Assetnote metadata/CDN checks are deliberately bounded so a degraded CDN
+# cannot stall the installer for a long time. Other wordlist sources keep
+# the default timeout used by Download-Wordlist.
+$AssetnoteTimeoutSec = 20
+$script:AssetnoteMetadataCache = @{}
 
 $WinGetPackages = @(
     [pscustomobject]@{ Name='Python'; Id='Python.Python.3.14' },
@@ -76,10 +83,12 @@ $GitHubHeaders = @{
 }
 
 $script:State = [ordered]@{
-    schema_version=2.19
+    schema_version=2.23
+    installer_version='2.25'
     started_at=(Get-Date).ToString('o')
     repo_root=$RepoRoot
     dry_run=[bool]$DryRun
+    update_wordlists=[bool]$UpdateWordlists
     installed_by_script=@()
     venv_created_by_script=$false
     python_reference=$null
@@ -142,6 +151,7 @@ function Request-Administrator {
     if ($SkipRollback) { $elevatedArguments += '-SkipRollback' }
     if ($SkipZAP) { $elevatedArguments += '-SkipZAP' }
     if ($Force) { $elevatedArguments += '-Force' }
+    if ($UpdateWordlists) { $elevatedArguments += '-UpdateWordlists' }
 
     try {
         $process = Start-Process `
@@ -628,11 +638,20 @@ function Install-GitHubZipTool {
 function Get-LatestAssetnoteWordlist {
     param(
         [Parameter(Mandatory=$true)][string]$MetadataUrl,
-        [Parameter(Mandatory=$true)][string]$FilePrefix
+        [Parameter(Mandatory=$true)][string]$FilePrefix,
+        [int]$TimeoutSec=$AssetnoteTimeoutSec
     )
 
     try{
-        $metadata = Invoke-RestMethod -Uri $MetadataUrl -Method Get
+        if($script:AssetnoteMetadataCache.ContainsKey($MetadataUrl)){
+            $metadata = $script:AssetnoteMetadataCache[$MetadataUrl]
+        }
+        else{
+            Write-Log "Mengambil metadata Assetnote: $MetadataUrl" 'INFO'
+            $metadata = Invoke-RestMethod -Uri $MetadataUrl -Method Get -TimeoutSec $TimeoutSec
+            $script:AssetnoteMetadataCache[$MetadataUrl] = $metadata
+        }
+
         $matches = @($metadata.data | Where-Object {
             $_.Filename -like "$FilePrefix*.txt" -and
             $_.Download
@@ -648,8 +667,9 @@ function Get-LatestAssetnoteWordlist {
         return $null
     }
 
-    # Metadata is generated from the current Assetnote dataset. Prefer the
-    # newest timestamp rather than hard-coding a monthly filename.
+    # Assetnote publishes the dataset identity in the metadata table.
+    # The installer selects the newest Date entry for the requested filename
+    # prefix instead of hard-coding a monthly filename.
     $selected = $matches |
         Sort-Object { [double]$_.Date } -Descending |
         Select-Object -First 1
@@ -665,10 +685,11 @@ function Get-LatestAssetnoteWordlist {
     }
 
     [pscustomobject]@{
-        Filename = [string]$selected.Filename
-        Url      = $downloadUrl
+        Filename  = [string]$selected.Filename
+        Url       = $downloadUrl
         LineCount = [int64]$selected.'Line Count'
-        FileSize = [string]$selected.'File Size'
+        FileSize  = [string]$selected.'File Size'
+        Date      = [string]$selected.Date
     }
 }
 
@@ -692,10 +713,12 @@ function Download-Wordlist {
         [Parameter(Mandatory=$true)][string]$Destination,
         [string]$Source='unknown',
         [string]$Version='',
-        [string]$ExpectedSha256=''
+        [string]$ExpectedSha256='',
+        [int]$TimeoutSec=60,
+        [switch]$AllowReplaceExisting
     )
 
-    if(Test-Path $Destination){
+    if((Test-Path $Destination) -and -not $AllowReplaceExisting){
         Write-Log "Wordlist sudah tersedia: $Destination" 'OK'
         return $false
     }
@@ -709,7 +732,7 @@ function Download-Wordlist {
     try{
         New-Item -ItemType Directory -Path (Split-Path -Parent $Destination) -Force | Out-Null
         Write-Log "Download wordlist [$Source] $Name..." 'STEP'
-        Invoke-WebRequest -Uri $Url -OutFile $temp -UseBasicParsing
+        Invoke-WebRequest -Uri $Url -OutFile $temp -UseBasicParsing -TimeoutSec $TimeoutSec
 
         if(-not (Test-Path $temp)){
             throw "File hasil download tidak ditemukan: $temp"
@@ -743,8 +766,19 @@ function Add-WordlistManifestEntry {
         [string]$Url='',
         [string]$Version='',
         [int64]$LineCount=0,
-        [string]$FileSize=''
+        [string]$FileSize='',
+        [string]$SourceId='',
+        [string]$SourceSha='',
+        [string]$MetadataDate='',
+        [string]$ETag='',
+        [string]$LastModified=''
     )
+
+    $sha256=''
+    if(Test-Path $Path){
+        try { $sha256=(Get-FileHash $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
+        catch { Write-Log "Gagal menghitung SHA-256 wordlist [$Name]: $($_.Exception.Message)" 'WARN' }
+    }
 
     $Manifest.Add([ordered]@{
         category=$Category
@@ -755,7 +789,248 @@ function Add-WordlistManifestEntry {
         version=$Version
         line_count=$LineCount
         file_size=$FileSize
+        source_id=$SourceId
+        source_sha=$SourceSha
+        metadata_date=$MetadataDate
+        sha256=$sha256
+        etag=$ETag
+        last_modified=$LastModified
+        checked_at=(Get-Date).ToString('o')
     }) | Out-Null
+}
+
+function Read-WordlistManifest {
+    if(-not (Test-Path $WordlistManifest)){
+        return @()
+    }
+
+    try{
+        $doc=Get-Content -Path $WordlistManifest -Raw -Encoding UTF8 | ConvertFrom-Json
+        if($doc.wordlists){ return @($doc.wordlists) }
+        return @()
+    }
+    catch{
+        Write-Log "Manifest wordlist lama tidak dapat dibaca: $($_.Exception.Message). Installer akan membangun manifest baru." 'WARN'
+        return @()
+    }
+}
+
+function Get-PreviousWordlistEntry {
+    param(
+        [Parameter(Mandatory=$true)][object[]]$PreviousManifest,
+        [Parameter(Mandatory=$true)][string]$Name
+    )
+
+    $match=@(
+        $PreviousManifest |
+            Where-Object {
+                $entryName=[string](Get-SafeObjectProperty -Object $_ -Name 'name')
+                $entryName -eq $Name
+            } |
+            Select-Object -First 1
+    )
+
+    if($match.Count -eq 0){
+        return $null
+    }
+
+    return $match[0]
+}
+
+function Get-GitHubFileMetadata {
+    param(
+        [Parameter(Mandatory=$true)][string]$Repository,
+        [Parameter(Mandatory=$true)][string]$Path,
+        [string]$Ref='master'
+    )
+
+    $encodedParts=@($Path -split '/' | ForEach-Object { [uri]::EscapeDataString($_) })
+    $encodedPath=$encodedParts -join '/'
+    $apiUrl="https://api.github.com/repos/$Repository/contents/${encodedPath}?ref=${Ref}"
+
+    try{
+        $response=Invoke-RestMethod -Uri $apiUrl -Method Get -Headers $GitHubHeaders
+        return [pscustomobject]@{
+            Url=$apiUrl
+            Sha=[string]$response.sha
+            Size=[int64]$response.size
+            Name=[string]$response.name
+        }
+    }
+    catch{
+        Write-Log "Gagal mengambil metadata GitHub [$Repository/$Path]: $($_.Exception.Message)" 'WARN'
+        return $null
+    }
+}
+
+function Get-SafeObjectProperty {
+    param(
+        [Parameter(Mandatory=$true)][object]$Object,
+        [Parameter(Mandatory=$true)][string]$Name
+    )
+
+    if($null -eq $Object){ return $null }
+    $property=$Object.PSObject.Properties[$Name]
+    if($null -eq $property){ return $null }
+    return $property.Value
+}
+
+function Test-WordlistCurrent {
+    param(
+        [Parameter(Mandatory=$true)][string]$Name,
+        [Parameter(Mandatory=$true)][string]$Url,
+        [Parameter(Mandatory=$true)][string]$Destination,
+        [Parameter(Mandatory=$true)][string]$Source,
+        [string]$Version='',
+        [string]$SourceId='',
+        [string]$SourceSha='',
+        [int64]$RemoteSize=0,
+        [int64]$LineCount=0,
+        [string]$FileSize='',
+        [object]$PreviousEntry=$null,
+        [int]$TimeoutSec=60,
+        [switch]$ForceRemoteCheck
+    )
+
+    if(-not (Test-Path $Destination)){ return $false }
+
+    if($PreviousEntry -and -not $ForceRemoteCheck){
+        $previousSourceSha = [string](Get-SafeObjectProperty -Object $PreviousEntry -Name 'source_sha')
+        $previousVersion   = [string](Get-SafeObjectProperty -Object $PreviousEntry -Name 'version')
+        $previousLineCount = [int64](Get-SafeObjectProperty -Object $PreviousEntry -Name 'line_count')
+        $previousFileSize  = [string](Get-SafeObjectProperty -Object $PreviousEntry -Name 'file_size')
+
+        if($SourceSha -and $previousSourceSha){
+            if($SourceSha -eq $previousSourceSha){
+                Write-Log "Source metadata tidak berubah: $Name (GitHub source SHA cocok)." 'OK'
+                return $true
+            }
+            return $false
+        }
+
+        if($Version -and $previousVersion){
+            if($Version -eq $previousVersion){
+                if($Source -eq 'Assetnote'){
+                    # Assetnote equality is based on the metadata identity used by the
+                    # manifest: filename + line count + file size. Date is informational
+                    # because the filename already carries the published dataset date.
+                    $lineCountMatches = ($LineCount -le 0 -or $previousLineCount -le 0 -or $LineCount -eq $previousLineCount)
+                    $fileSizeMatches  = ([string]::IsNullOrWhiteSpace($FileSize) -or [string]::IsNullOrWhiteSpace($previousFileSize) -or $FileSize -eq $previousFileSize)
+
+                    if($lineCountMatches -and $fileSizeMatches){
+                        Write-Log "Assetnote metadata sama: $Name (filename=$Version; line_count=$LineCount; file_size=$FileSize). Date metadata dicatat sebagai informasi, bukan kriteria equality." 'OK'
+                        return $true
+                    }
+
+                    Write-Log "Assetnote metadata berubah: $Name (filename sama=$Version; line_count $previousLineCount -> $LineCount; file_size $previousFileSize -> $FileSize)." 'INFO'
+                    return $false
+                }
+
+                if($RemoteSize -gt 0 -and (Get-Item $Destination).Length -eq $RemoteSize){
+                    Write-Log "Source metadata sama: $Name ($Version; remote size cocok)." 'OK'
+                    return $true
+                }
+
+                if(-not $RemoteSize){
+                    Write-Log "Source version sama: $Name ($Version)." 'OK'
+                    return $true
+                }
+            }
+            elseif($Version -ne $previousVersion){
+                return $false
+            }
+        }
+    }
+
+    # A legacy manifest or a forced remote check may not provide enough source
+    # metadata. Perform a bounded content comparison. The live wordlist is
+    # never replaced unless the new content is successfully downloaded.
+    if($DryRun){
+        Write-Log "DryRun: wordlist perlu diverifikasi/di-update: $Name" 'DRYRUN'
+        return $true
+    }
+
+    $temp="$Destination.check"
+    try{
+        Write-Log "Memeriksa perubahan wordlist [$Source] $Name..." 'STEP'
+        Invoke-WebRequest -Uri $Url -OutFile $temp -UseBasicParsing -TimeoutSec $TimeoutSec
+        if(-not (Test-Path $temp)){ throw "File hasil check tidak ditemukan: $temp" }
+
+        $localHash=(Get-FileHash $Destination -Algorithm SHA256).Hash.ToLowerInvariant()
+        $remoteHash=(Get-FileHash $temp -Algorithm SHA256).Hash.ToLowerInvariant()
+
+        if($localHash -eq $remoteHash){
+            Write-Log "Konten wordlist sama: $Name (SHA-256 cocok)." 'OK'
+            Remove-Item $temp -Force -ErrorAction SilentlyContinue
+            return $true
+        }
+
+        Write-Log "Perubahan konten wordlist terdeteksi: $Name (SHA-256 berbeda)." 'INFO'
+        Remove-Item $temp -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+    catch{
+        Remove-Item $temp -Force -ErrorAction SilentlyContinue
+        Write-Log "Tidak dapat memastikan update [$Name]: $($_.Exception.Message). Wordlist lama dipertahankan." 'WARN'
+        return $true
+    }
+}
+
+function Sync-Wordlist {
+    param(
+        [Parameter(Mandatory=$true)][string]$Name,
+        [Parameter(Mandatory=$true)][string]$Url,
+        [Parameter(Mandatory=$true)][string]$Destination,
+        [Parameter(Mandatory=$true)][string]$Source,
+        [string]$Category='generic',
+        [string]$Version='',
+        [string]$SourceId='',
+        [string]$SourceSha='',
+        [int64]$RemoteSize=0,
+        [int64]$LineCount=0,
+        [string]$FileSize='',
+        [object]$PreviousEntry=$null,
+        [int]$TimeoutSec=60,
+        [switch]$ForceRemoteCheck
+    )
+
+    $needsDownload = -not (Test-Path $Destination)
+
+    if(-not $needsDownload){
+        $current=Test-WordlistCurrent `
+            -Name $Name -Url $Url -Destination $Destination -Source $Source `
+            -Version $Version -SourceId $SourceId -SourceSha $SourceSha `
+            -RemoteSize $RemoteSize `
+            -LineCount $LineCount -FileSize $FileSize `
+            -PreviousEntry $PreviousEntry -TimeoutSec $TimeoutSec -ForceRemoteCheck:$ForceRemoteCheck
+        $needsDownload = -not $current
+    }
+
+    if($needsDownload){
+        $updated=Download-Wordlist `
+            -Name $Name -Url $Url -Destination $Destination `
+            -Source $Source -Version $Version `
+            -TimeoutSec $TimeoutSec `
+            -AllowReplaceExisting
+        if(-not (Test-Path $Destination)){
+            return $false
+        }
+        if($updated){
+            Write-Log "Wordlist diperbarui/diinstall: $Name" 'OK'
+
+            $previousEntryPath = [string](Get-SafeObjectProperty -Object $PreviousEntry -Name 'path')
+            if($previousEntryPath){
+                $previousPath=Join-Path $RepoRoot ($previousEntryPath -replace '/', '\')
+                $currentPath=[IO.Path]::GetFullPath($Destination)
+                if((Test-Path $previousPath) -and ([IO.Path]::GetFullPath($previousPath) -ne $currentPath)){
+                    Remove-Item $previousPath -Force -ErrorAction SilentlyContinue
+                    Write-Log "Wordlist versi lama dihapus setelah update: $previousPath" 'INFO'
+                }
+            }
+        }
+    }
+
+    return (Test-Path $Destination)
 }
 
 function Install-Gobuster {
@@ -846,7 +1121,7 @@ function Install-Gobuster {
 
 function Install-Wordlists {
     if($DryRun){
-        Write-Log 'DryRun: wordlist installation akan menggunakan layout generic/technology dan manifest.json.' 'DRYRUN'
+        Write-Log 'DryRun: wordlist installation/update akan menggunakan layout generic/technology dan manifest.json.' 'DRYRUN'
     }
 
     New-Item -ItemType Directory -Path `
@@ -855,110 +1130,83 @@ function Install-Wordlists {
         $AssetnoteTechnologyDir `
         -Force | Out-Null
 
+    $previousManifest=Read-WordlistManifest
     $manifest = New-Object System.Collections.ArrayList
 
-    # SecLists: compact-to-broad directory discovery tiers.
-    # Wordlist download failures are non-fatal; failed URLs are logged and skipped.
+    if($UpdateWordlists){
+        Write-Log 'Mode UpdateWordlists aktif: memeriksa seluruh wordlist yang dikelola installer.' 'STEP'
+    }
+    else{
+        Write-Log 'Memeriksa wordlist: file yang sudah ada juga akan dicek terhadap source terbaru.' 'STEP'
+    }
+
+    # SecLists: use the GitHub Contents API SHA as a lightweight source
+    # fingerprint. If the API is unavailable, the existing wordlist is kept.
     $secLists = @(
-        [pscustomobject]@{
-            Name='common'
-            Category='generic/seclists'
-            File='common.txt'
-        },
-        [pscustomobject]@{
-            Name='quickhits'
-            Category='generic/seclists'
-            File='quickhits.txt'
-        },
-        [pscustomobject]@{
-            Name='raft-small-directories'
-            Category='generic/seclists'
-            File='raft-small-directories.txt'
-        },
-        [pscustomobject]@{
-            Name='raft-medium-directories'
-            Category='generic/seclists'
-            File='raft-medium-directories.txt'
-        },
-        [pscustomobject]@{
-            Name='raft-large-directories'
-            Category='generic/seclists'
-            File='raft-large-directories.txt'
-        }
+        [pscustomobject]@{ Name='common'; Category='generic/seclists'; File='common.txt' },
+        [pscustomobject]@{ Name='quickhits'; Category='generic/seclists'; File='quickhits.txt' },
+        [pscustomobject]@{ Name='raft-small-directories'; Category='generic/seclists'; File='raft-small-directories.txt' },
+        [pscustomobject]@{ Name='raft-medium-directories'; Category='generic/seclists'; File='raft-medium-directories.txt' },
+        [pscustomobject]@{ Name='raft-large-directories'; Category='generic/seclists'; File='raft-large-directories.txt' }
     )
 
     foreach($item in $secLists){
         $url="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/$($item.File)"
         $destination=Join-Path $SecListsWordlistsDir $item.File
+        $previous=Get-PreviousWordlistEntry -PreviousManifest $previousManifest -Name $item.Name
+        $sourceMeta=Get-GitHubFileMetadata -Repository 'danielmiessler/SecLists' -Path "Discovery/Web-Content/$($item.File)" -Ref 'master'
 
-        Download-Wordlist `
-            -Name $item.Name `
-            -Url $url `
-            -Destination $destination `
-            -Source 'SecLists'
+        $sourceSha=if($sourceMeta){ [string]$sourceMeta.Sha } else { '' }
+        $sourceSize=if($sourceMeta){ [int64]$sourceMeta.Size } else { 0 }
+        $available=Sync-Wordlist `
+            -Name $item.Name -Url $url -Destination $destination `
+            -Source 'SecLists' -Category $item.Category `
+            -SourceId "danielmiessler/SecLists:Discovery/Web-Content/$($item.File)" `
+            -SourceSha $sourceSha -RemoteSize $sourceSize `
+            -PreviousEntry $previous -TimeoutSec 60 `
+            -ForceRemoteCheck:$UpdateWordlists
 
-        if(Test-Path $destination){
+        if($available){
             Add-WordlistManifestEntry `
                 -Manifest $manifest `
                 -Category $item.Category `
                 -Name $item.Name `
                 -Path (Get-RepoRelativePath $destination) `
                 -Source 'danielmiessler/SecLists' `
-                -Url $url
+                -Url $url `
+                -SourceId "danielmiessler/SecLists:Discovery/Web-Content/$($item.File)" `
+                -SourceSha $sourceSha
         }
     }
 
-    # Assetnote metadata is used instead of hard-coding monthly filenames.
-    # This keeps the installer aligned with the latest published dataset.
     $automatedMetadataUrl='https://raw.githubusercontent.com/assetnote/wordlists/master/data/automated.json'
     $technologyMetadataUrl='https://raw.githubusercontent.com/assetnote/wordlists/master/data/technologies.json'
 
     $assetnoteAutomated = @(
-        [pscustomobject]@{
-            Name='httparchive-directories-1m'
-            Prefix='httparchive_directories_1m_'
-            Category='generic/assetnote'
-        },
-        [pscustomobject]@{
-            Name='httparchive-php'
-            Prefix='httparchive_php_'
-            Category='technology/assetnote'
-        },
-        [pscustomobject]@{
-            Name='httparchive-jsp-jspa-do-action'
-            Prefix='httparchive_jsp_jspa_do_action_'
-            Category='technology/assetnote'
-        },
-        [pscustomobject]@{
-            Name='httparchive-aspx-asp-cfm-svc-ashx-asmx'
-            Prefix='httparchive_aspx_asp_cfm_svc_ashx_asmx_'
-            Category='technology/assetnote'
-        }
+        [pscustomobject]@{ Name='httparchive-directories-1m'; Prefix='httparchive_directories_1m_'; Category='generic/assetnote' },
+        [pscustomobject]@{ Name='httparchive-php'; Prefix='httparchive_php_'; Category='technology/assetnote' },
+        [pscustomobject]@{ Name='httparchive-jsp-jspa-do-action'; Prefix='httparchive_jsp_jspa_do_action_'; Category='technology/assetnote' },
+        [pscustomobject]@{ Name='httparchive-aspx-asp-cfm-svc-ashx-asmx'; Prefix='httparchive_aspx_asp_cfm_svc_ashx_asmx_'; Category='technology/assetnote' }
     )
 
     foreach($item in $assetnoteAutomated){
-        $meta=Get-LatestAssetnoteWordlist -MetadataUrl $automatedMetadataUrl -FilePrefix $item.Prefix
-        if(-not $meta){
-            continue
-        }
+        $meta=Get-LatestAssetnoteWordlist -MetadataUrl $automatedMetadataUrl -FilePrefix $item.Prefix -TimeoutSec $AssetnoteTimeoutSec
+        if(-not $meta){ continue }
 
-        $destinationRoot = if($item.Category -eq 'generic/assetnote'){
-            $AssetnoteAutomatedDir
-        }
-        else{
-            $AssetnoteTechnologyDir
-        }
-
+        $destinationRoot=if($item.Category -eq 'generic/assetnote'){ $AssetnoteAutomatedDir } else { $AssetnoteTechnologyDir }
         $destination=Join-Path $destinationRoot $meta.Filename
+        $previous=Get-PreviousWordlistEntry -PreviousManifest $previousManifest -Name $item.Name
+        $sourceId="assetnote/wordlists:$($meta.Filename)"
 
-        Download-Wordlist `
-            -Name $item.Name `
-            -Url $meta.Url `
-            -Destination $destination `
-            -Source 'Assetnote' `
-            -Version $meta.Filename
+        $available=Sync-Wordlist `
+            -Name $item.Name -Url $meta.Url -Destination $destination `
+            -Source 'Assetnote' -Category $item.Category `
+            -Version $meta.Filename -SourceId $sourceId `
+            -LineCount $meta.LineCount -FileSize $meta.FileSize `
+            -PreviousEntry $previous -TimeoutSec $AssetnoteTimeoutSec `
+            -ForceRemoteCheck:$UpdateWordlists
 
-        if(Test-Path $destination){
+        if($available){
             Add-WordlistManifestEntry `
                 -Manifest $manifest `
                 -Category $item.Category `
@@ -968,68 +1216,60 @@ function Install-Wordlists {
                 -Url $meta.Url `
                 -Version $meta.Filename `
                 -LineCount $meta.LineCount `
-                -FileSize $meta.FileSize
+                -FileSize $meta.FileSize `
+                -MetadataDate $meta.Date `
+                -SourceId $sourceId
         }
     }
 
-    # Technology-specific Assetnote lists. These are selected because they
-    # map directly to the technology-aware discovery design. We intentionally
-    # skip extremely large lists such as Nginx (>100 MB in current metadata);
-    # directory.py can add them later as an explicit deep-scan profile.
-    $technologyLists = @(
-        'apache',
-        'django',
-        'express',
-        'flask',
-        'laravel',
-        'rails',
-        'spring',
-        'symfony',
-        'tomcat',
-        'yii',
-        'zend',
-        'coldfusion'
+    $technologyLists=@(
+        'apache','django','express','flask','laravel','rails',
+        'spring','symfony','tomcat','yii','zend','coldfusion'
     )
 
     foreach($technology in $technologyLists){
         $meta=Get-LatestAssetnoteWordlist `
             -MetadataUrl $technologyMetadataUrl `
-            -FilePrefix "httparchive_${technology}_"
+            -FilePrefix "httparchive_${technology}_" `
+            -TimeoutSec $AssetnoteTimeoutSec
 
-        if(-not $meta){
-            continue
-        }
-
+        if(-not $meta){ continue }
         if($meta.LineCount -eq 0){
             Write-Log "Assetnote technology wordlist kosong; dilewati: $technology" 'WARN'
             continue
         }
 
         $destination=Join-Path $AssetnoteTechnologyDir $meta.Filename
+        $name="assetnote-$technology"
+        $previous=Get-PreviousWordlistEntry -PreviousManifest $previousManifest -Name $name
+        $sourceId="assetnote/wordlists:$($meta.Filename)"
 
-        Download-Wordlist `
-            -Name "assetnote-$technology" `
-            -Url $meta.Url `
-            -Destination $destination `
-            -Source 'Assetnote' `
-            -Version $meta.Filename
+        $available=Sync-Wordlist `
+            -Name $name -Url $meta.Url -Destination $destination `
+            -Source 'Assetnote' -Category 'technology/assetnote' `
+            -Version $meta.Filename -SourceId $sourceId `
+            -LineCount $meta.LineCount -FileSize $meta.FileSize `
+            -PreviousEntry $previous -TimeoutSec $AssetnoteTimeoutSec `
+            -ForceRemoteCheck:$UpdateWordlists
 
-        if(Test-Path $destination){
+        if($available){
             Add-WordlistManifestEntry `
                 -Manifest $manifest `
                 -Category 'technology/assetnote' `
-                -Name "assetnote-$technology" `
+                -Name $name `
                 -Path (Get-RepoRelativePath $destination) `
                 -Source 'assetnote/wordlists' `
                 -Url $meta.Url `
                 -Version $meta.Filename `
                 -LineCount $meta.LineCount `
-                -FileSize $meta.FileSize
+                -FileSize $meta.FileSize `
+                -MetadataDate $meta.Date `
+                -SourceId $sourceId
         }
     }
 
     $manifestDocument=[ordered]@{
-        schema_version=1
+        schema_version=2
         generated_at=(Get-Date).ToString('o')
         root=(Get-RepoRelativePath $WordlistsRoot)
         sources=@(
@@ -1052,11 +1292,10 @@ function Install-Wordlists {
     if(-not $DryRun){
         $manifestDocument | ConvertTo-Json -Depth 10 |
             Set-Content -Path $WordlistManifest -Encoding UTF8
-
-        Write-Log "Wordlist manifest berhasil dibuat: $WordlistManifest" 'OK'
+        Write-Log "Wordlist manifest berhasil dibuat/diperbarui: $WordlistManifest" 'OK'
     }
     else{
-        Write-Log "DryRun: manifest akan dibuat di $WordlistManifest" 'DRYRUN'
+        Write-Log "DryRun: manifest akan dibuat/diperbarui di $WordlistManifest" 'DRYRUN'
     }
 }
 
@@ -1372,6 +1611,48 @@ function Get-VerificationOutput {
     $output
 }
 
+function Invoke-VersionCapture {
+    param(
+        [Parameter(Mandatory=$true)][string]$FilePath,
+        [string[]]$Arguments=@()
+    )
+
+    if(-not (Test-Path $FilePath)){
+        throw "Executable tidak ditemukan: $FilePath"
+    }
+
+    $stdoutFile = Join-Path $DownloadRoot ("version-" + [Guid]::NewGuid().ToString('N') + ".stdout")
+    $stderrFile = Join-Path $DownloadRoot ("version-" + [Guid]::NewGuid().ToString('N') + ".stderr")
+
+    try{
+        $argumentString = ($Arguments | ForEach-Object {
+            if($_ -match '[\s"]') { '"' + ($_.Replace('"','\"')) + '"' } else { $_ }
+        }) -join ' '
+
+        $process = Start-Process `
+            -FilePath $FilePath `
+            -ArgumentList $argumentString `
+            -RedirectStandardOutput $stdoutFile `
+            -RedirectStandardError $stderrFile `
+            -WindowStyle Hidden `
+            -Wait `
+            -PassThru `
+            -ErrorAction Stop
+
+        $stdout = if(Test-Path $stdoutFile){ Get-Content $stdoutFile -Raw -ErrorAction SilentlyContinue } else { '' }
+        $stderr = if(Test-Path $stderrFile){ Get-Content $stderrFile -Raw -ErrorAction SilentlyContinue } else { '' }
+
+        [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            StdOut   = [string]$stdout
+            StdErr   = [string]$stderr
+        }
+    }
+    finally{
+        Remove-Item $stdoutFile,$stderrFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Verify-Command {
     param(
         [Parameter(Mandatory=$true)][string]$Name,
@@ -1391,15 +1672,14 @@ function Verify-Command {
 
     Write-Log "VERIFY $Name -> $path"
 
-    $result = Invoke-NativeCapture -FilePath $path -Arguments $Arguments
+    # Use Start-Process redirection for CLI version checks. This keeps native
+    # stderr out of the Windows PowerShell error stream, eliminating the
+    # misleading NativeCommandError noise produced by some Go CLIs.
+    $result = Invoke-VersionCapture -FilePath $path -Arguments $Arguments
     $output = Get-VerificationOutput $result
 
-    # Verification criterion for version-capable CLI tools is intentionally simple:
-    # executable exists and the requested version command returns non-empty output.
-    # Do not reject a valid version banner only because the tool uses a non-zero
-    # exit code or writes informational text to stderr on Windows.
     if([string]::IsNullOrWhiteSpace($output)){
-        throw "Verifikasi gagal untuk ${Name}: command tidak mengembalikan output."
+        throw "Verifikasi gagal untuk ${Name}: command tidak mengembalikan output. Exit code: $($result.ExitCode)."
     }
 
     Write-Log "$Name OK: $output" 'OK'
@@ -1419,27 +1699,11 @@ function Verify-Nuclei {
 
     Write-Log "VERIFY nuclei -> $path"
 
-    # Nuclei writes its version banner to stderr on this Windows environment.
-    # Windows PowerShell 5.1 can treat native stderr as a terminating error when
-    # $ErrorActionPreference is Stop. Temporarily use Continue only for this
-    # native command so stderr becomes captured output instead of aborting.
-    $previousErrorActionPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        $output = (& $path '-version' 2>&1 | Out-String).Trim()
-    }
-    finally {
-        $ErrorActionPreference = $previousErrorActionPreference
-    }
+    $result = Invoke-VersionCapture -FilePath $path -Arguments @('-version')
+    $output = Get-VerificationOutput $result
 
-    # Verification criterion is intentionally simple:
-    # executable exists and -version returns any non-empty output.
     if([string]::IsNullOrWhiteSpace($output)){
-        throw 'Verifikasi Nuclei gagal: command -version tidak mengembalikan output.'
-    }
-
-    if($output.Length -gt 4000){
-        $output = $output.Substring(0,4000) + '...'
+        throw "Verifikasi Nuclei gagal: command -version tidak mengembalikan output. Exit code: $($result.ExitCode)."
     }
 
     Write-Log "nuclei OK: $output" 'OK'
@@ -1632,17 +1896,17 @@ try{
         -Force | Out-Null
 
     Write-Log '============================================================' 'STEP'
-    Write-Log 'BrebesKab-CSIRT-Tools install-requirements.ps1 v2.20' 'STEP'
+    Write-Log 'BrebesKab-CSIRT-Tools install-requirements.ps1 v2.25' 'STEP'
     Write-Log '============================================================' 'STEP'
 
     Request-Administrator
 
     if(-not(Test-Administrator)){
-        throw 'Installer v2.19 tidak berjalan sebagai Administrator setelah proses elevation.'
+        throw 'Installer v2.25 tidak berjalan sebagai Administrator setelah proses elevation.'
     }
 
     if(-not [Environment]::Is64BitOperatingSystem){
-        throw 'Installer v2.19 membutuhkan Windows 64-bit.'
+        throw 'Installer v2.25 membutuhkan Windows 64-bit.'
     }
 
     if(-not(Find-Command 'winget')){
