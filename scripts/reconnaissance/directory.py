@@ -82,7 +82,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2.0.0"
+SCRIPT_VERSION = "2.0.2"
 SCHEMA_VERSION = "2.0"
 CHECKLIST_ID = "2-006"
 CHECKLIST_NAME = "Directory discovery"
@@ -528,33 +528,41 @@ def _repository_root() -> Path:
     return SCRIPT_DIR.parent.parent
 
 
+CANONICAL_WORDLIST_MANIFEST = (
+    "config/dictionaries/directory/manifest.json"
+)
+
+
 def _manifest_candidates() -> list[Path]:
+    """Return the single canonical global wordlist manifest.
+
+    The project must never create or depend on a project-local manifest.
+    Legacy paths are intentionally not returned here so a stale installation
+    cannot silently become the source of truth.
+    """
     repo = _repository_root()
     return [
-        repo / "wordlists" / "manifest.json",
-        repo / ".runtime" / "wordlists" / "manifest.json",
+        repo / "config" / "dictionaries" / "directory" / "manifest.json",
     ]
 
 
 def _resolve_manifest_path(raw: str) -> Path:
+    """Resolve a wordlist path without copying it into the project.
+
+    Relative paths in the global manifest are resolved from the repository
+    root first. Absolute paths are accepted as-is. Project-local resolution
+    is deliberately not used as a fallback because the global manifest is
+    the canonical source of wordlist locations.
+    """
     value = str(raw).strip()
     if not value:
         return Path()
 
     path = Path(value).expanduser()
     if path.is_absolute():
-        return path
+        return path.resolve()
 
-    candidates = [
-        _repository_root() / path,
-        project_root() / path,
-        Path.cwd() / path,
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate.resolve()
-
-    return candidates[0].resolve()
+    return (_repository_root() / path).resolve()
 
 
 def _load_manifest() -> tuple[Path, list[dict[str, Any]]]:
@@ -567,8 +575,20 @@ def _load_manifest() -> tuple[Path, list[dict[str, Any]]]:
 
     path = candidates[0]
 
+    if path.resolve() != (
+        _repository_root()
+        / "config"
+        / "dictionaries"
+        / "directory"
+        / "manifest.json"
+    ).resolve():
+        raise DirectoryError(
+            "Manifest yang digunakan bukan canonical global manifest: "
+            f"{path}"
+        )
+
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         raise DirectoryError(
             f"Manifest wordlist tidak valid: {path}\n{exc}"
@@ -783,6 +803,8 @@ def _selection_candidates(
         merged = dict(manifest)
         merged.update(raw)
         merged["wordlist_id"] = wordlist_id
+        # The manifest reference is metadata only and always canonical.
+        merged["manifest_path"] = CANONICAL_WORDLIST_MANIFEST
 
         if not merged.get("path"):
             merged["path"] = manifest.get("path", "")
@@ -868,7 +890,7 @@ def _bootstrap_selection_from_manifest(
                     or item.get("provider")
                     or "unknown"
                 ),
-                "manifest_path": str(manifest_path),
+                "manifest_path": CANONICAL_WORDLIST_MANIFEST,
                 "path": path,
                 "enabled": True,
                 "initial_score": score,
@@ -918,7 +940,14 @@ def list_wordlists() -> int:
         for item in selected
     }
 
-    print(f"MANIFEST : {manifest_path}")
+    print(
+        "MANIFEST : "
+        f"{CANONICAL_WORDLIST_MANIFEST}"
+    )
+    print(
+        "PATH     : "
+        f"{manifest_path}"
+    )
     print(f"TOTAL    : {len(manifest_items)}")
     print(f"SELECTED : {len(selected)}")
     print()
@@ -3868,6 +3897,9 @@ def status() -> int:
     print(
         f"File           : {directory_file()}"
     )
+    print(
+        f"Manifest       : {CANONICAL_WORDLIST_MANIFEST}"
+    )
 
     by_status = (
         summary.get(
@@ -4010,6 +4042,25 @@ def verify() -> int:
             "tidak ditemukan."
         )
 
+    canonical_manifest = (
+        _repository_root()
+        / "config"
+        / "dictionaries"
+        / "directory"
+        / "manifest.json"
+    )
+
+    if not canonical_manifest.is_file():
+        errors.append(
+            "Global wordlist manifest tidak ditemukan: "
+            f"{canonical_manifest}"
+        )
+    else:
+        try:
+            _load_manifest()
+        except DirectoryError as exc:
+            errors.append(str(exc))
+
     if errors:
         print(
             "[FAIL] Directory Enumeration "
@@ -4112,7 +4163,10 @@ def version() -> int:
     )
     print(
         "Features : baseline, fuzzy, scoring, "
-        "budget, feedback, confidence"
+        "budget, feedback, confidence, exploration"
+    )
+    print(
+        f"Manifest : {CANONICAL_WORDLIST_MANIFEST}"
     )
 
 
