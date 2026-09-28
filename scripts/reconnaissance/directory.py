@@ -588,7 +588,7 @@ def _load_manifest() -> tuple[Path, list[dict[str, Any]]]:
         )
 
     try:
-        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise DirectoryError(
             f"Manifest wordlist tidak valid: {path}\n{exc}"
