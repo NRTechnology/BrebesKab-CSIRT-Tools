@@ -1,5 +1,5 @@
-#requires -Version 5.1
-# BrebesKab-CSIRT-Tools install-requirements.ps1 v2.25
+﻿#requires -Version 5.1
+# BrebesKab-CSIRT-Tools install-requirements.ps1 v2.26
 # CLI version verification is based on executable availability and non-empty version output.
 [CmdletBinding()]
 param(
@@ -1685,6 +1685,53 @@ function Verify-Command {
     Write-Log "$Name OK: $output" 'OK'
 }
 
+function Verify-Gobuster {
+    if($DryRun){
+        Write-Log 'DryRun: verification dilewati untuk gobuster.' 'DRYRUN'
+        return
+    }
+
+    $path = Find-ToolExecutable 'gobuster'
+
+    if(-not $path){
+        throw 'Tool tidak ditemukan: gobuster'
+    }
+
+    Write-Log "VERIFY gobuster -> $path"
+
+    # Gobuster does not expose a stable `version` subcommand in the
+    # installed CLI. Read the Windows executable version metadata instead,
+    # keeping verification consistent with the other binary checks without
+    # producing a misleading "No help topic for 'version'" message.
+    $versionInfo = (Get-Item -LiteralPath $path -ErrorAction Stop).VersionInfo
+    $version = [string]$versionInfo.ProductVersion
+
+    if([string]::IsNullOrWhiteSpace($version)){
+        $version = [string]$versionInfo.FileVersion
+    }
+
+    if(-not [string]::IsNullOrWhiteSpace($version)){
+        $displayVersion = $version.Trim()
+        if($displayVersion -notmatch '^v'){
+            $displayVersion = "v$displayVersion"
+        }
+
+        Write-Log "gobuster OK: $displayVersion (executable metadata)" 'OK'
+        return
+    }
+
+    # Fallback: verify that the executable itself responds to --help when
+    # version metadata is unavailable.
+    $result = Invoke-VersionCapture -FilePath $path -Arguments @('--help')
+    $output = Get-VerificationOutput $result
+
+    if([string]::IsNullOrWhiteSpace($output)){
+        throw "Verifikasi Gobuster gagal: executable tidak memiliki version metadata dan command --help tidak mengembalikan output. Exit code: $($result.ExitCode)."
+    }
+
+    Write-Log 'gobuster OK: executable merespons --help (version metadata tidak tersedia).' 'OK'
+}
+
 function Verify-Nuclei {
     if($DryRun){
         Write-Log 'DryRun: verification dilewati untuk nuclei.' 'DRYRUN'
@@ -1896,17 +1943,17 @@ try{
         -Force | Out-Null
 
     Write-Log '============================================================' 'STEP'
-    Write-Log 'BrebesKab-CSIRT-Tools install-requirements.ps1 v2.25' 'STEP'
+    Write-Log 'BrebesKab-CSIRT-Tools install-requirements.ps1 v2.26' 'STEP'
     Write-Log '============================================================' 'STEP'
 
     Request-Administrator
 
     if(-not(Test-Administrator)){
-        throw 'Installer v2.25 tidak berjalan sebagai Administrator setelah proses elevation.'
+        throw 'Installer v2.26 tidak berjalan sebagai Administrator setelah proses elevation.'
     }
 
     if(-not [Environment]::Is64BitOperatingSystem){
-        throw 'Installer v2.25 membutuhkan Windows 64-bit.'
+        throw 'Installer v2.26 membutuhkan Windows 64-bit.'
     }
 
     if(-not(Find-Command 'winget')){
@@ -1958,7 +2005,7 @@ try{
     Verify-Command 'ffuf' @('-V')
     Verify-Nuclei
     Verify-Command 'httpx' @('-version')
-    Verify-Command 'gobuster' @('version')
+    Verify-Gobuster
     Verify-Command 'curl.exe' @('--version')
     Verify-Command 'openssl.exe' @('version')
 
