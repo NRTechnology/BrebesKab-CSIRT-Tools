@@ -33,7 +33,7 @@ except ImportError:
     sys.exit(1)
 
 
-SCRIPT_VERSION = "1.5.1"
+SCRIPT_VERSION = "1.5.3"
 PROJECT_ID_PATTERN = re.compile(r"^PENTEST-[0-9]{4}-[0-9]{3,}$")
 ALLOWED_ENVIRONMENTS = ("Production", "Staging", "Pre-Production")
 ALLOWED_ASSESSMENT_TYPES = ("Black Box", "Grey Box", "White Box")
@@ -69,6 +69,7 @@ PHASE_DEFINITIONS: tuple[dict[str, str], ...] = (
 # Project workspaces store references, configuration, baselines, results,
 # feedback and score history only.
 SCORING_SCHEMA_VERSION = "1.0"
+CANONICAL_WORDLIST_MANIFEST = "config/dictionaries/directory/manifest.json"
 
 WORDLIST_SCORING_CONFIG = """schema_version: '1.0'
 model: 'fuzzy-wordlist-adaptive'
@@ -521,6 +522,130 @@ def init_secrets(project_id: str) -> int:
     return 0
 
 
+
+def atomic_write_text(path: Path, content: str) -> None:
+    """Atomically replace a text configuration file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.migration.tmp")
+    try:
+        temp_path.write_text(content, encoding="utf-8", newline="\n")
+        temp_path.replace(path)
+    finally:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+
+def migrate_scoring_config(path: Path) -> bool:
+    """
+    Migrate legacy scoring wordlist manifest configuration to the canonical
+    global manifest reference.
+
+    Only scoring configuration is migrated. Assessment metadata, evidence,
+    activity logs, and runtime encryption keys are never touched here.
+    """
+    if not path.is_file():
+        return False
+
+    original = path.read_text(encoding="utf-8-sig")
+    updated = original
+
+    # Legacy block:
+    # manifest_candidates:
+    #   - 'wordlists/manifest.json'
+    #   - '.runtime/wordlists/manifest.json'
+    legacy_block = re.compile(
+        r"(?m)^([ \t]*)manifest_candidates:\s*\n"
+        r"(?:\1[ \t]*-[^\n]*\n)+"
+    )
+    updated, block_count = legacy_block.subn(
+        lambda m: (
+            f"{m.group(1)}manifest: "
+            f"'{CANONICAL_WORDLIST_MANIFEST}'\n"
+        ),
+        updated,
+    )
+
+    # Defensive migration for a legacy single manifest field.
+    updated = re.sub(
+        r'(?m)^([ \t]*)manifest:\s*[\'"](?:wordlists/manifest\.json|\.runtime/wordlists/manifest\.json)[\'"]\s*$',
+        lambda m: (
+            f"{m.group(1)}manifest: "
+            f"'{CANONICAL_WORDLIST_MANIFEST}'"
+        ),
+        updated,
+    )
+
+    # Normalize legacy manifest paths everywhere else in the YAML as well,
+    # including comments and example blocks. This keeps the file internally
+    # consistent without changing any unrelated configuration.
+    updated = re.sub(
+        r'(?<![A-Za-z0-9_.-])(?:wordlists/manifest\.json|\.runtime/wordlists/manifest\.json)',
+        CANONICAL_WORDLIST_MANIFEST,
+        updated,
+    )
+
+    if updated == original:
+        return False
+
+    atomic_write_text(path, updated)
+    return True
+
+
+def migrate_selection_config(path: Path) -> bool:
+    """
+    Migrate legacy manifest_path references in selection.yaml.
+
+    This changes only the project wordlist reference metadata; it never copies
+    or modifies the actual global wordlist source files.
+    """
+    if not path.is_file():
+        return False
+
+    original = path.read_text(encoding="utf-8-sig")
+    updated = original
+
+    updated = re.sub(
+        r"(?m)^([ \t]*manifest_path:\s*)['\"](?:wordlists/manifest\.json|\.runtime/wordlists/manifest\.json)['\"]\s*$",
+        lambda m: (
+            f"{m.group(1)}'{CANONICAL_WORDLIST_MANIFEST}'"
+        ),
+        updated,
+    )
+
+    # Normalize legacy manifest paths everywhere else in the YAML too,
+    # including comments and examples.
+    updated = re.sub(
+        r'(?<![A-Za-z0-9_.-])(?:wordlists/manifest\.json|\.runtime/wordlists/manifest\.json)',
+        CANONICAL_WORDLIST_MANIFEST,
+        updated,
+    )
+
+    if updated == original:
+        return False
+
+    atomic_write_text(path, updated)
+    return True
+
+
+def migrate_project_scoring_configuration(project_dir: Path) -> tuple[bool, bool]:
+    """
+    Migrate existing scoring/selection configuration to the canonical
+    global wordlist manifest.
+
+    Returns:
+        (scoring_migrated, selection_migrated)
+    """
+    scoring_path = project_dir / "scoring" / "config" / "scoring.yaml"
+    selection_path = project_dir / "wordlists" / "selected" / "selection.yaml"
+
+    scoring_migrated = migrate_scoring_config(scoring_path)
+    selection_migrated = migrate_selection_config(selection_path)
+
+    return scoring_migrated, selection_migrated
+
 def create_project(
     *,
     project_id: str,
@@ -788,14 +913,32 @@ def create_project(
     write_text_if_missing(project_dir / "scans" / "README.md", scan_readme)
     write_text_if_missing(project_dir / "wordlists" / "README.md", WORDLISTS_README)
     write_text_if_missing(project_dir / "scoring" / "README.md", SCORING_README)
-    write_text_if_missing(
-        project_dir / "scoring" / "config" / "scoring.yaml",
+
+    scoring_config_path = project_dir / "scoring" / "config" / "scoring.yaml"
+    selection_config_path = project_dir / "wordlists" / "selected" / "selection.yaml"
+
+    scoring_created = write_text_if_missing(
+        scoring_config_path,
         WORDLIST_SCORING_CONFIG,
     )
-    write_text_if_missing(
-        project_dir / "wordlists" / "selected" / "selection.yaml",
+    selection_created = write_text_if_missing(
+        selection_config_path,
         WORDLIST_SELECTION_TEMPLATE.format(project_id=project_id),
     )
+
+    scoring_migrated = False
+    selection_migrated = False
+
+    # --force is intentionally allowed to migrate only these two configuration
+    # files. Existing assessment/evidence/activity/key data remain untouched.
+    if already_exists and force:
+        try:
+            scoring_migrated, selection_migrated = (
+                migrate_project_scoring_configuration(project_dir)
+            )
+        except OSError as exc:
+            print(f"[ERROR] Migrasi konfigurasi scoring/wordlist gagal: {exc}")
+            return 1
 
     activity_created = write_initial_activity_log(
         project_dir,
@@ -834,6 +977,24 @@ def create_project(
     print("[PASS] assessment.yaml tersedia.")
     print("[PASS] checklist.yaml tersedia.")
     print("[PASS] README.md tersedia.")
+
+    if scoring_created:
+        print("[PASS] scoring/config/scoring.yaml dibuat.")
+    elif scoring_migrated:
+        print("[PASS] scoring/config/scoring.yaml dimigrasikan ke manifest global.")
+    else:
+        print("[INFO] scoring/config/scoring.yaml sudah ada; tidak ditimpa.")
+
+    if selection_created:
+        print("[PASS] wordlists/selected/selection.yaml dibuat.")
+    elif selection_migrated:
+        print("[PASS] wordlists/selected/selection.yaml dimigrasikan ke manifest global.")
+    else:
+        print("[INFO] wordlists/selected/selection.yaml sudah ada; tidak ditimpa.")
+
+    print(f"[PASS] Global wordlist manifest: {CANONICAL_WORDLIST_MANIFEST}")
+    print("[PASS] Source wordlist tidak disalin ke dalam project.")
+
     if activity_created:
         print("[PASS] Activity log canonical tersedia.")
     else:
@@ -1109,7 +1270,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Lengkapi project yang sudah ada tanpa menimpa file yang sudah ada.",
+        help="Lengkapi project existing tanpa menimpa data assessment/evidence/activity/key; migrasikan konfigurasi scoring/wordlist legacy.",
     )
     return parser
 
