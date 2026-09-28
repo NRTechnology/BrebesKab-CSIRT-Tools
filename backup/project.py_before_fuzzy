@@ -33,7 +33,7 @@ except ImportError:
     sys.exit(1)
 
 
-SCRIPT_VERSION = "1.5.0"
+SCRIPT_VERSION = "1.4.0"
 PROJECT_ID_PATTERN = re.compile(r"^PENTEST-[0-9]{4}-[0-9]{3,}$")
 ALLOWED_ENVIRONMENTS = ("Production", "Staging", "Pre-Production")
 ALLOWED_ASSESSMENT_TYPES = ("Black Box", "Grey Box", "White Box")
@@ -63,159 +63,6 @@ PHASE_DEFINITIONS: tuple[dict[str, str], ...] = (
     {"number": "22", "name": "Retest", "slug": "retest"},
     {"number": "23", "name": "Final Sign-Off", "slug": "final-sign-off"},
 )
-
-# Wordlist/fuzzy scoring model.
-# Wordlist source files remain centrally managed by install-requirements.ps1.
-# Project workspaces store references, configuration, baselines, results,
-# feedback and score history only.
-SCORING_SCHEMA_VERSION = "1.0"
-
-WORDLIST_SCORING_CONFIG = """schema_version: '1.0'
-model: 'fuzzy-wordlist-adaptive'
-enabled: true
-
-wordlist_source:
-  mode: 'global-manifest'
-  local_copy: false
-  manifest_candidates:
-    - 'wordlists/manifest.json'
-    - '.runtime/wordlists/manifest.json'
-
-ranking:
-  enabled: true
-  initial_score_range: [0.0, 1.0]
-  tiers:
-    - name: 'Primary'
-      min_score: 0.80
-      max_score: 1.00
-    - name: 'Secondary'
-      min_score: 0.50
-      max_score: 0.79
-    - name: 'Exploration'
-      min_score: 0.20
-      max_score: 0.49
-
-exploration:
-  enabled: true
-  minimum_score: 0.20
-  low_rank_access: true
-
-fuzzy:
-  enabled: true
-  similarity_recording: true
-  baseline_required: true
-
-request_budget:
-  enabled: true
-  mode: 'per-run'
-  max_requests: null
-
-feedback:
-  enabled: true
-  formula: 'new_score = initial_score + evidence_gain + discovery_yield - noise_penalty'
-  signals:
-    - 'evidence_gain'
-    - 'discovery_yield'
-    - 'noise_penalty'
-  score_clamp:
-    minimum: 0.0
-    maximum: 1.0
-
-traceability:
-  required_fields:
-    - 'project_id'
-    - 'run_id'
-    - 'wordlist_id'
-    - 'wordlist_source'
-    - 'initial_score'
-    - 'final_score'
-    - 'tier'
-    - 'request_count'
-    - 'evidence_gain'
-    - 'discovery_yield'
-    - 'noise_penalty'
-    - 'timestamp'
-"""
-
-WORDLIST_SELECTION_TEMPLATE = """schema_version: '1.0'
-project_id: '{project_id}'
-
-# Referensi wordlist dikelola oleh manifest global.
-# Jangan menyalin source wordlist ke dalam project.
-wordlists: []
-
-# Contoh item:
-# - wordlist_id: 'seclists-common'
-#   source: 'SecLists'
-#   manifest_path: 'wordlists/manifest.json'
-#   enabled: true
-#   initial_score: 0.80
-#   tier: 'Primary'
-#   notes: ''
-
-runs: []
-"""
-
-SCORING_README = """# Fuzzy & Wordlist Scoring
-
-Workspace ini menyimpan state dan artefak model adaptive fuzzy-wordlist scoring.
-
-## Prinsip
-
-Wordlist source tidak disalin ke dalam project. Source dikelola secara terpusat
-oleh installer/wordlist manifest. Project menyimpan referensi wordlist yang
-dipilih dan hasil eksekusinya.
-
-## Alur
-
-Wordlist -> Initial Score -> Fuzzy Ranking -> Request Budget -> Enumeration
--> Feedback -> Updated Score -> Ranking berikutnya
-
-## Feedback
-
-Model feedback menggunakan:
-
-`new_score = initial_score + evidence_gain + discovery_yield - noise_penalty`
-
-Score harus dibatasi pada rentang 0.0 sampai 1.0.
-
-## Tier
-
-- Primary: 0.80 - 1.00
-- Secondary: 0.50 - 0.79
-- Exploration: 0.20 - 0.49
-
-Exploration tetap diberi kesempatan dan tidak langsung dibuang hanya karena
-ranking awal rendah.
-
-## Direktori
-
-- `config/`    konfigurasi model.
-- `baseline/`  baseline response/fuzzy comparison.
-- `results/`   hasil scoring/ranking per run.
-- `feedback/`  feedback evidence/discovery/noise.
-- `history/`   histori perubahan score dan ranking.
-
-Setiap run harus dapat ditelusuri kembali ke project, wordlist, request,
-evidence, dan timestamp.
-"""
-
-WORDLISTS_README = """# Wordlists
-
-Project menyimpan **referensi dan metadata pemakaian wordlist**, bukan salinan
-source wordlist.
-
-Source wordlist dikelola oleh wordlist manifest global yang dipelihara oleh
-`install-requirements.ps1`.
-
-## Direktori
-
-- `selected/` referensi wordlist yang dipilih untuk project.
-- `runs/` metadata/artefak pemakaian wordlist per run.
-
-Raw hasil request tetap disimpan pada `../scans/ffuf/` atau repository scan
-yang sesuai.
-"""
 
 ACTIVITY_LOG_HEADER = (
     "# BrebesKab-CSIRT-Tools Activity Log\n"
@@ -613,15 +460,6 @@ def create_project(
         "scans/nuclei",
         "scans/ffuf",
         "scans/zap",
-        "wordlists",
-        "wordlists/selected",
-        "wordlists/runs",
-        "scoring",
-        "scoring/config",
-        "scoring/baseline",
-        "scoring/results",
-        "scoring/feedback",
-        "scoring/history",
         "timeline",
     )
 
@@ -637,7 +475,7 @@ def create_project(
 
     readme = f"""# {project_id}\n\n## Web Application Penetration Testing Assessment\n\n| Item | Value |\n|---|---|\n| Project ID | {project_id} |\n| Application | {application} |\n| Target | {target} |\n| Tester | {tester} |\n| Reviewer | {reviewer} |\n| Environment | {environment} |\n| Assessment Type | {assessment_type} |\n| Created | {timestamp} |\n\n## Assessment Phases\n\nAssessment menggunakan 23 phase yang didefinisikan dalam\nBrebesKab-CSIRT Web Application Penetration Testing Checklist.\n\n""" + "\n".join(
         f"{idx}. {phase['name']}" for idx, phase in enumerate(PHASE_DEFINITIONS, start=1)
-    ) + f"""\n\n## Repository Structure\n\n- `01-preparation/` sampai `23-final-sign-off/`\n  - Workspace berdasarkan phase assessment.\n- `timeline/`\n  - Jejak aktivitas assessment.\n- `scans/`\n  - Raw output dari security tools.\n- `wordlists/`\n  - Referensi wordlist yang dipilih dan metadata pemakaian; source wordlist tidak dicopy.\n- `scoring/`\n  - Konfigurasi, baseline, hasil ranking, feedback, dan history fuzzy-wordlist scoring.\n- `evidence/`\n  - Evidence yang dipilih dan direferensikan oleh assessment.\n- `findings/`\n  - Security findings.\n- `retest/`\n  - Evidence dan catatan retest.\n- `report/draft/`\n  - Draft report.\n- `report/final/`\n  - Final report.\n\n## Traceability\n\nSetiap aktivitas sebaiknya mempunyai:\n\n- Activity ID (`ACT-xxxx`)\n- Phase\n- Item\n- Timestamp\n- Action\n- Status\n- Operator\n- Evidence ID jika diperlukan\n- Finding ID jika menghasilkan finding\n- Scoring Run ID jika aktivitas menggunakan fuzzy/wordlist scoring\n- Wordlist ID dan source manifest jika menggunakan wordlist\n\n## Security\n\nJangan menyimpan:\n\n- Password\n- API key\n- Access token\n- Session cookie aktif\n- Private key\n- Credential lain\n\nSanitasi evidence sebelum dimasukkan ke repository.\n"""
+    ) + f"""\n\n## Repository Structure\n\n- `01-preparation/` sampai `23-final-sign-off/`\n  - Workspace berdasarkan phase assessment.\n- `timeline/`\n  - Jejak aktivitas assessment.\n- `scans/`\n  - Raw output dari security tools.\n- `evidence/`\n  - Evidence yang dipilih dan direferensikan oleh assessment.\n- `findings/`\n  - Security findings.\n- `retest/`\n  - Evidence dan catatan retest.\n- `report/draft/`\n  - Draft report.\n- `report/final/`\n  - Final report.\n\n## Traceability\n\nSetiap aktivitas sebaiknya mempunyai:\n\n- Activity ID (`ACT-xxxx`)\n- Phase\n- Item\n- Timestamp\n- Action\n- Status\n- Operator\n- Evidence ID jika diperlukan\n- Finding ID jika menghasilkan finding\n\n## Security\n\nJangan menyimpan:\n\n- Password\n- API key\n- Access token\n- Session cookie aktif\n- Private key\n- Credential lain\n\nSanitasi evidence sebelum dimasukkan ke repository.\n"""
     write_text_if_missing(project_dir / "README.md", readme)
 
     assessment_lines = [
@@ -788,16 +626,6 @@ def create_project(
         ]
     ) + "\n"
     write_text_if_missing(project_dir / "scans" / "README.md", scan_readme)
-    write_text_if_missing(project_dir / "wordlists" / "README.md", WORDLISTS_README)
-    write_text_if_missing(project_dir / "scoring" / "README.md", SCORING_README)
-    write_text_if_missing(
-        project_dir / "scoring" / "config" / "scoring.yaml",
-        WORDLIST_SCORING_CONFIG,
-    )
-    write_text_if_missing(
-        project_dir / "wordlists" / "selected" / "selection.yaml",
-        WORDLIST_SELECTION_TEMPLATE.format(project_id=project_id),
-    )
 
     activity_created = write_initial_activity_log(
         project_dir,
@@ -829,8 +657,6 @@ def create_project(
     print("[PASS] Findings repository tersedia.")
     print("[PASS] Retest repository tersedia.")
     print("[PASS] Scan repositories tersedia.")
-    print("[PASS] Wordlist workspace tersedia.")
-    print("[PASS] Fuzzy/scoring workspace tersedia.")
     print("[PASS] Report repository tersedia.")
     print("[PASS] Timeline tersedia.")
     print("[PASS] assessment.yaml tersedia.")
@@ -856,10 +682,7 @@ def create_project(
     print("  3. Catat setiap aktivitas melalui scripts/activity.py.")
     print("  4. Simpan raw scan pada scans/.")
     print("  5. Simpan evidence terpilih pada evidence/.")
-    print("  6. Gunakan wordlists/selected/selection.yaml untuk referensi wordlist project.")
-    print("  7. Gunakan scoring/config/scoring.yaml sebagai konfigurasi model scoring.")
-    print("  8. Simpan baseline, result, feedback, dan history pada scoring/.")
-    print("  9. Buat finding pada findings/ jika ada.")
+    print("  6. Buat finding pada findings/ jika ada.")
     print()
 
     return 0
