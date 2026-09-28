@@ -3,7 +3,7 @@
 BrebesKab-CSIRT-Tools
 Reconnaissance - Directory Enumeration & Adaptive Scoring Engine
 
-Version: 2.1.0
+Version: 2.1.2
 
 Checklist mapping:
     02-006 - Directory discovery
@@ -22,6 +22,9 @@ Design:
     - Feedback is bounded and persisted per run; history is append-only.
     - Exploration candidates remain eligible even when their score is low.
     - Raw tool output is retained as evidence; no response bodies are stored.
+    - Unlimited request configuration is protected by a finite safety cap.
+    - Large wordlists are bounded by a temporary run-only subset.
+    - Ctrl+C explicitly terminates the enumeration process tree.
     - This module does not authorize newly discovered paths.
 """
 
@@ -83,7 +86,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2.1.1"
+SCRIPT_VERSION = "2.1.2"
 SCHEMA_VERSION = "2.0"
 CHECKLIST_ID = "2-006"
 CHECKLIST_NAME = "Directory discovery"
@@ -101,6 +104,13 @@ DEFAULT_SECONDARY_MIN = 0.50
 DEFAULT_EXPLORATION_MIN = 0.20
 
 DEFAULT_EXTENSIONS = ["php", "html", "txt", "json", "xml"]
+
+# Safety controls for request-heavy enumeration.
+# A configured/unlimited request budget is never allowed to run without
+# a finite safety cap. An explicit --max-requests value may raise the cap.
+DEFAULT_SAFE_MAX_REQUESTS = 10_000
+DEFAULT_ESTIMATION_WARNING_REQUESTS = 50_000
+DEFAULT_PROCESS_TERMINATE_TIMEOUT = 5
 
 DEFAULT_MAX_EVIDENCE_GAIN = 0.15
 DEFAULT_MAX_DISCOVERY_YIELD = 0.15
@@ -131,6 +141,10 @@ SENSITIVE_PATH_TERMS = {
 
 class DirectoryError(RuntimeError):
     """Raised when directory reconnaissance cannot be completed."""
+
+
+class DirectoryInterrupted(DirectoryError):
+    """Raised/represented when the user interrupts an active enumeration."""
 
 
 # ---------------------------------------------------------------------------
@@ -2431,70 +2445,198 @@ def _count_wordlist_entries(
         ) from exc
 
 
+def _request_multiplier(extensions: list[str]) -> int:
+    """Return the ffuf/gobuster request multiplier for one wordlist entry."""
+    # One request for the base path plus one request for each extension.
+    return 1 + len(extensions)
+
+
 def _estimate_request_cost(
     entries: int,
     extensions: list[str],
 ) -> int:
-    # Upper-bound estimate:
-    # one base candidate plus one probe for each extension.
-    multiplier = 1 + len(extensions)
-    return entries * multiplier
+    """Estimate the upper-bound request cost for the selected run."""
+    if entries <= 0:
+        return 0
+    return entries * _request_multiplier(extensions)
+
+
+def _estimate_duration_seconds(
+    request_count: int,
+    rate: int,
+) -> float:
+    """Estimate wall-clock duration from planned requests and request rate."""
+    if request_count <= 0 or rate <= 0:
+        return 0.0
+    return request_count / rate
+
+
+def _format_duration(seconds: float) -> str:
+    """Format a duration for CLI output."""
+    if seconds <= 0:
+        return "0s"
+
+    total = int(math.ceil(seconds))
+    days, remainder = divmod(total, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, secs = divmod(remainder, 60)
+
+    if days:
+        return f"{days}d {hours:02d}h {minutes:02d}m"
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
+def _configured_request_budget(
+    scoring_config: dict[str, Any],
+    override: int | None,
+) -> int | None:
+    """Read the configured budget without applying the safety cap."""
+    budget = scoring_config.get("request_budget")
+
+    if not isinstance(budget, dict):
+        budget = {}
+
+    enabled = bool(budget.get("enabled", True))
+
+    if not enabled:
+        return None
+
+    if override is not None:
+        if override <= 0:
+            raise DirectoryError(
+                "--max-requests harus lebih besar dari 0."
+            )
+        return int(override)
+
+    raw = budget.get("max_requests")
+
+    if raw in (None, "", 0, "0"):
+        return None
+
+    value = int(_safe_float(raw, 0))
+
+    if value <= 0:
+        raise DirectoryError(
+            "request_budget.max_requests harus lebih besar dari 0 "
+            "atau null untuk menggunakan safety cap."
+        )
+
+    return value
+
+
+def _resolve_effective_request_budget(
+    scoring_config: dict[str, Any],
+    override: int | None,
+) -> tuple[int, str, bool, int | None]:
+    """Resolve a finite run budget with a mandatory safety guard.
+
+    Returns:
+        effective_budget,
+        source label,
+        whether the safety cap was applied,
+        configured budget (None means configured/unlimited).
+    """
+    configured = _configured_request_budget(
+        scoring_config,
+        override,
+    )
+
+    if configured is None:
+        return (
+            DEFAULT_SAFE_MAX_REQUESTS,
+            f"safety-cap:{DEFAULT_SAFE_MAX_REQUESTS}",
+            True,
+            None,
+        )
+
+    return (
+        configured,
+        "explicit/configured",
+        False,
+        configured,
+    )
+
+
+def _max_entries_for_budget(
+    budget: int,
+    extensions: list[str],
+) -> int:
+    """Return the maximum number of wordlist entries allowed by a request cap."""
+    multiplier = _request_multiplier(extensions)
+
+    if budget <= 0:
+        return 0
+
+    return budget // multiplier
+
+
+def _prepare_limited_wordlist(
+    source: Path,
+    destination: Path,
+    max_entries: int,
+) -> int:
+    """Create a temporary first-N-entry wordlist for a bounded run.
+
+    The source wordlist remains untouched and is never copied into the project.
+    The temporary file is removed automatically with the run's temp directory.
+    """
+    if max_entries <= 0:
+        raise DirectoryError(
+            "Request budget terlalu kecil untuk menjalankan satu wordlist entry."
+        )
+
+    count = 0
+
+    try:
+        with source.open(
+            "r",
+            encoding="utf-8",
+            errors="ignore",
+        ) as src_handle, destination.open(
+            "w",
+            encoding="utf-8",
+            newline="\n",
+        ) as dst_handle:
+            for line in src_handle:
+                if not line.strip():
+                    continue
+
+                dst_handle.write(line)
+                count += 1
+
+                if count >= max_entries:
+                    break
+    except OSError as exc:
+        raise DirectoryError(
+            f"Gagal membuat temporary bounded wordlist: {exc}"
+        ) from exc
+
+    if count <= 0:
+        raise DirectoryError(
+            f"Wordlist kosong atau tidak memiliki entry yang dapat digunakan: {source}"
+        )
+
+    return count
 
 
 def _budget_from_config(
     scoring_config: dict[str, Any],
     override: int | None,
 ) -> int | None:
-    budget = scoring_config.get(
-        "request_budget"
+    """Backward-compatible budget accessor.
+
+    The returned value is always finite when request budgeting is enabled.
+    A null/unlimited configuration resolves to the mandatory safety cap.
+    """
+    budget, _, _, _ = _resolve_effective_request_budget(
+        scoring_config,
+        override,
     )
-
-    if not isinstance(
-        budget,
-        dict,
-    ):
-        budget = {}
-
-    enabled = bool(
-        budget.get(
-            "enabled",
-            True,
-        )
-    )
-
-    if not enabled:
-        return None
-
-    if override is not None:
-        return max(
-            0,
-            override,
-        )
-
-    raw = budget.get(
-        "max_requests"
-    )
-
-    if raw in (
-        None,
-        "",
-        0,
-        "0",
-    ):
-        return None
-
-    value = int(
-        _safe_float(
-            raw,
-            0,
-        )
-    )
-
-    return (
-        value
-        if value > 0
-        else None
-    )
+    return budget
 
 
 # ---------------------------------------------------------------------------
@@ -2805,26 +2947,82 @@ def _append_history(
 # Tool execution
 # ---------------------------------------------------------------------------
 
+def _terminate_process_tree(
+    process: subprocess.Popen[str],
+) -> None:
+    """Terminate the enumeration process and its descendants explicitly."""
+    pid = process.pid
+
+    try:
+        if os.name == "nt":
+            # ffuf/gobuster may spawn child processes on Windows. /T ensures
+            # the complete process tree is terminated.
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        else:
+            import signal
+
+            try:
+                os.killpg(
+                    os.getpgid(pid),
+                    signal.SIGTERM,
+                )
+            except ProcessLookupError:
+                return
+    except Exception:
+        # Fall back to the direct process API below.
+        pass
+
+    try:
+        if process.poll() is None:
+            process.terminate()
+    except OSError:
+        pass
+
+    try:
+        process.wait(timeout=DEFAULT_PROCESS_TERMINATE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
 def _run_command(
     command: list[str],
     stderr_path: Path,
 ) -> subprocess.CompletedProcess[str]:
-    """Run an enumeration tool with a visible heartbeat.
-
-    ffuf/Gobuster write their normalized result to a file, so their stdout is
-    intentionally not streamed as the primary UI. A periodic heartbeat keeps
-    the CLI responsive and makes long network-bound runs visibly active.
-    """
+    """Run an enumeration tool with heartbeat and graceful Ctrl+C handling."""
     started = time.monotonic()
+
+    popen_kwargs: dict[str, Any] = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+
+    if os.name == "nt":
+        creation_flags = getattr(
+            subprocess,
+            "CREATE_NEW_PROCESS_GROUP",
+            0,
+        )
+        if creation_flags:
+            popen_kwargs["creationflags"] = creation_flags
+    else:
+        # Allows the whole process group to be terminated on Ctrl+C.
+        popen_kwargs["start_new_session"] = True
 
     try:
         process = subprocess.Popen(
             command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+            **popen_kwargs,
         )
     except OSError as exc:
         raise DirectoryError(
@@ -2832,20 +3030,51 @@ def _run_command(
         ) from exc
 
     last_heartbeat = 0.0
+    interrupted = False
 
-    while process.poll() is None:
-        elapsed = int(time.monotonic() - started)
-        if elapsed == 0 or elapsed - last_heartbeat >= 5:
-            print(
-                f"[RUN] Enumeration berjalan... "
-                f"elapsed {elapsed // 60:02d}:{elapsed % 60:02d} "
-                f"| PID {process.pid}",
-                flush=True,
-            )
-            last_heartbeat = elapsed
-        time.sleep(1)
+    try:
+        while process.poll() is None:
+            elapsed = int(time.monotonic() - started)
+            if elapsed == 0 or elapsed - last_heartbeat >= 5:
+                print(
+                    f"[RUN] Enumeration berjalan... "
+                    f"elapsed {elapsed // 60:02d}:{elapsed % 60:02d} "
+                    f"| PID {process.pid}",
+                    flush=True,
+                )
+                last_heartbeat = elapsed
+
+            try:
+                time.sleep(1)
+            except KeyboardInterrupt:
+                interrupted = True
+                print()
+                print(
+                    "[STOP] Ctrl+C diterima. "
+                    "Menghentikan proses enumeration...",
+                    flush=True,
+                )
+                _terminate_process_tree(process)
+                break
+
+    except KeyboardInterrupt:
+        # Covers an interrupt arriving between loop iterations.
+        interrupted = True
+        print()
+        print(
+            "[STOP] Ctrl+C diterima. "
+            "Menghentikan proses enumeration...",
+            flush=True,
+        )
+        _terminate_process_tree(process)
 
     stdout, stderr = process.communicate()
+
+    if interrupted:
+        stderr = (
+            (stderr or "").rstrip()
+            + "\n[BrebesKab-CSIRT-Tools] Enumeration interrupted by user.\n"
+        )
 
     stderr_path.parent.mkdir(
         parents=True,
@@ -2858,6 +3087,22 @@ def _run_command(
     )
 
     elapsed = int(time.monotonic() - started)
+
+    if interrupted:
+        print(
+            f"[STOP] Enumeration process dihentikan "
+            f"({elapsed // 60:02d}:{elapsed % 60:02d}) "
+            f"| PID {process.pid} terminated",
+            flush=True,
+        )
+
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=130,
+            stdout=stdout or "",
+            stderr=stderr or "",
+        )
+
     print(
         f"[PASS] Enumeration process selesai "
         f"({elapsed // 60:02d}:{elapsed % 60:02d}) "
@@ -2883,6 +3128,7 @@ def _execute_tool(
     timeout: int,
     match_codes: str,
     extensions: list[str],
+    max_entries: int | None = None,
 ) -> tuple[
     int,
     Path,
@@ -2902,6 +3148,27 @@ def _execute_tool(
         prefix=f"{run}-"
     ) as temp_dir:
         temp = Path(temp_dir)
+
+        run_wordlist_path = wordlist_path
+
+        if max_entries is not None:
+            # Only create a temporary bounded subset when the safety/request
+            # budget requires truncation. The canonical source wordlist is
+            # never modified and no copy is stored in the project.
+            total_entries = _count_wordlist_entries(wordlist_path)
+            if total_entries > max_entries:
+                limited_wordlist = temp / "bounded-wordlist.txt"
+                used_entries = _prepare_limited_wordlist(
+                    wordlist_path,
+                    limited_wordlist,
+                    max_entries,
+                )
+                run_wordlist_path = limited_wordlist
+                print(
+                    "[INFO] Safety/request budget membatasi wordlist: "
+                    f"{total_entries} -> {used_entries} entries.",
+                    flush=True,
+                )
 
         if tool == "ffuf":
             executable = _resolve_ffuf()
@@ -2924,7 +3191,7 @@ def _execute_tool(
             command = _build_ffuf_command(
                 executable,
                 base_url,
-                wordlist_path,
+                run_wordlist_path,
                 raw_output,
                 rate,
                 threads,
@@ -2954,7 +3221,7 @@ def _execute_tool(
             command = _build_gobuster_command(
                 executable,
                 base_url,
-                wordlist_path,
+                run_wordlist_path,
                 raw_output,
                 threads,
                 timeout,
@@ -3516,31 +3783,67 @@ def discover(
         wordlist_path
     )
 
-    estimated_requests = (
-        _estimate_request_cost(
-            entries,
-            extensions,
-        )
+    full_estimated_requests = _estimate_request_cost(
+        entries,
+        extensions,
     )
 
-    budget = _budget_from_config(
+    (
+        budget,
+        budget_source,
+        safety_cap_applied,
+        configured_budget,
+    ) = _resolve_effective_request_budget(
         scoring_config,
         max_requests,
     )
 
-    if (
-        budget is not None
-        and estimated_requests > budget
-    ):
+    multiplier = _request_multiplier(extensions)
+    max_entries = _max_entries_for_budget(
+        budget,
+        extensions,
+    )
+
+    if max_entries <= 0:
         raise DirectoryError(
-            "Estimated request cost melebihi request budget.\n"
-            f"  Wordlist entries : {entries}\n"
-            f"  Extensions       : {len(extensions)}\n"
-            f"  Estimated cost   : {estimated_requests}\n"
-            f"  Budget           : {budget}\n"
-            "Gunakan wordlist yang lebih kecil, "
-            "kurangi extensions, atau naikkan budget "
-            "secara eksplisit."
+            "Request budget terlalu kecil untuk konfigurasi extensions saat ini. "
+            f"Minimal budget: {multiplier} request."
+        )
+
+    entries_used = min(entries, max_entries)
+    truncated = entries_used < entries
+
+    estimated_requests = _estimate_request_cost(
+        entries_used,
+        extensions,
+    )
+
+    estimated_duration = _estimate_duration_seconds(
+        estimated_requests,
+        rate,
+    )
+
+    full_estimated_duration = _estimate_duration_seconds(
+        full_estimated_requests,
+        rate,
+    )
+
+    if full_estimated_requests > DEFAULT_ESTIMATION_WARNING_REQUESTS:
+        print(
+            "[WARN] Full request estimate sangat besar: "
+            f"{full_estimated_requests:,} requests "
+            f"(~{_format_duration(full_estimated_duration)} @ {rate} req/s)."
+        )
+
+    if truncated:
+        print(
+            "[INFO] Request budget aktif; run akan memakai subset wordlist "
+            f"{entries_used:,}/{entries:,} entries."
+        )
+        print(
+            "[INFO] Planned request cost : "
+            f"{estimated_requests:,} "
+            f"(~{_format_duration(estimated_duration)} @ {rate} req/s)."
         )
 
     run = run_id()
@@ -3635,15 +3938,30 @@ def discover(
         f"{_safe_float(candidate.get('confidence'), 0.0):.4f}"
     )
     print(
-        f"Entries          : {entries}"
+        f"Entries          : {entries:,}"
     )
     print(
-        f"Estimated req.   : {estimated_requests}"
+        f"Entries used     : {entries_used:,}"
     )
     print(
-        "Budget           : "
-        f"{budget if budget is not None else 'unlimited'}"
+        f"Estimated req.   : {estimated_requests:,}"
     )
+    print(
+        f"Full estimate    : {full_estimated_requests:,}"
+    )
+    print(
+        f"Est. duration    : {_format_duration(estimated_duration)}"
+    )
+    if safety_cap_applied:
+        print(
+            "Budget           : "
+            f"{budget:,} (safety cap; configured unlimited)"
+        )
+    else:
+        print(
+            "Budget           : "
+            f"{budget:,} ({budget_source})"
+        )
     print(
         f"Adaptive         : {'yes' if adaptive else 'no'}"
     )
@@ -3759,6 +4077,7 @@ def discover(
             timeout,
             match_codes,
             extensions,
+            max_entries=entries_used,
         )
 
     except DirectoryError as exc:
@@ -3778,12 +4097,18 @@ def discover(
         return 1
 
     if returncode != 0:
-        print(
-            f"[FAIL] {selected_tool} gagal "
-            f"dengan exit code {returncode}."
-        )
-
-        directory["status"] = "failed"
+        if returncode == 130:
+            print(
+                "[STOP] Enumeration dihentikan oleh user "
+                "dan proses tool telah diterminasi."
+            )
+            directory["status"] = "interrupted"
+        else:
+            print(
+                f"[FAIL] {selected_tool} gagal "
+                f"dengan exit code {returncode}."
+            )
+            directory["status"] = "failed"
         directory["updated_at"] = now_iso()
         directory["baseline"] = baseline
 
@@ -3795,10 +4120,11 @@ def discover(
         _record_activity(
             CHECKLIST_ID,
             (
-                f"Directory enumeration failed: "
+                f"Directory enumeration "
+                f"{'interrupted' if returncode == 130 else 'failed'}: "
                 f"{run}: exit {returncode}"
             ),
-            "failed",
+            "interrupted" if returncode == 130 else "failed",
         )
 
         return 1
@@ -3921,6 +4247,19 @@ def discover(
             else ""
         ),
         "adaptive": adaptive,
+        "wordlist_entries_total": entries,
+        "wordlist_entries_used": entries_used,
+        "wordlist_truncated": truncated,
+        "full_estimated_request_cost": full_estimated_requests,
+        "estimated_request_cost": estimated_requests,
+        "estimated_duration_seconds": round(
+            estimated_duration,
+            2,
+        ),
+        "request_budget": budget,
+        "configured_request_budget": configured_budget,
+        "request_budget_source": budget_source,
+        "safety_cap_applied": safety_cap_applied,
         "technology_context": (
             technology_context.get("technologies", [])
             if technology_context.get("available")
@@ -3958,7 +4297,24 @@ def discover(
         "estimated_request_cost": (
             estimated_requests
         ),
+        "full_estimated_request_cost": (
+            full_estimated_requests
+        ),
+        "wordlist_entries_total": entries,
+        "wordlist_entries_used": entries_used,
+        "wordlist_truncated": truncated,
+        "estimated_duration_seconds": round(
+            estimated_duration,
+            2,
+        ),
+        "full_estimated_duration_seconds": round(
+            full_estimated_duration,
+            2,
+        ),
         "request_budget": budget,
+        "configured_request_budget": configured_budget,
+        "request_budget_source": budget_source,
+        "safety_cap_applied": safety_cap_applied,
         "evidence_gain": feedback[
             "evidence_gain"
         ],
@@ -4174,14 +4530,17 @@ def discover(
     }
 
     directory["request_budget"] = {
-        "enabled": budget is not None,
+        "enabled": True,
         "max_requests": budget,
-        "estimated_requests": (
-            estimated_requests
-        ),
-        "actual_request_count": (
-            request_count
-        ),
+        "configured_max_requests": configured_budget,
+        "budget_source": budget_source,
+        "safety_cap_applied": safety_cap_applied,
+        "full_estimated_requests": full_estimated_requests,
+        "estimated_requests": estimated_requests,
+        "wordlist_entries_total": entries,
+        "wordlist_entries_used": entries_used,
+        "truncated": truncated,
+        "actual_request_count": request_count,
     }
 
     _save_yaml(
@@ -4522,6 +4881,22 @@ def status() -> int:
         f"Budget         : {budget.get('max_requests', '-')}"
     )
     print(
+        "Budget source  : "
+        f"{budget.get('budget_source', '-')}"
+    )
+    print(
+        "Safety cap     : "
+        f"{budget.get('safety_cap_applied', False)}"
+    )
+    print(
+        "Estimated req. : "
+        f"{budget.get('estimated_requests', '-')}"
+    )
+    print(
+        "Entries used   : "
+        f"{budget.get('wordlist_entries_used', '-')}"
+    )
+    print(
         f"File           : {directory_file()}"
     )
     print(
@@ -4790,7 +5165,8 @@ def version() -> int:
     )
     print(
         "Features : baseline, fuzzy, scoring, "
-        "budget, feedback, confidence, exploration"
+        "budget, safety-cap, graceful-stop, feedback, "
+        "confidence, exploration"
     )
     print(
         f"Manifest : {CANONICAL_WORDLIST_MANIFEST}"
@@ -5002,6 +5378,13 @@ def main(
                 match_codes=args.match_codes,
                 max_requests=args.max_requests,
             )
+
+    except KeyboardInterrupt:
+        print()
+        print(
+            "[STOP] Operasi dihentikan oleh user."
+        )
+        return 130
 
     except (
         ContextError,
