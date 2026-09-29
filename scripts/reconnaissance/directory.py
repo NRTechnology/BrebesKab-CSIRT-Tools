@@ -3,7 +3,7 @@
 BrebesKab-CSIRT-Tools
 Reconnaissance - Directory Enumeration & Adaptive Scoring Engine
 
-Version: 2.1.5
+Version: 2.1.6
 
 Checklist mapping:
     02-006 - Directory discovery
@@ -86,7 +86,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2.1.5"
+SCRIPT_VERSION = "2.1.6"
 SCHEMA_VERSION = "2.0"
 CHECKLIST_ID = "2-006"
 CHECKLIST_NAME = "Directory discovery"
@@ -4085,7 +4085,7 @@ def discover(
                             )
                             process_state["parsed_results"] = len(results)
                             process_state["result_status"] = "partial"
-                            _save_yaml(process_evidence, process_debug)
+                            _save_yaml(process_evidence, process_state)
 
                 except (DirectoryError, OSError, ValueError, json.JSONDecodeError):
                     results = []
@@ -4353,7 +4353,7 @@ def discover(
             )
             process_state["parsed_results"] = len(results)
             process_state["result_status"] = "complete"
-            _save_yaml(process_evidence, process_debug)
+            _save_yaml(process_evidence, process_state)
 
         request_count = estimated_requests
 
