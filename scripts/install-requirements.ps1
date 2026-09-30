@@ -1,5 +1,5 @@
 #requires -Version 5.1
-# BrebesKab-CSIRT-Tools install-requirements.ps1 v2.27
+# BrebesKab-CSIRT-Tools install-requirements.ps1 v2.28
 # CLI version verification is based on executable availability and non-empty version output.
 [CmdletBinding()]
 param(
@@ -85,7 +85,7 @@ $GitHubHeaders = @{
 
 $script:State = [ordered]@{
     schema_version=2.23
-    installer_version='2.27'
+    installer_version='2.28'
     started_at=(Get-Date).ToString('o')
     repo_root=$RepoRoot
     dry_run=[bool]$DryRun
@@ -109,9 +109,83 @@ function Write-Log {
     Add-Content -Path $LogFile -Value $line -Encoding UTF8
 }
 
+function Write-Utf8NoBom {
+    <#
+    .SYNOPSIS
+        Write text as UTF-8 without BOM.
+
+    .DESCRIPTION
+        Windows PowerShell 5.1's Set-Content -Encoding UTF8 writes a UTF-8 BOM.
+        The repository standard is UTF-8 without BOM for JSON and YAML.
+        This helper uses .NET directly so the output is deterministic on
+        Windows PowerShell 5.1 and PowerShell 7+.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Path,
+
+        [Parameter(Mandatory=$true)]
+        [AllowEmptyString()]
+        [string]$Content
+    )
+
+    $parent = Split-Path -Parent $Path
+    if ($parent) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
+}
+
+function Write-JsonUtf8NoBom {
+    <#
+    .SYNOPSIS
+        Serialize an object as UTF-8 JSON without BOM.
+
+    .NOTES
+        The serialized JSON is then written with UTF8Encoding($false), so the
+        resulting file has no UTF-8 BOM.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [object]$InputObject,
+
+        [Parameter(Mandatory=$true)]
+        [string]$Path,
+
+        [int]$Depth = 10
+    )
+
+    $json = $InputObject | ConvertTo-Json -Depth $Depth
+    Write-Utf8NoBom -Path $Path -Content $json
+}
+
+function Write-YamlUtf8NoBom {
+    <#
+    .SYNOPSIS
+        Write YAML as UTF-8 without BOM.
+
+    .DESCRIPTION
+        The current installer does not generate YAML directly, but this helper
+        establishes the same repository encoding contract for any YAML output
+        added to the installer later.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Path,
+
+        [Parameter(Mandatory=$true)]
+        [AllowEmptyString()]
+        [string]$Content
+    )
+
+    Write-Utf8NoBom -Path $Path -Content $Content
+}
+
 function Save-State {
     New-Item -ItemType Directory -Path $StateRoot -Force | Out-Null
-    $script:State | ConvertTo-Json -Depth 10 | Set-Content -Path $StateFile -Encoding UTF8
+    Write-JsonUtf8NoBom -InputObject $script:State -Path $StateFile -Depth 10
 }
 
 function Add-InstalledComponent {
@@ -1390,9 +1464,11 @@ function Install-Wordlists {
     }
 
     if(-not $DryRun){
-        $manifestDocument | ConvertTo-Json -Depth 10 |
-            Set-Content -Path $WordlistManifest -Encoding UTF8
-        Write-Log "Wordlist manifest berhasil dibuat/diperbarui: $WordlistManifest" 'OK'
+        Write-JsonUtf8NoBom `
+            -InputObject $manifestDocument `
+            -Path $WordlistManifest `
+            -Depth 10
+        Write-Log "Wordlist manifest berhasil dibuat/diperbarui (UTF-8 tanpa BOM): $WordlistManifest" 'OK'
     }
     else{
         Write-Log "DryRun: manifest akan dibuat/diperbarui di $WordlistManifest" 'DRYRUN'
