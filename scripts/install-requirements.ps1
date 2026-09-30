@@ -1,5 +1,6 @@
 #requires -Version 5.1
-# BrebesKab-CSIRT-Tools install-requirements.ps1 v2.29
+# BrebesKab-CSIRT-Tools install-requirements.ps1 v2.30
+# WinGet/App Installer is upgraded and re-verified before package installation.
 # CLI version verification is based on executable availability and non-empty version output.
 [CmdletBinding()]
 param(
@@ -8,7 +9,8 @@ param(
     [switch]$SkipZAP,
     [switch]$Force,
     [switch]$UpdateWordlists,
-    [switch]$ApproveSecurityChanges
+    [switch]$ApproveSecurityChanges,
+    [switch]$SkipWinGetUpgrade
 )
 
 Set-StrictMode -Version Latest
@@ -85,8 +87,8 @@ $GitHubHeaders = @{
 }
 
 $script:State = [ordered]@{
-    schema_version=2.29
-    installer_version='2.29'
+    schema_version=2.30
+    installer_version='2.30'
     started_at=(Get-Date).ToString('o')
     repo_root=$RepoRoot
     dry_run=[bool]$DryRun
@@ -100,6 +102,18 @@ $script:State = [ordered]@{
     gobuster_reference=$null
     security_preflight=$null
     security_changes_approved=[bool]$ApproveSecurityChanges
+    winget_upgrade=[ordered]@{
+        attempted=$false
+        skipped=[bool]$SkipWinGetUpgrade
+        before_version=$null
+        after_version=$null
+        before_appinstaller_version=$null
+        after_appinstaller_version=$null
+        update_available=$null
+        exit_code=$null
+        result='not-run'
+        error=''
+    }
     security_state=[ordered]@{
         captured=$false
         defender_detected=$false
@@ -568,6 +582,158 @@ function Invoke-NativeChecked {
     if ($DryRun) { Write-Log 'DryRun: command tidak dijalankan.' 'DRYRUN'; return }
     & $FilePath @Arguments
     if ($LASTEXITCODE -ne 0) { throw "Command gagal, exit code $LASTEXITCODE`: $FilePath" }
+}
+
+function Get-AppInstallerVersion {
+    <#
+    .SYNOPSIS
+        Return the installed Microsoft App Installer version, which provides WinGet.
+    #>
+    try {
+        $packages = @(Get-AppxPackage -Name 'Microsoft.DesktopAppInstaller' -ErrorAction Stop)
+        if($packages.Count -eq 0) { return $null }
+        $package = $packages | Sort-Object Version -Descending | Select-Object -First 1
+        if($null -eq $package.Version) { return $null }
+        return [version]$package.Version
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-WinGetVersion {
+    try {
+        $path = Find-Command 'winget'
+        if([string]::IsNullOrWhiteSpace($path)) { return $null }
+        $output = & $path --version 2>&1 | Out-String
+        $value = $output.Trim()
+        if([string]::IsNullOrWhiteSpace($value)) { return $null }
+        return $value
+    }
+    catch {
+        return $null
+    }
+}
+
+function Update-WinGet {
+    <#
+    .SYNOPSIS
+        Upgrade Microsoft App Installer / WinGet before installing dependencies.
+
+    .DESCRIPTION
+        WinGet is delivered as part of Microsoft App Installer. The installer
+        first records both the WinGet CLI version and the App Installer package
+        version, then asks WinGet to upgrade Microsoft.AppInstaller. A failure
+        to find an available upgrade is not treated as an error. A real upgrade
+        failure is logged and the existing WinGet installation is re-verified.
+
+        This function never uses `winget upgrade --all`; it only targets the
+        WinGet/App Installer package so unrelated applications are not changed.
+    #>
+    if($SkipWinGetUpgrade) {
+        Write-Log 'Upgrade WinGet dilewati karena -SkipWinGetUpgrade.' 'WARN'
+        $script:State.winget_upgrade.result = 'skipped'
+        Save-State
+        return
+    }
+
+    $wingetPath = Find-Command 'winget'
+    if([string]::IsNullOrWhiteSpace($wingetPath)) {
+        throw 'WinGet tidak ditemukan sebelum proses upgrade. Installer tidak dapat melakukan bootstrap WinGet secara otomatis.'
+    }
+
+    $beforeWinGet = Get-WinGetVersion
+    $beforeAppInstaller = Get-AppInstallerVersion
+
+    $script:State.winget_upgrade.attempted = $true
+    $script:State.winget_upgrade.before_version = $beforeWinGet
+    $script:State.winget_upgrade.before_appinstaller_version = if($beforeAppInstaller){$beforeAppInstaller.ToString()}else{$null}
+    Save-State
+
+    Write-Log "WinGet sebelum upgrade : $(if($beforeWinGet){$beforeWinGet}else{'UNKNOWN'})" 'SECURITY'
+    Write-Log "App Installer sebelum upgrade : $(if($beforeAppInstaller){$beforeAppInstaller}else{'UNKNOWN'})" 'SECURITY'
+
+    if($DryRun) {
+        Write-Log 'DryRun: akan menjalankan upgrade Microsoft.AppInstaller/WinGet, tetapi command tidak dijalankan.' 'DRYRUN'
+        $script:State.winget_upgrade.result = 'dry-run'
+        Save-State
+        return
+    }
+
+    Write-Log 'Memeriksa update Microsoft App Installer / WinGet...' 'STEP'
+
+    $upgradeOutput = ''
+    $exitCode = 0
+    try {
+        $upgradeOutput = & $wingetPath upgrade `
+            --id Microsoft.AppInstaller `
+            --exact `
+            --silent `
+            --accept-package-agreements `
+            --accept-source-agreements 2>&1 | Out-String
+        $exitCode = $LASTEXITCODE
+    }
+    catch {
+        $exitCode = -1
+        $script:State.winget_upgrade.error = $_.Exception.Message
+        Write-Log "Exception saat upgrade WinGet/App Installer: $($_.Exception.Message)" 'WARN'
+    }
+
+    $script:State.winget_upgrade.exit_code = $exitCode
+    if(-not [string]::IsNullOrWhiteSpace($upgradeOutput)) {
+        $cleanOutput = $upgradeOutput.Trim()
+        Write-Log "WinGet upgrade output: $cleanOutput" 'INFO'
+    }
+
+    # WinGet may report that no upgrade is applicable while returning a
+    # non-zero code depending on the installed/source state. Verify the actual
+    # App Installer package and CLI after the command instead of relying only
+    # on the exit code.
+    Start-Sleep -Seconds 3
+    Refresh-Path
+
+    $newWingetPath = Find-Command 'winget'
+    $afterWinGet = Get-WinGetVersion
+    $afterAppInstaller = Get-AppInstallerVersion
+
+    $script:State.winget_upgrade.after_version = $afterWinGet
+    $script:State.winget_upgrade.after_appinstaller_version = if($afterAppInstaller){$afterAppInstaller.ToString()}else{$null}
+
+    if($beforeAppInstaller -and $afterAppInstaller) {
+        $script:State.winget_upgrade.update_available = ($afterAppInstaller -gt $beforeAppInstaller)
+    }
+    else {
+        $script:State.winget_upgrade.update_available = $null
+    }
+
+    if([string]::IsNullOrWhiteSpace($newWingetPath) -or [string]::IsNullOrWhiteSpace($afterWinGet)) {
+        $script:State.winget_upgrade.result = 'failed'
+        Save-State
+        throw 'WinGet/App Installer tidak dapat diverifikasi setelah proses upgrade.'
+    }
+
+    if($exitCode -eq 0) {
+        if($script:State.winget_upgrade.update_available -eq $true) {
+            $script:State.winget_upgrade.result = 'upgraded'
+            Write-Log "WinGet/App Installer berhasil di-upgrade: $beforeAppInstaller -> $afterAppInstaller" 'OK'
+        }
+        else {
+            $script:State.winget_upgrade.result = 'already-current'
+            Write-Log 'WinGet/App Installer sudah versi terbaru atau tidak ada upgrade yang tersedia.' 'OK'
+        }
+    }
+    else {
+        # If the CLI and App Installer are still healthy, do not break the
+        # installation solely because the upgrade command returned a source- or
+        # package-specific code. Record the condition for auditability.
+        $script:State.winget_upgrade.result = 'verified-current-after-nonzero'
+        Write-Log "WinGet upgrade command exit code $exitCode, tetapi WinGet tetap dapat diverifikasi: $afterWinGet" 'WARN'
+        Write-Log 'Installer melanjutkan menggunakan WinGet yang terverifikasi.' 'WARN'
+    }
+
+    Save-State
+    Write-Log "WinGet setelah upgrade : $afterWinGet" 'OK'
+    Write-Log "App Installer setelah upgrade : $(if($afterAppInstaller){$afterAppInstaller}else{'UNKNOWN'})" 'OK'
 }
 
 function Get-WinGetInstalled {
@@ -2439,25 +2605,31 @@ try{
         -Force | Out-Null
 
     Write-Log '============================================================' 'STEP'
-    Write-Log 'BrebesKab-CSIRT-Tools install-requirements.ps1 v2.29' 'STEP'
+    Write-Log 'BrebesKab-CSIRT-Tools install-requirements.ps1 v2.30' 'STEP'
     Write-Log '============================================================' 'STEP'
 
     Request-Administrator
 
     if(-not(Test-Administrator)){
-        throw 'Installer v2.29 tidak berjalan sebagai Administrator setelah proses elevation.'
+        throw 'Installer v2.30 tidak berjalan sebagai Administrator setelah proses elevation.'
     }
 
     if(-not [Environment]::Is64BitOperatingSystem){
-        throw 'Installer v2.29 membutuhkan Windows 64-bit.'
+        throw 'Installer v2.30 membutuhkan Windows 64-bit.'
     }
 
     if(-not(Find-Command 'winget')){
         throw 'WinGet tidak ditemukan. Install/update Microsoft App Installer terlebih dahulu.'
     }
 
-    Write-Log "WinGet: $((& winget --version 2>&1|Out-String).Trim())" 'OK'
+    Update-WinGet
     Refresh-Path
+
+    $verifiedWingetVersion = Get-WinGetVersion
+    if([string]::IsNullOrWhiteSpace($verifiedWingetVersion)){
+        throw 'WinGet tidak dapat diverifikasi setelah proses upgrade.'
+    }
+    Write-Log "WinGet verified: $verifiedWingetVersion" 'OK'
 
     foreach($p in $WinGetPackages){
         Install-WinGetPackage $p.Name $p.Id
