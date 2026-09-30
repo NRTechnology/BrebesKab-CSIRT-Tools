@@ -1,5 +1,5 @@
 #requires -Version 5.1
-# BrebesKab-CSIRT-Tools install-requirements.ps1 v2.29
+# BrebesKab-CSIRT-Tools install-requirements.ps1 v2.28
 # CLI version verification is based on executable availability and non-empty version output.
 [CmdletBinding()]
 param(
@@ -7,8 +7,7 @@ param(
     [switch]$SkipRollback,
     [switch]$SkipZAP,
     [switch]$Force,
-    [switch]$UpdateWordlists,
-    [switch]$ApproveSecurityChanges
+    [switch]$UpdateWordlists
 )
 
 Set-StrictMode -Version Latest
@@ -85,8 +84,8 @@ $GitHubHeaders = @{
 }
 
 $script:State = [ordered]@{
-    schema_version=2.29
-    installer_version='2.29'
+    schema_version=2.23
+    installer_version='2.28'
     started_at=(Get-Date).ToString('o')
     repo_root=$RepoRoot
     dry_run=[bool]$DryRun
@@ -98,30 +97,16 @@ $script:State = [ordered]@{
     curl_reference=$null
     openssl_reference=$null
     gobuster_reference=$null
-    security_preflight=$null
-    security_changes_approved=[bool]$ApproveSecurityChanges
-    security_state=[ordered]@{
-        captured=$false
-        defender_detected=$false
-        defender_rtp_initial=$null
-        defender_rtp_changed=$false
-        defender_restored=$false
-        third_party_products=@()
-        firewall_profiles=@()
-        restoration_attempted=$false
-        restoration_completed=$false
-    }
     completed=$false
 }
 
 function Write-Log {
-    param([string]$Message,[ValidateSet('INFO','WARN','ERROR','OK','STEP','DRYRUN','SECURITY')][string]$Level='INFO')
+    param([string]$Message,[ValidateSet('INFO','WARN','ERROR','OK','STEP','DRYRUN')][string]$Level='INFO')
     $line="[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Level] $Message"
-    $color = switch ($Level) { ERROR {'Red'} WARN {'Yellow'} OK {'Green'} STEP {'Cyan'} DRYRUN {'Magenta'} SECURITY {'Yellow'} default {'Gray'} }
+    $color = switch ($Level) { ERROR {'Red'} WARN {'Yellow'} OK {'Green'} STEP {'Cyan'} DRYRUN {'Magenta'} default {'Gray'} }
     Write-Host $line -ForegroundColor $color
     if (-not (Test-Path $LogRoot)) { New-Item -ItemType Directory -Path $LogRoot -Force | Out-Null }
-    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-    [System.IO.File]::AppendAllText($LogFile, $line + [Environment]::NewLine, $utf8NoBom)
+    Add-Content -Path $LogFile -Value $line -Encoding UTF8
 }
 
 function Write-Utf8NoBom {
@@ -149,7 +134,7 @@ function Write-Utf8NoBom {
         New-Item -ItemType Directory -Path $parent -Force | Out-Null
     }
 
-    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
 }
 
@@ -242,7 +227,6 @@ function Request-Administrator {
     if ($SkipZAP) { $elevatedArguments += '-SkipZAP' }
     if ($Force) { $elevatedArguments += '-Force' }
     if ($UpdateWordlists) { $elevatedArguments += '-UpdateWordlists' }
-    if ($ApproveSecurityChanges) { $elevatedArguments += '-ApproveSecurityChanges' }
 
     try {
         $process = Start-Process `
@@ -270,284 +254,6 @@ function Request-Administrator {
 
     Write-Log 'Proses Administrator selesai dengan sukses.' 'OK'
     exit 0
-}
-
-
-function Get-EndpointSecurityStatus {
-    <#
-    .SYNOPSIS
-        Collect endpoint-security state without changing it.
-    #>
-    $result = [ordered]@{
-        checked_at = (Get-Date).ToString('o')
-        defender = [ordered]@{
-            available = $false
-            antivirus_enabled = $null
-            real_time_protection_enabled = $null
-            behavior_monitor_enabled = $null
-            ioav_protection_enabled = $null
-            network_inspection_enabled = $null
-            status = 'UNKNOWN'
-            error = ''
-        }
-        antivirus_products = @()
-        firewall_profiles = @()
-    }
-
-    Write-Log 'Memeriksa status security endpoint...' 'SECURITY'
-
-    try {
-        $status = Get-MpComputerStatus -ErrorAction Stop
-        $result.defender.available = $true
-        $result.defender.antivirus_enabled = [bool]$status.AntivirusEnabled
-        $result.defender.real_time_protection_enabled = [bool]$status.RealTimeProtectionEnabled
-        $result.defender.behavior_monitor_enabled = [bool]$status.BehaviorMonitorEnabled
-        $result.defender.ioav_protection_enabled = [bool]$status.IoavProtectionEnabled
-        $result.defender.network_inspection_enabled = [bool]$status.NISEnabled
-        $result.defender.status = if(
-            $status.AntivirusEnabled -or
-            $status.RealTimeProtectionEnabled
-        ) { 'ACTIVE' } else { 'INACTIVE' }
-
-        Write-Log ("Microsoft Defender        : {0}" -f $result.defender.status) 'SECURITY'
-        Write-Log ("Real-Time Protection      : {0}" -f $(if($status.RealTimeProtectionEnabled){'ACTIVE'}else{'INACTIVE'})) 'SECURITY'
-        Write-Log ("Behavior Monitor          : {0}" -f $(if($status.BehaviorMonitorEnabled){'ACTIVE'}else{'INACTIVE'})) 'SECURITY'
-        Write-Log ("IOAV Protection           : {0}" -f $(if($status.IoavProtectionEnabled){'ACTIVE'}else{'INACTIVE'})) 'SECURITY'
-        Write-Log ("Network Inspection       : {0}" -f $(if($status.NISEnabled){'ACTIVE'}else{'INACTIVE'})) 'SECURITY'
-    }
-    catch {
-        $result.defender.error = $_.Exception.Message
-        Write-Log 'Tidak dapat membaca status Microsoft Defender.' 'WARN'
-        Write-Log "Defender status detail: $($_.Exception.Message)" 'WARN'
-    }
-
-    try {
-        $products = @(Get-CimInstance -Namespace 'root\SecurityCenter2' -ClassName AntiVirusProduct -ErrorAction Stop)
-        foreach($product in $products) {
-            $displayName = [string]$product.displayName
-            if([string]::IsNullOrWhiteSpace($displayName)) { continue }
-
-            $result.antivirus_products += [ordered]@{
-                display_name = $displayName
-                product_state = [string]$product.productState
-                path = [string]$product.pathToSignedProductExe
-            }
-        }
-
-        if($result.antivirus_products.Count -gt 0) {
-            foreach($product in $result.antivirus_products) {
-                Write-Log "Endpoint AV/EDR terdeteksi: $($product.display_name)" 'SECURITY'
-            }
-        }
-        else {
-            Write-Log 'Tidak ada produk antivirus yang dapat dibaca dari SecurityCenter2.' 'WARN'
-        }
-    }
-    catch {
-        Write-Log "Daftar antivirus/EDR pihak ketiga tidak dapat diverifikasi: $($_.Exception.Message)" 'WARN'
-    }
-
-    try {
-        if(Get-Command Get-NetFirewallProfile -ErrorAction SilentlyContinue) {
-            $profiles = @(Get-NetFirewallProfile -ErrorAction Stop)
-            foreach($profile in $profiles) {
-                $result.firewall_profiles += [ordered]@{
-                    name = [string]$profile.Name
-                    enabled = [bool]$profile.Enabled
-                }
-                Write-Log "Windows Firewall [$($profile.Name)] : $(if($profile.Enabled){'ACTIVE'}else{'INACTIVE'})" 'SECURITY'
-            }
-        }
-        else {
-            Write-Log 'Get-NetFirewallProfile tidak tersedia; status Windows Firewall tidak diverifikasi.' 'WARN'
-        }
-    }
-    catch {
-        Write-Log "Status Windows Firewall tidak dapat diverifikasi: $($_.Exception.Message)" 'WARN'
-    }
-
-    return [pscustomobject]$result
-}
-
-function Request-SecurityChangeApproval {
-    param(
-        [Parameter(Mandatory=$true)]
-        [pscustomobject]$SecurityStatus
-    )
-
-    $rtpActive = $false
-    if($SecurityStatus.defender.available) {
-        $rtpActive = [bool]$SecurityStatus.defender.real_time_protection_enabled
-    }
-
-    if(-not $rtpActive) {
-        Write-Log 'Real-Time Protection tidak aktif; tidak diperlukan persetujuan untuk menonaktifkannya.' 'SECURITY'
-        return $false
-    }
-
-    if($DryRun) {
-        Write-Log 'DryRun: security mitigation tidak akan dilakukan.' 'DRYRUN'
-        return $false
-    }
-
-    if($ApproveSecurityChanges) {
-        Write-Log 'Persetujuan security mitigation diberikan melalui -ApproveSecurityChanges.' 'SECURITY'
-        return $true
-    }
-
-    Write-Host ''
-    Write-Host '============================================================' -ForegroundColor Yellow
-    Write-Host ' PERSETUJUAN SECURITY MITIGATION' -ForegroundColor Yellow
-    Write-Host '============================================================' -ForegroundColor Yellow
-    Write-Host 'Microsoft Defender Real-Time Protection saat ini AKTIF.' -ForegroundColor Yellow
-    Write-Host ''
-    Write-Host 'Installer dapat menonaktifkan Real-Time Protection sementara' -ForegroundColor Yellow
-    Write-Host 'selama proses instalasi BrebesKab-CSIRT-Tools.' -ForegroundColor Yellow
-    Write-Host ''
-    Write-Host 'PERHATIAN:' -ForegroundColor Red
-    Write-Host '- Tindakan ini hanya ditujukan untuk VM/lab khusus project.' -ForegroundColor Red
-    Write-Host '- Installer tidak otomatis menonaktifkan antivirus/EDR pihak ketiga.' -ForegroundColor Red
-    Write-Host '- Windows Firewall, SmartScreen, App Control, dan EDR lain tidak' -ForegroundColor Red
-    Write-Host '  diubah otomatis karena mekanisme restoration berbeda-beda.' -ForegroundColor Red
-    Write-Host '- Defender akan dipulihkan ke kondisi awal setelah installer selesai.' -ForegroundColor Yellow
-    Write-Host ''
-    Write-Host 'Ketik YES untuk memberikan persetujuan.' -ForegroundColor Cyan
-
-    $answer = Read-Host 'Persetujuan'
-    if($answer -ceq 'YES') {
-        Write-Log 'Operator menyetujui temporary Defender Real-Time Protection mitigation.' 'SECURITY'
-        return $true
-    }
-
-    Write-Log 'Operator tidak menyetujui security mitigation. Defender tetap aktif.' 'WARN'
-    return $false
-}
-
-function Disable-DefenderTemporarily {
-    param(
-        [Parameter(Mandatory=$true)]
-        [pscustomobject]$SecurityStatus
-    )
-
-    if(-not $SecurityStatus.defender.available) {
-        Write-Log 'Defender tidak dapat diverifikasi; tidak ada perubahan Defender yang dilakukan.' 'WARN'
-        return
-    }
-
-    if(-not [bool]$SecurityStatus.defender.real_time_protection_enabled) {
-        Write-Log 'Defender Real-Time Protection sudah INACTIVE; tidak ada perubahan.' 'SECURITY'
-        return
-    }
-
-    if(-not $SecurityStatus.defender.antivirus_enabled) {
-        Write-Log 'Microsoft Defender Antivirus tidak aktif; tidak ada perubahan.' 'SECURITY'
-        return
-    }
-
-    $script:State.security_state.captured = $true
-    $script:State.security_state.defender_detected = $true
-    $script:State.security_state.defender_rtp_initial = [bool]$SecurityStatus.defender.real_time_protection_enabled
-    Save-State
-
-    Write-Log 'Menonaktifkan Microsoft Defender Real-Time Protection sementara sesuai persetujuan operator...' 'SECURITY'
-
-    try {
-        Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction Stop
-
-        # Mark the state as changed immediately after Set-MpPreference succeeds.
-        # If verification fails, restoration must still be attempted conservatively.
-        $script:State.security_state.defender_rtp_changed = $true
-        Save-State
-    }
-    catch {
-        Write-Log "Gagal mengubah Defender Real-Time Protection: $($_.Exception.Message)" 'WARN'
-        Write-Log 'Kemungkinan Tamper Protection, policy organisasi, atau security control lain mencegah perubahan.' 'WARN'
-        return
-    }
-
-    Start-Sleep -Seconds 2
-
-    try {
-        $after = Get-MpComputerStatus -ErrorAction Stop
-        if([bool]$after.RealTimeProtectionEnabled) {
-            Write-Log 'Defender Real-Time Protection masih ACTIVE setelah permintaan disable. Security control mungkin menolak perubahan.' 'WARN'
-            return
-        }
-
-        Write-Log 'Defender Real-Time Protection berhasil dinonaktifkan sementara.' 'SECURITY'
-    }
-    catch {
-        Write-Log "Tidak dapat memverifikasi perubahan Defender: $($_.Exception.Message)" 'WARN'
-        Write-Log 'State perubahan tetap dianggap aktif agar restoration tetap dicoba.' 'WARN'
-    }
-}
-
-function Restore-EndpointSecurity {
-    if($DryRun) {
-        return
-    }
-
-    $securityState = $script:State.security_state
-    if($null -eq $securityState) {
-        return
-    }
-
-    $securityState.restoration_attempted = $true
-    Save-State
-
-    if(
-        [bool]$securityState.defender_rtp_changed -and
-        [bool]$securityState.defender_rtp_initial
-    ) {
-        Write-Log 'Memulihkan Microsoft Defender Real-Time Protection ke kondisi awal...' 'SECURITY'
-
-        try {
-            Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction Stop
-            Start-Sleep -Seconds 2
-
-            $after = Get-MpComputerStatus -ErrorAction Stop
-            if([bool]$after.RealTimeProtectionEnabled) {
-                $securityState.defender_restored = $true
-                Write-Log 'Defender Real-Time Protection berhasil dipulihkan ke ACTIVE.' 'OK'
-            }
-            else {
-                Write-Log 'Defender Real-Time Protection belum kembali ACTIVE setelah restoration.' 'ERROR'
-            }
-        }
-        catch {
-            Write-Log "GAGAL memulihkan Defender Real-Time Protection: $($_.Exception.Message)" 'ERROR'
-            Write-Log 'Operator harus memeriksa dan memulihkan Microsoft Defender secara manual.' 'ERROR'
-        }
-    }
-    elseif([bool]$securityState.defender_detected) {
-        Write-Log 'Defender terdeteksi tetapi tidak diubah oleh installer; tidak ada restoration yang diperlukan.' 'SECURITY'
-    }
-
-    $securityState.restoration_completed = $true
-    $securityState.restoration_completed_at = (Get-Date).ToString('o')
-    Save-State
-}
-
-function Write-SecurityWarning {
-    Write-Host ''
-    Write-Host '============================================================' -ForegroundColor Yellow
-    Write-Host ' PERINGATAN KEAMANAN' -ForegroundColor Yellow
-    Write-Host '============================================================' -ForegroundColor Yellow
-    Write-Host 'install-requirements.ps1 ditujukan untuk VM/lab khusus BrebesKab-CSIRT-Tools.' -ForegroundColor Yellow
-    Write-Host 'JANGAN menjalankan installer ini pada workstation atau server production.' -ForegroundColor Red
-    Write-Host ''
-    Write-Host 'Tool security dapat memicu Microsoft Defender, antivirus/EDR,' -ForegroundColor Yellow
-    Write-Host 'SmartScreen, firewall, atau application-control selama download/install/execute.' -ForegroundColor Yellow
-    Write-Host ''
-    Write-Host 'Installer tidak menonaktifkan security control secara diam-diam.' -ForegroundColor Cyan
-    Write-Host 'Perubahan Defender hanya dilakukan setelah persetujuan operator dan' -ForegroundColor Cyan
-    Write-Host 'kondisi awal disimpan untuk restoration.' -ForegroundColor Cyan
-    Write-Host ''
-    Write-Host 'Antivirus/EDR pihak ketiga, firewall, SmartScreen, dan application' -ForegroundColor Yellow
-    Write-Host 'control tidak dinonaktifkan otomatis karena restoration-nya bergantung' -ForegroundColor Yellow
-    Write-Host 'pada vendor/policy masing-masing.' -ForegroundColor Yellow
-    Write-Host '============================================================' -ForegroundColor Yellow
-    Write-Host ''
 }
 
 function Refresh-Path {
@@ -1267,23 +973,6 @@ function Add-WordlistManifestEntry {
     }) | Out-Null
 }
 
-
-function Test-Utf8Bom {
-    param([Parameter(Mandatory=$true)][string]$Path)
-    if(-not (Test-Path $Path)){ return $false }
-    try {
-        $bytes = [System.IO.File]::ReadAllBytes($Path)
-        return ($bytes.Length -ge 3 -and
-            $bytes[0] -eq 0xEF -and
-            $bytes[1] -eq 0xBB -and
-            $bytes[2] -eq 0xBF)
-    }
-    catch {
-        Write-Log "Tidak dapat memeriksa BOM: $Path : $($_.Exception.Message)" 'WARN'
-        return $false
-    }
-}
-
 function Read-WordlistManifest {
     if(-not (Test-Path $WordlistManifest)){
         return @()
@@ -1291,12 +980,6 @@ function Read-WordlistManifest {
 
     try{
         $doc=Get-Content -Path $WordlistManifest -Raw -Encoding UTF8 | ConvertFrom-Json
-
-        if(Test-Utf8Bom -Path $WordlistManifest){
-            Write-Log 'manifest.json menggunakan UTF-8 BOM; menormalisasi ke UTF-8 tanpa BOM.' 'WARN'
-            Write-JsonUtf8NoBom -InputObject $doc -Path $WordlistManifest -Depth 10
-        }
-
         if($doc.wordlists){ return @($doc.wordlists) }
         return @()
     }
@@ -2355,10 +2038,7 @@ function Rollback {
                             --scope machine `
                             --silent `
                             --accept-source-agreements `
-                            2>&1 | Out-String | ForEach-Object {
-                                $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-                                [System.IO.File]::AppendAllText($LogFile, $_, $utf8NoBom)
-                            }
+                            2>&1 | Add-Content $LogFile
 
                         if($LASTEXITCODE -eq 0){
                             Write-Log "Rollback WinGet berhasil: $($c.id)" 'OK'
@@ -2439,17 +2119,17 @@ try{
         -Force | Out-Null
 
     Write-Log '============================================================' 'STEP'
-    Write-Log 'BrebesKab-CSIRT-Tools install-requirements.ps1 v2.29' 'STEP'
+    Write-Log 'BrebesKab-CSIRT-Tools install-requirements.ps1 v2.26' 'STEP'
     Write-Log '============================================================' 'STEP'
 
     Request-Administrator
 
     if(-not(Test-Administrator)){
-        throw 'Installer v2.29 tidak berjalan sebagai Administrator setelah proses elevation.'
+        throw 'Installer v2.26 tidak berjalan sebagai Administrator setelah proses elevation.'
     }
 
     if(-not [Environment]::Is64BitOperatingSystem){
-        throw 'Installer v2.29 membutuhkan Windows 64-bit.'
+        throw 'Installer v2.26 membutuhkan Windows 64-bit.'
     }
 
     if(-not(Find-Command 'winget')){
@@ -2566,12 +2246,4 @@ catch{
     Save-State
 
     exit 1
-}
-finally {
-    try {
-        Restore-EndpointSecurity
-    }
-    catch {
-        Write-Log "Security restoration handler gagal: $($_.Exception.Message)" 'ERROR'
-    }
 }
