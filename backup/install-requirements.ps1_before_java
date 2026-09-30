@@ -1,5 +1,5 @@
-#requires -Version 5.1
-# BrebesKab-CSIRT-Tools install-requirements.ps1 v2.27
+﻿#requires -Version 5.1
+# BrebesKab-CSIRT-Tools install-requirements.ps1 v2.26
 # CLI version verification is based on executable availability and non-empty version output.
 [CmdletBinding()]
 param(
@@ -38,7 +38,6 @@ $WordlistManifest = Join-Path $WordlistsRoot 'manifest.json'
 $VenvDir = Join-Path $RepoRoot '.venv'
 $VenvPython = Join-Path $VenvDir 'Scripts\python.exe'
 $VenvScripts = Join-Path $VenvDir 'Scripts'
-$JavaReference = $null
 
 # Assetnote metadata/CDN checks are deliberately bounded so a degraded CDN
 # cannot stall the installer for a long time. Other wordlist sources keep
@@ -85,7 +84,7 @@ $GitHubHeaders = @{
 
 $script:State = [ordered]@{
     schema_version=2.23
-    installer_version='2.27'
+    installer_version='2.25'
     started_at=(Get-Date).ToString('o')
     repo_root=$RepoRoot
     dry_run=[bool]$DryRun
@@ -397,105 +396,6 @@ function Ensure-OpenSSL {
 
     Write-Log "OpenSSL berhasil diinstall: $resolved" 'OK'
     return $resolved
-}
-
-function Find-JavaExecutable {
-    # Resolve a real java.exe executable. Prefer PATH, then common JRE/JDK
-    # installation locations. Ignore the WindowsApps execution alias.
-    try {
-        $command = Get-Command 'java.exe' -CommandType Application -ErrorAction Stop |
-            Select-Object -First 1
-        if ($command -and $command.Source) {
-            $source = [string]$command.Source
-            if ($source -notmatch '\\WindowsApps\\' -and (Test-Path $source)) {
-                return $source
-            }
-        }
-    } catch {}
-
-    $patterns = @(
-        (Join-Path $env:ProgramFiles 'Microsoft\jdk-*\bin\java.exe'),
-        (Join-Path $env:ProgramFiles 'Eclipse Adoptium\jre-*\bin\java.exe'),
-        (Join-Path $env:ProgramFiles 'Eclipse Adoptium\jdk-*\bin\java.exe'),
-        (Join-Path $env:ProgramFiles 'Java\jre*\bin\java.exe'),
-        (Join-Path $env:ProgramFiles 'Java\jdk*\bin\java.exe'),
-        (Join-Path ${env:ProgramFiles(x86)} 'Java\jre*\bin\java.exe'),
-        (Join-Path ${env:ProgramFiles(x86)} 'Java\jdk*\bin\java.exe'),
-        (Join-Path $env:LOCALAPPDATA 'Programs\Microsoft\jdk-*\bin\java.exe'),
-        (Join-Path $env:LOCALAPPDATA 'Programs\Eclipse Adoptium\jre-*\bin\java.exe'),
-        (Join-Path $env:LOCALAPPDATA 'Programs\Eclipse Adoptium\jdk-*\bin\java.exe')
-    )
-
-    foreach ($pattern in $patterns) {
-        $matches = @(Get-ChildItem -Path $pattern -File -ErrorAction SilentlyContinue)
-        if ($matches.Count -gt 0) {
-            return ($matches | Sort-Object FullName | Select-Object -First 1).FullName
-        }
-    }
-    return $null
-}
-
-function Ensure-Java {
-    $existing = Find-JavaExecutable
-    if ($existing) {
-        Write-Log "Java sudah tersedia: $existing" 'OK'
-        $script:JavaReference = $existing
-        return $existing
-    }
-
-    if ($DryRun) {
-        Write-Log 'DryRun: Java Runtime belum ditemukan; install Microsoft OpenJDK 21 via WinGet.' 'DRYRUN'
-        return $null
-    }
-
-    $javaId = 'Microsoft.OpenJDK.21'
-    if (-not (Get-WinGetSearchExact $javaId)) {
-        throw "Java Runtime tidak ditemukan dan paket WinGet tidak tersedia: $javaId"
-    }
-
-    Write-Log "Java Runtime tidak ditemukan. Menginstall Microsoft OpenJDK 21 via WinGet: $javaId" 'STEP'
-
-    # Do not force --scope machine. This follows the WinGet behavior that
-    # successfully installed Nmap on the current VM.
-    & winget install `
-        --id $javaId `
-        --exact `
-        --source winget `
-        --silent `
-        --accept-package-agreements `
-        --accept-source-agreements
-
-    if ($LASTEXITCODE -ne 0) {
-        throw "WinGet gagal menginstall Java Runtime $javaId. Exit code: $LASTEXITCODE"
-    }
-
-    Refresh-Path
-    $installed = Find-JavaExecutable
-    if (-not $installed) {
-        throw 'Java Runtime berhasil dilaporkan oleh WinGet tetapi java.exe tidak ditemukan setelah instalasi.'
-    }
-
-    $script:JavaReference = $installed
-    Add-InstalledComponent 'winget' 'Java Runtime' $javaId '' $installed
-    Write-Log "Java Runtime berhasil diinstall: $installed" 'OK'
-    return $installed
-}
-
-function Verify-Java {
-    param([string]$JavaPath)
-    if ($DryRun) {
-        Write-Log 'DryRun: verification Java dilewati.' 'DRYRUN'
-        return
-    }
-    if ([string]::IsNullOrWhiteSpace($JavaPath) -or -not (Test-Path $JavaPath)) {
-        throw "Java executable tidak ditemukan untuk verification: $JavaPath"
-    }
-    $result = Invoke-NativeCapture -FilePath $JavaPath -Arguments @('-version')
-    $output = ($result.StdOut + "`r`n" + $result.StdErr).Trim()
-    if ($result.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($output)) {
-        throw "Java verification gagal. Exit code: $($result.ExitCode). Output: $output"
-    }
-    Write-Log "Java OK: $output" 'OK'
 }
 
 function Get-PythonBaseExecutable {
@@ -2096,9 +1996,6 @@ try{
 
     Install-Wordlists
 
-    $javaPath = Ensure-Java
-    Refresh-Path
-
     Install-ZAP
 
     Write-Log 'Memulai verification...' 'STEP'
@@ -2111,7 +2008,6 @@ try{
     Verify-Gobuster
     Verify-Command 'curl.exe' @('--version')
     Verify-Command 'openssl.exe' @('version')
-    Verify-Java $javaPath
 
     if (-not $DryRun) {
         if (-not (Test-ProjectPython $venvPython)) {
@@ -2140,7 +2036,6 @@ try{
 
     $script:State.curl_reference = $curlPath
     $script:State.openssl_reference = $opensslPath
-    $script:State.java_reference = $javaPath
     $script:State.gobuster_reference = $GobusterExe
     $script:State.completed=$true
     $script:State.completed_at=(Get-Date).ToString('o')
