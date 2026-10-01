@@ -631,7 +631,7 @@ def command_init() -> int:
     print("[PASS] Endpoint Discovery berhasil diinisialisasi.")
     print(f"PROJECT: {project_context().project_id}")
     print(f"FILE   : {path}")
-    print(f"TARGET : {data['endpoint']['target_url']}")
+    print(f"TARGET : {data['target_url']}")
     return 0
 
 
