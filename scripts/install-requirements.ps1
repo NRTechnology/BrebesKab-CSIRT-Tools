@@ -1,6 +1,7 @@
 #requires -Version 5.1
-# BrebesKab-CSIRT-Tools install-requirements.ps1 v2.30
+# BrebesKab-CSIRT-Tools install-requirements.ps1 v2.41
 # WinGet/App Installer is upgraded and re-verified before package installation.
+# WinGet package installation uses the package default scope; the package default scope is used.
 # CLI version verification is based on executable availability and non-empty version output.
 [CmdletBinding()]
 param(
@@ -10,12 +11,15 @@ param(
     [switch]$Force,
     [switch]$UpdateWordlists,
     [switch]$ApproveSecurityChanges,
-    [switch]$SkipWinGetUpgrade
+    [switch]$SkipWinGetUpgrade,
+    [string]$OriginalUserProfile,
+    [string]$OriginalUserLocalAppData
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+$InstallerVersion = '2.40'
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $RuntimeRoot = Join-Path $RepoRoot '.runtime'
@@ -25,6 +29,7 @@ $DownloadRoot = Join-Path $RuntimeRoot 'downloads'
 $ToolsRoot = Join-Path $RepoRoot 'tools'
 $LogFile = Join-Path $LogRoot 'install-requirements.log'
 $StateFile = Join-Path $StateRoot 'install-state.json'
+$UacContextFile = Join-Path $StateRoot 'uac-context.json'
 $NucleiDir = Join-Path $ToolsRoot 'nuclei'
 $HttpxDir = Join-Path $ToolsRoot 'httpx'
 $GobusterDir = Join-Path $ToolsRoot 'gobuster'
@@ -87,13 +92,14 @@ $GitHubHeaders = @{
 }
 
 $script:State = [ordered]@{
-    schema_version=2.30
-    installer_version='2.30'
+    schema_version=2.38
+    installer_version='2.40'
     started_at=(Get-Date).ToString('o')
     repo_root=$RepoRoot
     dry_run=[bool]$DryRun
     update_wordlists=[bool]$UpdateWordlists
     installed_by_script=@()
+    existing_components=@()
     venv_created_by_script=$false
     python_reference=$null
     python_base=$null
@@ -117,13 +123,21 @@ $script:State = [ordered]@{
     security_state=[ordered]@{
         captured=$false
         defender_detected=$false
-        defender_rtp_initial=$null
-        defender_rtp_changed=$false
+        defender_preferences_initial=@{}
+        defender_changes_applied=$false
         defender_restored=$false
-        third_party_products=@()
         firewall_profiles=@()
+        firewall_initial=@()
+        firewall_changed=$false
+        smartscreen_initial=@{}
+        smartscreen_changed=$false
+        third_party_products=@()
         restoration_attempted=$false
         restoration_completed=$false
+        operator_approval_requested=$false
+        operator_approval_granted=$false
+        mitigation_skipped=$false
+        verification_passed=$false
     }
     completed=$false
 }
@@ -225,6 +239,91 @@ function Add-InstalledComponent {
     Save-State
 }
 
+function Add-ExistingComponent {
+    param([string]$Type,[string]$Name,[string]$Id,[string]$Version,[string]$Path)
+    $script:State.existing_components += [ordered]@{
+        type=$Type; name=$Name; id=$Id; version=$Version; path=$Path; detected_at=(Get-Date).ToString('o')
+    }
+    Save-State
+}
+
+function Save-UacContext {
+    <#
+    .SYNOPSIS
+        Persist the interactive user's profile paths before UAC elevation.
+
+    .DESCRIPTION
+        User-scope WinGet packages belong to the interactive account. After
+        RunAs elevation, USERPROFILE/LOCALAPPDATA can refer to the elevated
+        security context. Persisting the original paths in a small UTF-8
+        no-BOM JSON file avoids relying on command-line quote/argument parsing
+        across the UAC boundary.
+    #>
+
+    param(
+        [Parameter(Mandatory=$true)][string]$UserProfile,
+        [Parameter(Mandatory=$true)][string]$LocalAppData
+    )
+
+    $context = [ordered]@{
+        schema_version = 1
+        user_profile = $UserProfile
+        local_app_data = $LocalAppData
+        created_at = (Get-Date).ToString('o')
+    }
+
+    Write-JsonUtf8NoBom -InputObject $context -Path $UacContextFile -Depth 5
+    Write-Log "UAC context disimpan: UserProfile=$UserProfile; LocalAppData=$LocalAppData" 'INFO'
+}
+
+function Load-UacContext {
+    <#
+    .SYNOPSIS
+        Load the interactive user's profile paths inside the elevated process.
+
+    .DESCRIPTION
+        The context file is intentionally read only when the current process
+        is elevated and explicit context parameters are missing. Explicit
+        parameters remain authoritative when supplied.
+    #>
+
+    if(
+        -not [string]::IsNullOrWhiteSpace($OriginalUserProfile) -and
+        -not [string]::IsNullOrWhiteSpace($OriginalUserLocalAppData)
+    ){
+        Write-Log "UAC context dari parameter: UserProfile=$OriginalUserProfile; LocalAppData=$OriginalUserLocalAppData" 'INFO'
+        return
+    }
+
+    if(-not (Test-Path $UacContextFile)){
+        Write-Log "UAC context file tidak ditemukan: $UacContextFile" 'WARN'
+        return
+    }
+
+    try {
+        $context = Get-Content -LiteralPath $UacContextFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+
+        if([string]::IsNullOrWhiteSpace([string]$context.user_profile) -or
+           [string]::IsNullOrWhiteSpace([string]$context.local_app_data)){
+            throw 'UAC context tidak memiliki user_profile/local_app_data yang valid.'
+        }
+
+        $script:OriginalUserProfile = [string]$context.user_profile
+        $script:OriginalUserLocalAppData = [string]$context.local_app_data
+
+        Write-Log "UAC context dimuat: UserProfile=$script:OriginalUserProfile; LocalAppData=$script:OriginalUserLocalAppData" 'OK'
+    }
+    catch {
+        Write-Log "Gagal membaca UAC context: $($_.Exception.Message)" 'WARN'
+    }
+}
+
+function Remove-UacContext {
+    if(Test-Path $UacContextFile){
+        Remove-Item -LiteralPath $UacContextFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Test-Administrator {
     $id=[Security.Principal.WindowsIdentity]::GetCurrent()
     $p=New-Object Security.Principal.WindowsPrincipal($id)
@@ -243,6 +342,35 @@ function Request-Administrator {
         throw 'Path install-requirements.ps1 tidak dapat ditentukan untuk proses elevation.'
     }
 
+    # Capture the interactive user's WinGet context before crossing the UAC
+    # boundary. The elevated process will load the same values from
+    # .runtime\state\uac-context.json, so no user-scope path depends on the
+    # elevated environment.
+    $interactiveUserProfile = $OriginalUserProfile
+    if ([string]::IsNullOrWhiteSpace($interactiveUserProfile)) {
+        $interactiveUserProfile = $env:USERPROFILE
+    }
+
+    $interactiveLocalAppData = $OriginalUserLocalAppData
+    if ([string]::IsNullOrWhiteSpace($interactiveLocalAppData)) {
+        $interactiveLocalAppData = [Environment]::GetFolderPath('LocalApplicationData')
+    }
+
+    if ([string]::IsNullOrWhiteSpace($interactiveUserProfile)) {
+        throw 'Interactive UserProfile tidak dapat ditentukan sebelum UAC elevation.'
+    }
+
+    if ([string]::IsNullOrWhiteSpace($interactiveLocalAppData)) {
+        throw 'Interactive LocalAppData tidak dapat ditentukan sebelum UAC elevation.'
+    }
+
+    Save-UacContext `
+        -UserProfile $interactiveUserProfile `
+        -LocalAppData $interactiveLocalAppData
+
+    # Keep the existing switch propagation unchanged. The WinGet user context
+    # is intentionally transported by the context file rather than by quoted
+    # -ArgumentList values.
     $elevatedArguments = @(
         '-NoProfile'
         '-ExecutionPolicy'
@@ -290,7 +418,13 @@ function Request-Administrator {
 function Get-EndpointSecurityStatus {
     <#
     .SYNOPSIS
-        Collect endpoint-security state without changing it.
+        Capture endpoint security state without changing it.
+
+    .DESCRIPTION
+        v2.36 is intended for a dedicated, isolated pentest/hacking VM.
+        After explicit operator approval, supported Windows endpoint controls
+        are temporarily disabled and later restored to their captured state.
+        Third-party AV/EDR is detected and logged but is not force-disabled.
     #>
     $result = [ordered]@{
         checked_at = (Get-Date).ToString('o')
@@ -302,10 +436,15 @@ function Get-EndpointSecurityStatus {
             ioav_protection_enabled = $null
             network_inspection_enabled = $null
             status = 'UNKNOWN'
+            preferences = @{}
             error = ''
         }
         antivirus_products = @()
         firewall_profiles = @()
+        smartscreen = [ordered]@{
+            available = $false
+            policies = @{}
+        }
     }
 
     Write-Log 'Memeriksa status security endpoint...' 'SECURITY'
@@ -318,16 +457,59 @@ function Get-EndpointSecurityStatus {
         $result.defender.behavior_monitor_enabled = [bool]$status.BehaviorMonitorEnabled
         $result.defender.ioav_protection_enabled = [bool]$status.IoavProtectionEnabled
         $result.defender.network_inspection_enabled = [bool]$status.NISEnabled
-        $result.defender.status = if(
-            $status.AntivirusEnabled -or
-            $status.RealTimeProtectionEnabled
-        ) { 'ACTIVE' } else { 'INACTIVE' }
+        $tamperProperty = $status.PSObject.Properties['IsTamperProtected']
+        if($null -ne $tamperProperty) {
+            $result.defender.tamper_protected = [bool]$tamperProperty.Value
+        }
+        else {
+            $result.defender.tamper_protected = $null
+        }
+        # AntivirusEnabled only tells us that the Defender AV product exists/enabled.
+        # For the installer mitigation gate, use the actual protection components.
+        $protectionActive = (
+            [bool]$status.RealTimeProtectionEnabled -or
+            [bool]$status.BehaviorMonitorEnabled -or
+            [bool]$status.IoavProtectionEnabled -or
+            [bool]$status.NISEnabled
+        )
+        $result.defender.status = if($protectionActive) { 'ACTIVE' } else { 'INACTIVE' }
+
+        try {
+            $pref = Get-MpPreference -ErrorAction Stop
+            $result.defender.preferences = [ordered]@{}
+            $preferenceNames = @(
+                'DisableRealtimeMonitoring',
+                'DisableBehaviorMonitoring',
+                'DisableIOAVProtection',
+                'DisableScriptScanning',
+                'DisableArchiveScanning',
+                'DisableIntrusionPreventionSystem',
+                'DisableBlockAtFirstSeen',
+                'DisableScanningNetworkFiles',
+                'DisableRemovableDriveScanning'
+            )
+            foreach($name in $preferenceNames) {
+                $property = $pref.PSObject.Properties[$name]
+                if($null -ne $property) {
+                    $result.defender.preferences[$name] = [bool]$property.Value
+                }
+                else {
+                    Write-Log "Defender preference tidak menyediakan property: $name. Diabaikan." 'INFO'
+                }
+            }
+        }
+        catch {
+            Write-Log "Defender preference tidak dapat dibaca lengkap: $($_.Exception.Message)" 'WARN'
+        }
 
         Write-Log ("Microsoft Defender        : {0}" -f $result.defender.status) 'SECURITY'
         Write-Log ("Real-Time Protection      : {0}" -f $(if($status.RealTimeProtectionEnabled){'ACTIVE'}else{'INACTIVE'})) 'SECURITY'
-        Write-Log ("Behavior Monitor          : {0}" -f $(if($status.BehaviorMonitorEnabled){'ACTIVE'}else{'INACTIVE'})) 'SECURITY'
-        Write-Log ("IOAV Protection           : {0}" -f $(if($status.IoavProtectionEnabled){'ACTIVE'}else{'INACTIVE'})) 'SECURITY'
-        Write-Log ("Network Inspection       : {0}" -f $(if($status.NISEnabled){'ACTIVE'}else{'INACTIVE'})) 'SECURITY'
+        Write-Log ("Behavior Monitor           : {0}" -f $(if($status.BehaviorMonitorEnabled){'ACTIVE'}else{'INACTIVE'})) 'SECURITY'
+        Write-Log ("IOAV Protection            : {0}" -f $(if($status.IoavProtectionEnabled){'ACTIVE'}else{'INACTIVE'})) 'SECURITY'
+        Write-Log ("Network Inspection        : {0}" -f $(if($status.NISEnabled){'ACTIVE'}else{'INACTIVE'})) 'SECURITY'
+        if($null -ne $result.defender.tamper_protected) {
+            Write-Log ("Tamper Protection          : {0}" -f $(if($result.defender.tamper_protected){'ACTIVE'}else{'INACTIVE'})) 'SECURITY'
+        }
     }
     catch {
         $result.defender.error = $_.Exception.Message
@@ -340,21 +522,14 @@ function Get-EndpointSecurityStatus {
         foreach($product in $products) {
             $displayName = [string]$product.displayName
             if([string]::IsNullOrWhiteSpace($displayName)) { continue }
-
             $result.antivirus_products += [ordered]@{
                 display_name = $displayName
                 product_state = [string]$product.productState
                 path = [string]$product.pathToSignedProductExe
             }
         }
-
-        if($result.antivirus_products.Count -gt 0) {
-            foreach($product in $result.antivirus_products) {
-                Write-Log "Endpoint AV/EDR terdeteksi: $($product.display_name)" 'SECURITY'
-            }
-        }
-        else {
-            Write-Log 'Tidak ada produk antivirus yang dapat dibaca dari SecurityCenter2.' 'WARN'
+        foreach($product in $result.antivirus_products) {
+            Write-Log "Endpoint AV/EDR terdeteksi: $($product.display_name)" 'SECURITY'
         }
     }
     catch {
@@ -372,35 +547,43 @@ function Get-EndpointSecurityStatus {
                 Write-Log "Windows Firewall [$($profile.Name)] : $(if($profile.Enabled){'ACTIVE'}else{'INACTIVE'})" 'SECURITY'
             }
         }
-        else {
-            Write-Log 'Get-NetFirewallProfile tidak tersedia; status Windows Firewall tidak diverifikasi.' 'WARN'
-        }
     }
     catch {
         Write-Log "Status Windows Firewall tidak dapat diverifikasi: $($_.Exception.Message)" 'WARN'
+    }
+
+    try {
+        $smartscreenPaths = @(
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer',
+            'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System',
+            'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppHost'
+        )
+        foreach($path in $smartscreenPaths) {
+            if(Test-Path $path) {
+                $props = Get-ItemProperty -Path $path -ErrorAction SilentlyContinue
+                if($null -ne $props) {
+                    foreach($name in @('SmartScreenEnabled','EnableSmartScreen','EnableSmartScreenForApps','PreventOverrideForFilesInShell')) {
+                        $prop = $props.PSObject.Properties[$name]
+                        if($null -ne $prop) { $result.smartscreen.policies["$path|$name"] = $prop.Value }
+                    }
+                }
+            }
+        }
+        $result.smartscreen.available = $true
+        Write-Log ("SmartScreen policy values captured: {0}" -f $result.smartscreen.policies.Count) 'SECURITY'
+    }
+    catch {
+        Write-Log "Status SmartScreen tidak dapat dibaca: $($_.Exception.Message)" 'WARN'
     }
 
     return [pscustomobject]$result
 }
 
 function Request-SecurityChangeApproval {
-    param(
-        [Parameter(Mandatory=$true)]
-        [pscustomobject]$SecurityStatus
-    )
-
-    $rtpActive = $false
-    if($SecurityStatus.defender.available) {
-        $rtpActive = [bool]$SecurityStatus.defender.real_time_protection_enabled
-    }
-
-    if(-not $rtpActive) {
-        Write-Log 'Real-Time Protection tidak aktif; tidak diperlukan persetujuan untuk menonaktifkannya.' 'SECURITY'
-        return $false
-    }
+    param([Parameter(Mandatory=$true)][pscustomobject]$SecurityStatus)
 
     if($DryRun) {
-        Write-Log 'DryRun: security mitigation tidak akan dilakukan.' 'DRYRUN'
+        Write-Log 'DryRun: seluruh security mitigation tidak akan dilakukan.' 'DRYRUN'
         return $false
     }
 
@@ -411,155 +594,326 @@ function Request-SecurityChangeApproval {
 
     Write-Host ''
     Write-Host '============================================================' -ForegroundColor Yellow
-    Write-Host ' PERSETUJUAN SECURITY MITIGATION' -ForegroundColor Yellow
+    Write-Host ' PERSETUJUAN SECURITY MITIGATION v2.38' -ForegroundColor Yellow
     Write-Host '============================================================' -ForegroundColor Yellow
-    Write-Host 'Microsoft Defender Real-Time Protection saat ini AKTIF.' -ForegroundColor Yellow
+    Write-Host 'VM ini diperlakukan sebagai environment khusus pentest/hacking.' -ForegroundColor Yellow
     Write-Host ''
-    Write-Host 'Installer dapat menonaktifkan Real-Time Protection sementara' -ForegroundColor Yellow
-    Write-Host 'selama proses instalasi BrebesKab-CSIRT-Tools.' -ForegroundColor Yellow
+    Write-Host 'Setelah YES, installer akan mencoba menonaktifkan:' -ForegroundColor Red
+    Write-Host '  - Microsoft Defender protection/preferences' -ForegroundColor Red
+    Write-Host '  - Windows Firewall seluruh profile' -ForegroundColor Red
+    Write-Host '  - Windows SmartScreen policy' -ForegroundColor Red
     Write-Host ''
-    Write-Host 'PERHATIAN:' -ForegroundColor Red
-    Write-Host '- Tindakan ini hanya ditujukan untuk VM/lab khusus project.' -ForegroundColor Red
-    Write-Host '- Installer tidak otomatis menonaktifkan antivirus/EDR pihak ketiga.' -ForegroundColor Red
-    Write-Host '- Windows Firewall, SmartScreen, App Control, dan EDR lain tidak' -ForegroundColor Red
-    Write-Host '  diubah otomatis karena mekanisme restoration berbeda-beda.' -ForegroundColor Red
-    Write-Host '- Defender akan dipulihkan ke kondisi awal setelah installer selesai.' -ForegroundColor Yellow
+    Write-Host 'State awal disimpan dan dipulihkan setelah installer selesai' -ForegroundColor Yellow
+    Write-Host 'atau ketika proses mengalami error.' -ForegroundColor Yellow
     Write-Host ''
-    Write-Host 'Ketik YES untuk memberikan persetujuan.' -ForegroundColor Cyan
+    Write-Host 'AV/EDR pihak ketiga dideteksi tetapi tidak dipaksa mati karena' -ForegroundColor Yellow
+    Write-Host 'mekanisme disable/restore vendor-specific tidak generik.' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host 'Ketik YES untuk melanjutkan.' -ForegroundColor Cyan
 
     $answer = Read-Host 'Persetujuan'
     if($answer -ceq 'YES') {
-        Write-Log 'Operator menyetujui temporary Defender Real-Time Protection mitigation.' 'SECURITY'
+        Write-Log 'Operator menyetujui temporary endpoint security mitigation.' 'SECURITY'
         return $true
     }
 
-    Write-Log 'Operator tidak menyetujui security mitigation. Defender tetap aktif.' 'WARN'
-    return $false
+    Write-Log 'Operator tidak menyetujui security mitigation. Installer berhenti.' 'WARN'
+    throw 'Security mitigation tidak disetujui operator. Installer tidak dilanjutkan.'
 }
 
-function Disable-DefenderTemporarily {
-    param(
-        [Parameter(Mandatory=$true)]
-        [pscustomobject]$SecurityStatus
-    )
+function Disable-EndpointSecurity {
+    param([Parameter(Mandatory=$true)][pscustomobject]$SecurityStatus)
 
-    if(-not $SecurityStatus.defender.available) {
-        Write-Log 'Defender tidak dapat diverifikasi; tidak ada perubahan Defender yang dilakukan.' 'WARN'
+    if($DryRun) {
+        Write-Log 'DryRun: endpoint security tidak akan diubah.' 'DRYRUN'
         return
     }
 
-    if(-not [bool]$SecurityStatus.defender.real_time_protection_enabled) {
-        Write-Log 'Defender Real-Time Protection sudah INACTIVE; tidak ada perubahan.' 'SECURITY'
-        return
-    }
-
-    if(-not $SecurityStatus.defender.antivirus_enabled) {
-        Write-Log 'Microsoft Defender Antivirus tidak aktif; tidak ada perubahan.' 'SECURITY'
-        return
-    }
-
-    $script:State.security_state.captured = $true
-    $script:State.security_state.defender_detected = $true
-    $script:State.security_state.defender_rtp_initial = [bool]$SecurityStatus.defender.real_time_protection_enabled
+    $state = $script:State.security_state
+    $state.captured = $true
+    $state.defender_detected = [bool]$SecurityStatus.defender.available
+    $state.defender_preferences_initial = $SecurityStatus.defender.preferences
+    $state.firewall_initial = @($SecurityStatus.firewall_profiles)
+    $state.firewall_profiles = @($SecurityStatus.firewall_profiles)
+    $state.smartscreen_initial = $SecurityStatus.smartscreen.policies
+    $state.third_party_products = @($SecurityStatus.antivirus_products)
     Save-State
 
-    Write-Log 'Menonaktifkan Microsoft Defender Real-Time Protection sementara sesuai persetujuan operator...' 'SECURITY'
+    if($SecurityStatus.defender.available) {
+        $defenderAlreadyOff = (
+            -not [bool]$SecurityStatus.defender.real_time_protection_enabled -and
+            -not [bool]$SecurityStatus.defender.behavior_monitor_enabled -and
+            -not [bool]$SecurityStatus.defender.ioav_protection_enabled -and
+            -not [bool]$SecurityStatus.defender.network_inspection_enabled
+        )
+
+        if($defenderAlreadyOff) {
+            # Important: do not call Set-MpPreference when the protection
+            # components are already OFF. A machine can legitimately report
+            # IsTamperProtected=True while the protection components are OFF.
+            Write-Log 'Microsoft Defender protection components sudah OFF. Tidak ada perubahan Defender yang diperlukan.' 'OK'
+            if($null -ne $SecurityStatus.defender.tamper_protected) {
+                Write-Log ("Tamper Protection        : {0} (informational)" -f $(if($SecurityStatus.defender.tamper_protected){'ACTIVE'}else{'INACTIVE'})) 'SECURITY'
+            }
+        }
+        else {
+            if($null -ne $SecurityStatus.defender.tamper_protected -and [bool]$SecurityStatus.defender.tamper_protected) {
+                Write-Log 'Microsoft Defender protection masih ACTIVE dan Tamper Protection juga ACTIVE.' 'ERROR'
+                throw 'Microsoft Defender masih ACTIVE dan Tamper Protection ACTIVE. Installer tidak dapat mengubah Defender melalui Set-MpPreference pada kondisi ini.'
+            }
+
+            Write-Log 'Menonaktifkan Microsoft Defender protection/preferences sesuai persetujuan operator...' 'SECURITY'
+            try {
+                $setMpPreference = @{
+                    ErrorAction = 'Stop'
+                }
+
+                # Only request parameters that are actually exposed by the
+                # current Set-MpPreference implementation.
+                $desiredDisableParameters = @(
+                    'DisableRealtimeMonitoring',
+                    'DisableBehaviorMonitoring',
+                    'DisableIOAVProtection',
+                    'DisableScriptScanning',
+                    'DisableArchiveScanning',
+                    'DisableIntrusionPreventionSystem',
+                    'DisableBlockAtFirstSeen',
+                    'DisableScanningNetworkFiles',
+                    'DisableRemovableDriveScanning'
+                )
+
+                $setMpCommand = Get-Command Set-MpPreference -ErrorAction Stop
+                foreach($parameterName in $desiredDisableParameters) {
+                    if($setMpCommand.Parameters.ContainsKey($parameterName)) {
+                        $setMpPreference[$parameterName] = $true
+                        Write-Log "Defender preference disable requested: $parameterName" 'SECURITY'
+                    }
+                    else {
+                        Write-Log "Set-MpPreference tidak menyediakan parameter: $parameterName. Diabaikan." 'WARN'
+                    }
+                }
+
+                Set-MpPreference @setMpPreference
+                $state.defender_changes_applied = $true
+                Save-State
+            }
+            catch {
+                Write-Log "Gagal menonaktifkan Microsoft Defender preferences: $($_.Exception.Message)" 'ERROR'
+                throw 'Microsoft Defender tidak dapat dinonaktifkan. Installer dihentikan sebelum software installation.'
+            }
+        }
+    }
+
+    if(Get-Command Set-NetFirewallProfile -ErrorAction SilentlyContinue) {
+        $activeFirewallBefore = @($SecurityStatus.firewall_profiles | Where-Object { [bool]$_.enabled })
+        if($activeFirewallBefore.Count -eq 0) {
+            Write-Log 'Windows Firewall seluruh profile sudah OFF. Tidak ada perubahan Firewall yang diperlukan.' 'OK'
+        }
+        else {
+            Write-Log 'Menonaktifkan Windows Firewall Domain, Private, dan Public...' 'SECURITY'
+            try {
+                Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled False -ErrorAction Stop
+                $state.firewall_changed = $true
+                Save-State
+            }
+            catch {
+                Write-Log "Gagal menonaktifkan Windows Firewall: $($_.Exception.Message)" 'ERROR'
+                throw 'Windows Firewall tidak dapat dinonaktifkan. Installer dihentikan.'
+            }
+        }
+    }
 
     try {
-        Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction Stop
+        $machineSystem = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
+        New-Item -Path $machineSystem -Force | Out-Null
+        New-ItemProperty -Path $machineSystem -Name 'EnableSmartScreen' -PropertyType DWord -Value 0 -Force | Out-Null
 
-        # Mark the state as changed immediately after Set-MpPreference succeeds.
-        # If verification fails, restoration must still be attempted conservatively.
-        $script:State.security_state.defender_rtp_changed = $true
+        $explorer = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer'
+        New-Item -Path $explorer -Force | Out-Null
+        New-ItemProperty -Path $explorer -Name 'SmartScreenEnabled' -PropertyType String -Value 'Off' -Force | Out-Null
+
+        $appHost = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppHost'
+        New-Item -Path $appHost -Force | Out-Null
+        New-ItemProperty -Path $appHost -Name 'EnableSmartScreenForApps' -PropertyType DWord -Value 0 -Force | Out-Null
+
+        $state.smartscreen_changed = $true
         Save-State
+        Write-Log 'Windows SmartScreen policy dinonaktifkan.' 'SECURITY'
     }
     catch {
-        Write-Log "Gagal mengubah Defender Real-Time Protection: $($_.Exception.Message)" 'WARN'
-        Write-Log 'Kemungkinan Tamper Protection, policy organisasi, atau security control lain mencegah perubahan.' 'WARN'
-        return
+        Write-Log "Gagal mengubah SmartScreen policy: $($_.Exception.Message)" 'WARN'
     }
 
     Start-Sleep -Seconds 2
+    $verify = Get-EndpointSecurityStatus
 
-    try {
-        $after = Get-MpComputerStatus -ErrorAction Stop
-        if([bool]$after.RealTimeProtectionEnabled) {
-            Write-Log 'Defender Real-Time Protection masih ACTIVE setelah permintaan disable. Security control mungkin menolak perubahan.' 'WARN'
-            return
+    if($verify.defender.available) {
+        $activeDefender = (
+            [bool]$verify.defender.real_time_protection_enabled -or
+            [bool]$verify.defender.behavior_monitor_enabled -or
+            [bool]$verify.defender.ioav_protection_enabled -or
+            [bool]$verify.defender.network_inspection_enabled
+        )
+        if($activeDefender) {
+            Write-Log 'Microsoft Defender masih memiliki protection component ACTIVE.' 'ERROR'
+            throw 'Security preflight gagal: Microsoft Defender protection components tidak benar-benar OFF. Installer dihentikan.'
         }
+    }
 
-        Write-Log 'Defender Real-Time Protection berhasil dinonaktifkan sementara.' 'SECURITY'
+    $activeFirewall = @($verify.firewall_profiles | Where-Object { [bool]$_.enabled })
+    if($activeFirewall.Count -gt 0) {
+        Write-Log ("Windows Firewall masih ACTIVE: {0}" -f (($activeFirewall | ForEach-Object { $_.name }) -join ', ')) 'ERROR'
+        throw 'Security preflight gagal: Windows Firewall tidak benar-benar OFF. Installer dihentikan.'
     }
-    catch {
-        Write-Log "Tidak dapat memverifikasi perubahan Defender: $($_.Exception.Message)" 'WARN'
-        Write-Log 'State perubahan tetap dianggap aktif agar restoration tetap dicoba.' 'WARN'
-    }
+
+    $state.verification_passed = $true
+    Save-State
+    Write-Log 'Endpoint security mitigation berhasil diverifikasi: supported controls OFF.' 'OK'
 }
 
 function Restore-EndpointSecurity {
-    if($DryRun) {
-        return
-    }
+    if($DryRun) { return }
 
-    $securityState = $script:State.security_state
-    if($null -eq $securityState) {
-        return
-    }
+    $state = $script:State.security_state
+    if($null -eq $state -or -not [bool]$state.captured) { return }
 
-    $securityState.restoration_attempted = $true
+    $state.restoration_attempted = $true
     Save-State
 
-    if(
-        [bool]$securityState.defender_rtp_changed -and
-        [bool]$securityState.defender_rtp_initial
-    ) {
-        Write-Log 'Memulihkan Microsoft Defender Real-Time Protection ke kondisi awal...' 'SECURITY'
-
+    if([bool]$state.defender_changes_applied -and $state.defender_preferences_initial.Count -gt 0) {
+        Write-Log 'Memulihkan Microsoft Defender preferences ke kondisi awal...' 'SECURITY'
         try {
-            Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction Stop
-            Start-Sleep -Seconds 2
+            $p = $state.defender_preferences_initial
+            $restoreMpPreference = @{
+                ErrorAction = 'Stop'
+            }
 
-            $after = Get-MpComputerStatus -ErrorAction Stop
-            if([bool]$after.RealTimeProtectionEnabled) {
-                $securityState.defender_restored = $true
-                Write-Log 'Defender Real-Time Protection berhasil dipulihkan ke ACTIVE.' 'OK'
+            $setMpCommand = Get-Command Set-MpPreference -ErrorAction Stop
+            foreach($propertyName in @(
+                'DisableRealtimeMonitoring',
+                'DisableBehaviorMonitoring',
+                'DisableIOAVProtection',
+                'DisableScriptScanning',
+                'DisableArchiveScanning',
+                'DisableIntrusionPreventionSystem',
+                'DisableBlockAtFirstSeen',
+                'DisableScanningNetworkFiles',
+                'DisableRemovableDriveScanning'
+            )) {
+                if($null -ne $p -and $p.Contains($propertyName) -and $setMpCommand.Parameters.ContainsKey($propertyName)) {
+                    $restoreMpPreference[$propertyName] = [bool]$p[$propertyName]
+                }
             }
-            else {
-                Write-Log 'Defender Real-Time Protection belum kembali ACTIVE setelah restoration.' 'ERROR'
-            }
+
+            Set-MpPreference @restoreMpPreference
+            $state.defender_restored = $true
+            Write-Log 'Microsoft Defender preferences restoration request berhasil.' 'OK'
         }
         catch {
-            Write-Log "GAGAL memulihkan Defender Real-Time Protection: $($_.Exception.Message)" 'ERROR'
-            Write-Log 'Operator harus memeriksa dan memulihkan Microsoft Defender secara manual.' 'ERROR'
+            Write-Log "GAGAL memulihkan Microsoft Defender preferences: $($_.Exception.Message)" 'ERROR'
         }
     }
-    elseif([bool]$securityState.defender_detected) {
-        Write-Log 'Defender terdeteksi tetapi tidak diubah oleh installer; tidak ada restoration yang diperlukan.' 'SECURITY'
+
+    if([bool]$state.firewall_changed -and $state.firewall_initial.Count -gt 0) {
+        Write-Log 'Memulihkan Windows Firewall profiles ke kondisi awal...' 'SECURITY'
+        try {
+            foreach($profile in @($state.firewall_initial)) {
+                $profileName = [string]$profile.name
+                $stateValue = if([bool]$profile.enabled) { 'on' } else { 'off' }
+                & netsh.exe advfirewall set $profileName state $stateValue 2>&1 | Out-String | Write-Log
+                if($LASTEXITCODE -ne 0) {
+                    throw "netsh gagal memulihkan Firewall profile $profileName. Exit code: $LASTEXITCODE"
+                }
+            }
+            Write-Log 'Windows Firewall restoration request berhasil.' 'OK'
+        }
+        catch {
+            Write-Log "GAGAL memulihkan Windows Firewall: $($_.Exception.Message)" 'ERROR'
+        }
     }
 
-    $securityState.restoration_completed = $true
-    $securityState.restoration_completed_at = (Get-Date).ToString('o')
+    if([bool]$state.smartscreen_changed) {
+        Write-Log 'Memulihkan SmartScreen registry policy ke kondisi awal...' 'SECURITY'
+        try {
+            $knownPaths = @(
+                'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer',
+                'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System',
+                'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppHost'
+            )
+            $knownNames = @('SmartScreenEnabled','EnableSmartScreen','EnableSmartScreenForApps','PreventOverrideForFilesInShell')
+
+            foreach($path in $knownPaths) {
+                foreach($name in $knownNames) {
+                    $key = "$path|$name"
+                    if($state.smartscreen_initial.Contains($key)) {
+                        if(-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
+                        $value = $state.smartscreen_initial[$key]
+                        $kind = if($name -eq 'SmartScreenEnabled') { 'String' } else { 'DWord' }
+                        New-ItemProperty -Path $path -Name $name -PropertyType $kind -Value $value -Force | Out-Null
+                    }
+                    else {
+                        if(Test-Path $path) { Remove-ItemProperty -Path $path -Name $name -Force -ErrorAction SilentlyContinue }
+                    }
+                }
+            }
+            Write-Log 'SmartScreen registry restoration request berhasil.' 'OK'
+        }
+        catch {
+            Write-Log "GAGAL memulihkan SmartScreen registry policy: $($_.Exception.Message)" 'ERROR'
+        }
+    }
+
+    try {
+        Start-Sleep -Seconds 2
+        $null = Get-EndpointSecurityStatus
+    }
+    catch {
+        Write-Log "Verifikasi akhir security restoration gagal: $($_.Exception.Message)" 'WARN'
+    }
+
+    $state.restoration_completed = $true
+    $state.restoration_completed_at = (Get-Date).ToString('o')
+    Save-State
+    Write-Log 'Proses restoration endpoint security selesai.' 'SECURITY'
+}
+
+function Invoke-SecurityPreflight {
+    Write-SecurityWarning
+
+    if($DryRun) {
+        Write-Log 'DryRun: security preflight hanya menampilkan peringatan; tidak ada security control yang diubah.' 'DRYRUN'
+        return
+    }
+
+    $securityStatus = Get-EndpointSecurityStatus
+    $script:State.security_state.operator_approval_requested = $true
+    $script:State.security_state.third_party_products = @($securityStatus.antivirus_products)
+    $script:State.security_state.firewall_profiles = @($securityStatus.firewall_profiles)
+    Save-State
+
+    $approval = Request-SecurityChangeApproval -SecurityStatus $securityStatus
+    $script:State.security_state.operator_approval_granted = [bool]$approval
+    Disable-EndpointSecurity -SecurityStatus $securityStatus
     Save-State
 }
 
 function Write-SecurityWarning {
     Write-Host ''
     Write-Host '============================================================' -ForegroundColor Yellow
-    Write-Host ' PERINGATAN KEAMANAN' -ForegroundColor Yellow
+    Write-Host ' PERINGATAN KEAMANAN v2.38' -ForegroundColor Yellow
     Write-Host '============================================================' -ForegroundColor Yellow
-    Write-Host 'install-requirements.ps1 ditujukan untuk VM/lab khusus BrebesKab-CSIRT-Tools.' -ForegroundColor Yellow
+    Write-Host 'install-requirements.ps1 ditujukan untuk VM/lab khusus pentest/hacking.' -ForegroundColor Yellow
     Write-Host 'JANGAN menjalankan installer ini pada workstation atau server production.' -ForegroundColor Red
     Write-Host ''
-    Write-Host 'Tool security dapat memicu Microsoft Defender, antivirus/EDR,' -ForegroundColor Yellow
-    Write-Host 'SmartScreen, firewall, atau application-control selama download/install/execute.' -ForegroundColor Yellow
+    Write-Host 'Setelah persetujuan operator, installer akan mencoba menonaktifkan' -ForegroundColor Red
+    Write-Host 'Microsoft Defender, Windows Firewall, dan SmartScreen sebelum' -ForegroundColor Red
+    Write-Host 'dependency/tool diinstall.' -ForegroundColor Red
     Write-Host ''
-    Write-Host 'Installer tidak menonaktifkan security control secara diam-diam.' -ForegroundColor Cyan
-    Write-Host 'Perubahan Defender hanya dilakukan setelah persetujuan operator dan' -ForegroundColor Cyan
-    Write-Host 'kondisi awal disimpan untuk restoration.' -ForegroundColor Cyan
+    Write-Host 'State awal disimpan dan dipulihkan setelah installer selesai' -ForegroundColor Yellow
+    Write-Host 'atau ketika terjadi error.' -ForegroundColor Yellow
     Write-Host ''
-    Write-Host 'Antivirus/EDR pihak ketiga, firewall, SmartScreen, dan application' -ForegroundColor Yellow
-    Write-Host 'control tidak dinonaktifkan otomatis karena restoration-nya bergantung' -ForegroundColor Yellow
-    Write-Host 'pada vendor/policy masing-masing.' -ForegroundColor Yellow
+    Write-Host 'AV/EDR pihak ketiga dideteksi dan dicatat; API vendor-specific' -ForegroundColor Yellow
+    Write-Host 'tidak dijalankan karena mekanisme disable/restore berbeda.' -ForegroundColor Yellow
     Write-Host '============================================================' -ForegroundColor Yellow
     Write-Host ''
 }
@@ -757,6 +1111,7 @@ function Install-WinGetPackage {
 
     if (Get-WinGetInstalled $Id) {
         Write-Log "$Name sudah terpasang: $Id" 'OK'
+        Add-ExistingComponent 'winget' $Name $Id '' ''
         return
     }
 
@@ -765,16 +1120,15 @@ function Install-WinGetPackage {
     }
 
     if ($DryRun) {
-        Write-Log "DryRun: install WinGet $Id (scope machine)" 'DRYRUN'
+        Write-Log "DryRun: install WinGet $Id (default package scope)" 'DRYRUN'
         return
     }
 
-    Write-Log "Install $Name via WinGet: $Id (scope machine)" 'STEP'
+    Write-Log "Install $Name via WinGet: $Id (default package scope)" 'STEP'
     & winget install `
         --id $Id `
         --exact `
         --source winget `
-        --scope machine `
         --silent `
         --accept-package-agreements `
         --accept-source-agreements
@@ -783,13 +1137,16 @@ function Install-WinGetPackage {
         throw "WinGet gagal menginstall $Id. Exit code: $LASTEXITCODE"
     }
 
+    # The package installation itself succeeded, so register it immediately.
+    # If a later verification step fails, rollback must still know that this
+    # component was created by the current run.
+    Add-InstalledComponent 'winget' $Name $Id '' ''
+
     Refresh-Path
 
     if (-not (Get-WinGetInstalled $Id)) {
         throw "Package tidak terdeteksi setelah install: $Id"
     }
-
-    Add-InstalledComponent 'winget' $Name $Id '' ''
     Write-Log "$Name berhasil diinstall." 'OK'
 }
 
@@ -973,6 +1330,7 @@ function Ensure-Java {
     $existing = Find-JavaExecutable
     if ($existing) {
         Write-Log "Java sudah tersedia: $existing" 'OK'
+        Add-ExistingComponent 'java' 'Java Runtime' 'Microsoft.OpenJDK.21' '' $existing
         $script:JavaReference = $existing
         return $existing
     }
@@ -989,19 +1347,35 @@ function Ensure-Java {
 
     Write-Log "Java Runtime tidak ditemukan. Menginstall Microsoft OpenJDK 21 via WinGet: $javaId" 'STEP'
 
-    # Do not force --scope machine. This follows the WinGet behavior that
-    # successfully installed Nmap on the current VM.
-    & winget install `
-        --id $javaId `
-        --exact `
-        --source winget `
-        --silent `
-        --accept-package-agreements `
-        --accept-source-agreements
+    # Capture WinGet output explicitly. In Windows PowerShell 5.1, native
+    # command output written directly with the call operator can leak into the
+    # function pipeline. That caused the caller's $javaPath variable to
+    # contain the complete WinGet transcript instead of only java.exe.
+    $wingetOutput = @(
+        & winget install `
+            --id $javaId `
+            --exact `
+            --source winget `
+            --silent `
+            --accept-package-agreements `
+            --accept-source-agreements 2>&1
+    )
+    $wingetExitCode = $LASTEXITCODE
 
-    if ($LASTEXITCODE -ne 0) {
-        throw "WinGet gagal menginstall Java Runtime $javaId. Exit code: $LASTEXITCODE"
+    foreach ($line in $wingetOutput) {
+        if ($null -ne $line) {
+            Write-Log ([string]$line) 'INFO'
+        }
     }
+
+    if ($wingetExitCode -ne 0) {
+        throw "WinGet gagal menginstall Java Runtime $javaId. Exit code: $wingetExitCode"
+    }
+
+    # WinGet completed the installation, so register it before executable
+    # discovery. This guarantees rollback can remove a package installed by
+    # this run even if the post-install executable check later fails.
+    Add-InstalledComponent 'winget' 'Java Runtime' $javaId '' ''
 
     Refresh-Path
     $installed = Find-JavaExecutable
@@ -1010,7 +1384,8 @@ function Ensure-Java {
     }
 
     $script:JavaReference = $installed
-    Add-InstalledComponent 'winget' 'Java Runtime' $javaId '' $installed
+    $script:State.installed_by_script[-1].path = $installed
+    Save-State
     Write-Log "Java Runtime berhasil diinstall: $installed" 'OK'
     return $installed
 }
@@ -2193,6 +2568,88 @@ function Install-ZAP {
     Write-Log "OWASP ZAP $version berhasil diinstall dan diverifikasi." 'OK'
 }
 
+function Find-WinGetLinkedExecutable {
+    <#
+        WinGet may expose a command through:
+        %LOCALAPPDATA%\\Microsoft\\WinGet\\Links\\<tool>.exe
+
+        On some Windows/WinGet combinations that Links entry is not directly
+        executable, or the package may expose the command directly from its
+        package directory without a Links entry. Resolve the real executable
+        from the corresponding WinGet package directory when available.
+
+        This is intentionally a fallback only. Normal executables and the
+        existing project-local tool paths are preferred first.
+    #>
+    param([Parameter(Mandatory=$true)][string]$Name)
+
+    # Elevated PowerShell can expose a different LOCALAPPDATA environment value.
+    # Resolve the interactive user's profile explicitly so WinGet user-scope
+    # packages remain discoverable after UAC elevation.
+    # Prefer the explicit LocalApplicationData captured before UAC.
+    # This is the authoritative path for the interactive user's user-scope
+    # WinGet packages and avoids relying on the elevated process environment.
+    $userLocalAppData = $OriginalUserLocalAppData
+    if([string]::IsNullOrWhiteSpace($userLocalAppData)){
+        $userProfile = $OriginalUserProfile
+        if([string]::IsNullOrWhiteSpace($userProfile)){
+            $userProfile = $env:USERPROFILE
+        }
+        if([string]::IsNullOrWhiteSpace($userProfile)){
+            $userProfile = [Environment]::GetFolderPath('UserProfile')
+        }
+        $userLocalAppData = Join-Path $userProfile 'AppData\Local'
+    }
+
+    $linksRoot = Join-Path $userLocalAppData 'Microsoft\WinGet\Links'
+    $packagesRoot = Join-Path $userLocalAppData 'Microsoft\WinGet\Packages'
+    $exeName = if($Name -match '\\.exe$'){ $Name } else { "$Name.exe" }
+
+    Write-Log "WinGet context untuk $Name`: UserProfile=$OriginalUserProfile; LocalAppData=$userLocalAppData; Packages=$packagesRoot" 'INFO'
+
+    if(-not (Test-Path $packagesRoot)){
+        Write-Log "WinGet Packages directory tidak ditemukan: $packagesRoot" 'WARN'
+        return $null
+    }
+
+    # The Links entry is optional. A WinGet package can be installed correctly
+    # while its command is exposed directly from the package directory instead
+    # of through %LOCALAPPDATA%\\Microsoft\\WinGet\\Links. Therefore do not
+    # require the Links shim to exist before resolving the real executable.
+    $linkPath = Join-Path $linksRoot $exeName
+
+    # Prefer a package directory whose name starts with the WinGet package ID.
+    # ffuf is the important current case, but the map is deliberately easy to
+    # extend for future WinGet Links based tools.
+    $packageId = switch($Name.ToLowerInvariant()){
+        'ffuf' { 'ffuf.ffuf' }
+        default { $null }
+    }
+
+    $packageDirs = @()
+    if($packageId){
+        $packageDirs = @(Get-ChildItem -Path $packagesRoot -Directory -Filter "$packageId*" -ErrorAction SilentlyContinue)
+    }
+
+    if($packageDirs.Count -eq 0){
+        # Last-resort bounded lookup: search only inside WinGet Packages, never
+        # the entire user profile or system drive.
+        $packageDirs = @(Get-ChildItem -Path $packagesRoot -Directory -ErrorAction SilentlyContinue)
+    }
+
+    foreach($dir in $packageDirs){
+        $matches = @(Get-ChildItem -Path $dir.FullName -File -Filter $exeName -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notlike ($linksRoot + '\\*') } |
+            Select-Object -First 1)
+
+        if($matches.Count -gt 0){
+            return $matches[0].FullName
+        }
+    }
+
+    return $null
+}
+
 function Find-ToolExecutable {
     param([string]$Name)
 
@@ -2276,40 +2733,10 @@ function Invoke-VersionCapture {
         [string[]]$Arguments=@()
     )
 
-    if(-not (Test-Path $FilePath)){
-        throw "Executable tidak ditemukan: $FilePath"
-    }
-
-    $stdoutFile = Join-Path $DownloadRoot ("version-" + [Guid]::NewGuid().ToString('N') + ".stdout")
-    $stderrFile = Join-Path $DownloadRoot ("version-" + [Guid]::NewGuid().ToString('N') + ".stderr")
-
-    try{
-        $argumentString = ($Arguments | ForEach-Object {
-            if($_ -match '[\s"]') { '"' + ($_.Replace('"','\"')) + '"' } else { $_ }
-        }) -join ' '
-
-        $process = Start-Process `
-            -FilePath $FilePath `
-            -ArgumentList $argumentString `
-            -RedirectStandardOutput $stdoutFile `
-            -RedirectStandardError $stderrFile `
-            -WindowStyle Hidden `
-            -Wait `
-            -PassThru `
-            -ErrorAction Stop
-
-        $stdout = if(Test-Path $stdoutFile){ Get-Content $stdoutFile -Raw -ErrorAction SilentlyContinue } else { '' }
-        $stderr = if(Test-Path $stderrFile){ Get-Content $stderrFile -Raw -ErrorAction SilentlyContinue } else { '' }
-
-        [pscustomobject]@{
-            ExitCode = $process.ExitCode
-            StdOut   = [string]$stdout
-            StdErr   = [string]$stderr
-        }
-    }
-    finally{
-        Remove-Item $stdoutFile,$stderrFile -Force -ErrorAction SilentlyContinue
-    }
+    # Verification uses the same direct native capture path as the other
+    # project CLI checks. WinGet Links shims are resolved to their real package
+    # executable by Find-ToolExecutable before this function is called.
+    return (Invoke-NativeCapture -FilePath $FilePath -Arguments $Arguments)
 }
 
 function Verify-Command {
@@ -2331,9 +2758,8 @@ function Verify-Command {
 
     Write-Log "VERIFY $Name -> $path"
 
-    # Use Start-Process redirection for CLI version checks. This keeps native
-    # stderr out of the Windows PowerShell error stream, eliminating the
-    # misleading NativeCommandError noise produced by some Go CLIs.
+    # Use the direct native capture path so WinGet Links shims such as ffuf.exe
+    # are verified the same way they are invoked successfully from PowerShell.
     $result = Invoke-VersionCapture -FilePath $path -Arguments $Arguments
     $output = Get-VerificationOutput $result
 
@@ -2518,7 +2944,6 @@ function Rollback {
                         & winget uninstall `
                             --id $c.id `
                             --exact `
-                            --scope machine `
                             --silent `
                             --accept-source-agreements `
                             2>&1 | Out-String | ForEach-Object {
@@ -2605,18 +3030,26 @@ try{
         -Force | Out-Null
 
     Write-Log '============================================================' 'STEP'
-    Write-Log 'BrebesKab-CSIRT-Tools install-requirements.ps1 v2.30' 'STEP'
+    Write-Log 'BrebesKab-CSIRT-Tools install-requirements.ps1 v2.41' 'STEP'
     Write-Log '============================================================' 'STEP'
+
+    if (Test-Administrator) {
+        Load-UacContext
+    }
 
     Request-Administrator
 
     if(-not(Test-Administrator)){
-        throw 'Installer v2.30 tidak berjalan sebagai Administrator setelah proses elevation.'
+        throw 'Installer v2.41 tidak berjalan sebagai Administrator setelah proses elevation.'
     }
 
     if(-not [Environment]::Is64BitOperatingSystem){
-        throw 'Installer v2.30 membutuhkan Windows 64-bit.'
+        throw 'Installer v2.41 membutuhkan Windows 64-bit.'
     }
+
+    # SECURITY PREFLIGHT MUST RUN BEFORE ANY SOFTWARE INSTALL/UPGRADE.
+    # This is the first stage after elevation and platform validation.
+    Invoke-SecurityPreflight
 
     if(-not(Find-Command 'winget')){
         throw 'WinGet tidak ditemukan. Install/update Microsoft App Installer terlebih dahulu.'
@@ -2630,6 +3063,12 @@ try{
         throw 'WinGet tidak dapat diverifikasi setelah proses upgrade.'
     }
     Write-Log "WinGet verified: $verifiedWingetVersion" 'OK'
+
+    # Java Runtime/JRE must be checked immediately after WinGet is verified,
+    # before the remaining toolchain installation begins.
+    Write-Log 'Memeriksa Java Runtime/JRE sebelum melanjutkan instalasi dependency lain...' 'STEP'
+    $javaPath = Ensure-Java
+    Refresh-Path
 
     foreach($p in $WinGetPackages){
         Install-WinGetPackage $p.Name $p.Id
@@ -2663,9 +3102,6 @@ try{
     Refresh-Path
 
     Install-Wordlists
-
-    $javaPath = Ensure-Java
-    Refresh-Path
 
     Install-ZAP
 
@@ -2745,5 +3181,9 @@ finally {
     }
     catch {
         Write-Log "Security restoration handler gagal: $($_.Exception.Message)" 'ERROR'
+    }
+
+    if (Test-Administrator) {
+        Remove-UacContext
     }
 }
