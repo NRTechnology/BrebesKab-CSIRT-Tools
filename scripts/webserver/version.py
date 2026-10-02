@@ -44,7 +44,7 @@ from urllib3.exceptions import InsecureRequestWarning
 # Version / schema
 # ---------------------------------------------------------------------------
 APP_NAME = "BrebesKab-CSIRT-Tools version.py"
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 SCHEMA_VERSION = "1.3"
 CHECKLIST_ID = "4-001"
 CHECKLIST_NAME = "Server version disclosure"
@@ -1391,6 +1391,41 @@ def analyze_cmd(
         print(f"FILE                     : {path}")
         for key, value in ws["evidence"].items():
             print(f"{key.upper():24} : {repo_root / value}")
+    except Exception as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        raise typer.Exit(code=1)
+
+
+@app.command("status")
+def status_cmd() -> None:
+    try:
+        repo_root = discover_repo_root()
+        project_id = discover_project_id(repo_root)
+        path = artifact_file(repo_root, project_id)
+
+        if not path.exists():
+            print(f"[ERROR] Artifact belum ada: {path}", file=sys.stderr)
+            raise typer.Exit(code=1)
+
+        data = load_yaml(path)
+        ws = data.get("webserver_version", {})
+        assessment = ws.get("assessment", {})
+        probe = ws.get("probe", {})
+        cve = ws.get("cve_correlation", {})
+
+        print(f"PROJECT ID        : {project_id}")
+        print(f"STATUS             : {ws.get('status', 'unknown')}")
+        print(f"TARGET             : {ws.get('hostname', '')}")
+        print(f"4-001 RESULT       : {assessment.get('result', 'not-analyzed')}")
+        print(f"OBSERVED           : {assessment.get('disclosure_observations', 0)}")
+        print(f"VERSIONS           : {assessment.get('disclosed_versions', 0)}")
+        print(f"CVE CANDIDATES     : {assessment.get('cve_candidates', 0)}")
+        print(f"REQUIRES REVIEW    : {int(bool(assessment.get('requires_review')))}")
+        print(f"HTTP/S PROBES      : {len(probe.get('targets') or [])}")
+        print(f"CVE STATUS         : {cve.get('status', 'not-run')}")
+        print(f"FILE               : {path}")
+    except typer.Exit:
+        raise
     except Exception as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         raise typer.Exit(code=1)
