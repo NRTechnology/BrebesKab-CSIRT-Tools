@@ -34,6 +34,7 @@ import argparse
 import datetime as dt
 import json
 import math
+import re
 import os
 import secrets
 import shutil
@@ -86,7 +87,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2.1.6"
+SCRIPT_VERSION = "2.1.7"
 SCHEMA_VERSION = "2.0"
 CHECKLIST_ID = "2-006"
 CHECKLIST_NAME = "Directory discovery"
@@ -1730,7 +1731,6 @@ def _build_gobuster_command(
         "--timeout",
         f"{timeout}s",
         "-q",
-        "-n",
     ]
 
     if extensions:
