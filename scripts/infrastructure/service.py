@@ -3,7 +3,7 @@
 BrebesKab-CSIRT-Tools
 Infrastructure - Service Enumeration
 
-Version: 1.0.0
+Version: 1.0.1
 
 Checklist mapping:
     3-002 - Service enumeration

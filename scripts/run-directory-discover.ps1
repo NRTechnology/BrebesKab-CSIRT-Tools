@@ -22,8 +22,9 @@ $Timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $StdoutLog = Join-Path $LogDir "directory-discover-$Timestamp.log"
 $StderrLog = Join-Path $LogDir "directory-discover-$Timestamp-error.log"
 
+# Quote the Python script path so paths containing spaces are handled correctly.
 $Arguments = @(
-    $Script
+    "`"$Script`""
     "discover"
     "--wordlist-id"
     "common"
@@ -44,9 +45,18 @@ $Process.Id | Set-Content $PidFile -Encoding ascii
 
 Write-Host ""
 Write-Host "Directory discovery started."
-Write-Host "PID    : $($Process.Id)"
+Write-Host "PID     : $($Process.Id)"
 Write-Host "Wordlist: common"
-Write-Host "Budget : 28512 requests"
-Write-Host "Log    : $StdoutLog"
-Write-Host "Error  : $StderrLog"
+Write-Host "Budget  : 28512 requests"
+Write-Host "Log     : $StdoutLog"
+Write-Host "Error   : $StderrLog"
+Write-Host ""
+Write-Host "Monitor PID:"
+Write-Host "  Get-Process -Id $($Process.Id)"
+Write-Host ""
+Write-Host "Follow log:"
+Write-Host "  Get-Content `"$StdoutLog`" -Wait"
+Write-Host ""
+Write-Host "Follow error log:"
+Write-Host "  Get-Content `"$StderrLog`" -Wait"
 Write-Host ""
