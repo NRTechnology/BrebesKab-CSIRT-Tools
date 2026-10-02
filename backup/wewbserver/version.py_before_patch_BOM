@@ -44,7 +44,7 @@ from urllib3.exceptions import InsecureRequestWarning
 # Version / schema
 # ---------------------------------------------------------------------------
 APP_NAME = "BrebesKab-CSIRT-Tools version.py"
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.3"
 SCHEMA_VERSION = "1.3"
 CHECKLIST_ID = "4-001"
 CHECKLIST_NAME = "Server version disclosure"
@@ -108,7 +108,7 @@ def sha256_file(path: Path) -> str:
 def atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(content, encoding="utf-8", newline="\n")
+    tmp.write_text(content, encoding="utf-8")
     tmp.replace(path)
 
 
@@ -1272,11 +1272,11 @@ def analyze_project(repo_root: Path, project_id: str, no_cve: bool, max_cves: in
     for scheme in ("http", "https"):
         probe_entries = [x for x in all_probes if x["url"].startswith(f"{scheme}://")]
         path = evidence / f"{scheme}-headers.json"
-        atomic_write_text(path, json.dumps(probe_entries, indent=2, ensure_ascii=False) + "\n")
+        atomic_write_text(path, json.dumps(probe_entries, indent=2, ensure_ascii=False))
         evidence_paths[f"{scheme}_headers"] = str(path.relative_to(repo_root)).replace("\\", "/")
     curl_path_file = evidence / "curl-version.txt"
     curl_details = detect_toolchain()["curl"]
-    atomic_write_text(curl_path_file, json.dumps({"toolchain": curl_details, "results": curl_results}, indent=2, ensure_ascii=False) + "\n")
+    atomic_write_text(curl_path_file, json.dumps({"toolchain": curl_details, "results": curl_results}, indent=2, ensure_ascii=False))
     evidence_paths["curl_version"] = str(curl_path_file.relative_to(repo_root)).replace("\\", "/")
     cve_path = evidence / "cve-correlation.json"
     cve_json = {
@@ -1285,7 +1285,7 @@ def analyze_project(repo_root: Path, project_id: str, no_cve: bool, max_cves: in
         "api_key_used": bool(nvd_api_key),
         "products": cve_products,
     }
-    atomic_write_text(cve_path, json.dumps(cve_json, indent=2, ensure_ascii=False) + "\n")
+    atomic_write_text(cve_path, json.dumps(cve_json, indent=2, ensure_ascii=False))
     evidence_paths["cve_correlation"] = str(cve_path.relative_to(repo_root)).replace("\\", "/")
 
     completed = now_iso()
