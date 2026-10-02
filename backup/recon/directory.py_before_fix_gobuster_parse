@@ -2332,14 +2332,6 @@ def _parse_gobuster_results(
                 status_text
             )
 
-            redirect_location = ""
-            redirect_match = re.search(
-                r"\[-->\s*(.*?)\]",
-                after_status,
-            )
-            if redirect_match:
-                redirect_location = redirect_match.group(1).strip()
-
             content_length: int | None = None
 
             if "[Size:" in after_status:
@@ -2380,7 +2372,7 @@ def _parse_gobuster_results(
             "content_type": "",
             "words": None,
             "lines": None,
-            "redirect_location": redirect_location,
+            "redirect_location": "",
             "source": "gobuster",
             "tool": "gobuster",
             "input_word": path.strip("/"),

@@ -1,21 +1,20 @@
-$ErrorActionPreference = "Stop"
-
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $Python      = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 $Script      = Join-Path $ProjectRoot "scripts\reconnaissance\directory.py"
 $LogDir      = Join-Path $ProjectRoot ".runtime\logs"
 $PidFile     = Join-Path $LogDir "directory-discover.pid"
 
-if (-not (Test-Path $Python)) {
-    throw "Python venv tidak ditemukan: $Python"
-}
+New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
-if (-not (Test-Path $Script)) {
-    throw "directory.py tidak ditemukan: $Script"
-}
+if (Test-Path $PidFile) {
+    $ExistingPid = Get-Content $PidFile -ErrorAction SilentlyContinue
 
-if (-not (Test-Path $LogDir)) {
-    New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+    if ($ExistingPid -and (Get-Process -Id $ExistingPid -ErrorAction SilentlyContinue)) {
+        Write-Host "Directory discovery masih berjalan. PID: $ExistingPid"
+        exit 1
+    }
+
+    Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
 }
 
 $Timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
@@ -26,6 +25,10 @@ $StderrLog = Join-Path $LogDir "directory-discover-$Timestamp-error.log"
 $Arguments = @(
     $Script
     "discover"
+    "--wordlist-id"
+    "common"
+    "--max-requests"
+    "28512"
 )
 
 $Process = Start-Process `
@@ -37,18 +40,13 @@ $Process = Start-Process `
     -WindowStyle Hidden `
     -PassThru
 
-$Process.Id | Set-Content -Path $PidFile -Encoding ASCII
+$Process.Id | Set-Content $PidFile -Encoding ascii
 
 Write-Host ""
-Write-Host "[PASS] Directory discovery dijalankan di background."
+Write-Host "Directory discovery started."
 Write-Host "PID    : $($Process.Id)"
-Write-Host "LOG    : $StdoutLog"
-Write-Host "ERROR  : $StderrLog"
-Write-Host "PIDFILE: $PidFile"
-Write-Host ""
-Write-Host "Monitor:"
-Write-Host "  Get-Content '$StdoutLog' -Wait"
-Write-Host ""
-Write-Host "Check process:"
-Write-Host "  Get-Process -Id $($Process.Id)"
+Write-Host "Wordlist: common"
+Write-Host "Budget : 28512 requests"
+Write-Host "Log    : $StdoutLog"
+Write-Host "Error  : $StderrLog"
 Write-Host ""
