@@ -85,7 +85,7 @@ except ImportError:
         record_activity = None
 
 
-SCRIPT_VERSION = "1.3.2"
+SCRIPT_VERSION = "1.3.1"
 SCHEMA_VERSION = "1.3.1"
 CHECKLIST_ID = "2-004"
 CHECKLIST_NAME = "Subdomain discovery"
@@ -456,7 +456,7 @@ def certificate_transparency(
             params=params,
             timeout=timeout,
             headers={
-                "User-Agent": "BrebesKab-CSIRT-Tools/1.3.2",
+                "User-Agent": "BrebesKab-CSIRT-Tools/1.3",
                 "Accept": "application/json",
             },
         )
@@ -1257,14 +1257,12 @@ def verify() -> int:
             f"{actual_status} != {expected_status}"
         )
 
-    # `partial` is a valid, explicitly recorded discovery outcome when at
-    # least one configured method completed and another failed. Verification
-    # validates artifact integrity without falsely upgrading the discovery
-    # status to `completed`.
-    if expected_status == DISCOVERY_STATUS_FAILED:
+    # A failed source means the overall discovery is partial. Therefore
+    # verify does not mark the checklist fully completed.
+    if expected_status != DISCOVERY_STATUS_COMPLETED:
         errors.append(
-            "Tidak ada discovery source yang berhasil; "
-            "hasil discovery tidak dapat diverifikasi."
+            "Hasil belum metodologis lengkap: "
+            f"status discovery adalah {expected_status}."
         )
 
     environment = block.get("dns_environment")
@@ -1391,15 +1389,12 @@ def verify() -> int:
 
         return 1
 
-    # Preserve the actual discovery lifecycle status. Verification confirms
-    # artifact/data integrity; it must not upgrade a partial discovery to
-    # completed merely because the artifact is internally consistent.
-    block["status"] = expected_status
+    block["status"] = DISCOVERY_STATUS_COMPLETED
     data["updated_at"] = now_iso()
     update_document(data)
 
-    print("[PASS] Subdomain Discovery memenuhi validasi artifact.")
-    print(f"[PASS] Status discovery: {expected_status}")
+    print("[PASS] Subdomain Discovery memenuhi validasi.")
+    print("[PASS] Status: completed")
     print(f"PROJECT: {data['project_id']}")
     print(f"DOMAIN : {block['domain']}")
     print(
@@ -1407,31 +1402,11 @@ def verify() -> int:
         "verifikasi terhadap scope sebelum testing."
     )
 
-    if expected_status == DISCOVERY_STATUS_PARTIAL:
-        print("[WARN] Discovery berstatus partial.")
-        print(
-            "[WARN] Tidak semua discovery source berhasil; "
-            "hasil dari source yang berhasil tetap dipertahankan."
-        )
-
-        for method in failed_methods:
-            print(
-                "       Failed: "
-                f"{method.get('id', '-')}: "
-                f"{method.get('name', '-')}"
-            )
-
-        record(
-            "2-004",
-            "Subdomain discovery artifact verified; discovery remains partial",
-            "in-progress",
-        )
-    else:
-        record(
-            "2-004",
-            "Subdomain discovery verified",
-            "completed",
-        )
+    record(
+        "2-004",
+        "Subdomain discovery verified",
+        "completed",
+    )
 
     return 0
 
