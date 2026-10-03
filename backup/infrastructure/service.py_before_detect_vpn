@@ -45,7 +45,6 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import shutil
-import socket
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -87,7 +86,7 @@ except ImportError as exc:
 # Constants
 # ---------------------------------------------------------------------------
 
-SCRIPT_VERSION = "1.0.2"
+SCRIPT_VERSION = "1.0.1"
 SCHEMA_VERSION = "1.0"
 
 CHECKLIST_ID = "3-002"
@@ -513,7 +512,7 @@ def intersect_with_recon_ports(
 
 
 # ---------------------------------------------------------------------------
-# Nmap / network path selection
+# Nmap
 # ---------------------------------------------------------------------------
 
 def find_nmap() -> str:
@@ -534,212 +533,35 @@ def find_nmap() -> str:
     )
 
 
-def detect_local_route(target_ip: str) -> str:
-    """
-    Ask the operating system which local address would be used to reach target.
-
-    A UDP connect does not send application data; it is only used to let the OS
-    select the route/local address. This is useful when VPN software changes the
-    default route dynamically.
-    """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(2)
-    try:
-        sock.connect((target_ip, 443))
-        local_ip = str(sock.getsockname()[0]).strip()
-    except OSError:
-        local_ip = ""
-    finally:
-        sock.close()
-
-    return local_ip
-
-
-def nmap_iflist(nmap_path: str) -> list[dict[str, str]]:
-    """
-    Read Nmap's interface inventory.
-
-    The parser keeps the Nmap interface name, its local IP and WINDEVICE.
-    An interface with WINDEVICE=<none> is not considered pcap-usable on Windows.
-    """
-    try:
-        completed = subprocess.run(
-            [nmap_path, "--iflist"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return []
-
-    lines = completed.stdout.splitlines()
-    interfaces: dict[str, dict[str, str]] = {}
-
-    section = ""
-    for raw_line in lines:
-        line = raw_line.strip()
-
-        if line == "************************INTERFACES************************":
-            section = "interfaces"
-            continue
-
-        if line == "**************************ROUTES**************************":
-            break
-
-        if not line:
-            continue
-
-        if section == "interfaces":
-            if line.startswith("DEV  (SHORT)") or line.startswith("DEV    WINDEVICE"):
-                continue
-
-            # Interface table:
-            # eth1 (eth1) 15.0.14.5/24 ethernet up 1500 MAC
-            parts = line.split()
-            if len(parts) >= 4 and parts[0] != "DEV":
-                dev = parts[0]
-                ip = parts[2].split("/", 1)[0]
-                interfaces.setdefault(
-                    dev,
-                    {
-                        "dev": dev,
-                        "ip": "",
-                        "windevice": "",
-                    },
-                )
-                if ip and ip not in {"<none>"}:
-                    interfaces[dev]["ip"] = ip
-                continue
-
-            # Windows/Npcap table:
-            # eth1 \\Device\\NPF_{...}
-            if len(parts) >= 2:
-                dev = parts[0]
-                windev = parts[1]
-                interfaces.setdefault(
-                    dev,
-                    {
-                        "dev": dev,
-                        "ip": "",
-                        "windevice": "",
-                    },
-                )
-                interfaces[dev]["windevice"] = windev
-
-    return list(interfaces.values())
-
-
-def choose_nmap_network_path(target_ip: str) -> dict[str, str]:
-    """
-    Select the safest Nmap execution path for the current OS/routing state.
-
-    Preferred:
-      1. Detect the OS-selected local IP for the target.
-      2. If Nmap exposes that interface through Npcap, use '-e <dev>'.
-      3. If the route is through a VPN/DCO interface that Nmap reports without
-         a usable WINDEVICE on Windows, use '--unprivileged -sT'. This lets the
-         Windows TCP stack select the VPN route instead of forcing a nonexistent
-         pcap adapter.
-
-    The function never guesses a different interface merely because it exists.
-    """
-    nmap_path = find_nmap()
-    local_ip = detect_local_route(target_ip)
-    interfaces = nmap_iflist(nmap_path)
-
-    usable = [
-        item
-        for item in interfaces
-        if item.get("windevice")
-        and item["windevice"].lower() != "<none>"
-    ]
-
-    matching = [
-        item
-        for item in usable
-        if local_ip and item.get("ip") == local_ip
-    ]
-
-    if matching:
-        return {
-            "mode": "interface",
-            "interface": matching[0]["dev"],
-            "local_ip": local_ip,
-            "selection": "os-route-local-ip",
-        }
-
-    # On Windows, VPN adapters such as OpenVPN DCO can own the route while
-    # Npcap does not expose a matching WINDEVICE. Do not force another adapter.
-    if sys.platform.startswith("win"):
-        return {
-            "mode": "unprivileged",
-            "interface": "",
-            "local_ip": local_ip,
-            "selection": "os-route-vpn-or-non-pcap",
-        }
-
-    if usable and local_ip:
-        return {
-            "mode": "unprivileged",
-            "interface": "",
-            "local_ip": local_ip,
-            "selection": "os-route-no-pcap-match",
-        }
-
-    raise ServiceEnumerationError(
-        "Tidak dapat menentukan network path yang aman untuk Nmap. "
-        f"Local IP ke target: {local_ip or '-'}; "
-        "Nmap tidak menyediakan interface pcap yang cocok."
-    )
-
-
 def build_nmap_command(
     target_ip: str,
     ports: list[int],
     output_file: Path,
-) -> tuple[list[str], dict[str, str]]:
+) -> list[str]:
     port_spec = ",".join(str(port) for port in ports)
-    path = choose_nmap_network_path(target_ip)
 
-    command = [
+    return [
         find_nmap(),
         "-Pn",
         "-sV",
         "--version-light",
         "--reason",
+        "-p",
+        port_spec,
+        "-oX",
+        str(output_file),
+        target_ip,
     ]
-
-    if path["mode"] == "interface":
-        command.extend(["-e", path["interface"]])
-    else:
-        # Connect scan does not require raw packet/pcap access. This is the
-        # safe fallback for Windows VPN/DCO routes that Npcap cannot expose.
-        command.extend(["-sT", "--unprivileged"])
-
-    command.extend(
-        [
-            "-p",
-            port_spec,
-            "-oX",
-            str(output_file),
-            target_ip,
-        ]
-    )
-
-    return command, path
 
 
 def run_nmap(
     target_ip: str,
     ports: list[int],
-) -> tuple[list[str], str, str, dict[str, str]]:
+) -> tuple[list[str], str, str]:
     evidence = nmap_evidence_file()
     evidence.parent.mkdir(parents=True, exist_ok=True)
 
-    command, path = build_nmap_command(target_ip, ports, evidence)
+    command = build_nmap_command(target_ip, ports, evidence)
 
     try:
         completed = subprocess.run(
@@ -772,7 +594,7 @@ def run_nmap(
             "Nmap selesai tetapi file XML evidence tidak dibuat."
         )
 
-    return command, completed.stdout.strip(), completed.stderr.strip(), path
+    return command, completed.stdout.strip(), completed.stderr.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -919,12 +741,6 @@ def empty_document(
                 "completed_at": "",
                 "exit_code": None,
                 "evidence": "",
-                "network_path": {
-                    "mode": "",
-                    "interface": "",
-                    "local_ip": "",
-                    "selection": "",
-                },
             },
             "results": [],
             "summary": {
@@ -1101,7 +917,7 @@ def cmd_enumerate() -> int:
     started_at = now_iso()
 
     try:
-        command, stdout, stderr, network_path = run_nmap(
+        command, stdout, stderr = run_nmap(
             target["target_ip"],
             ports_to_enumerate,
         )
@@ -1128,7 +944,6 @@ def cmd_enumerate() -> int:
             "evidence": str(
                 nmap_evidence_file().relative_to(project_root())
             ),
-            "network_path": network_path,
         }
         service["results"] = results
         service["summary"] = {
@@ -1150,18 +965,6 @@ def cmd_enumerate() -> int:
             )
         if stderr:
             service["notes"] += " Nmap menghasilkan diagnostic stderr."
-
-        if network_path["mode"] == "unprivileged":
-            service["notes"] += (
-                " Network path dipilih otomatis melalui OS routing; "
-                "Nmap menggunakan TCP connect scan (--unprivileged) karena "
-                "interface route tidak tersedia sebagai Npcap WINDEVICE."
-            )
-        else:
-            service["notes"] += (
-                f" Interface Nmap dipilih otomatis: {network_path['interface']} "
-                f"(local IP {network_path['local_ip']})."
-            )
 
         service["enumerated_at"] = completed_at
         save_yaml(service_file(), data)
@@ -1196,12 +999,6 @@ def cmd_enumerate() -> int:
                 if nmap_evidence_file().exists()
                 else ""
             ),
-            "network_path": {
-                "mode": "",
-                "interface": "",
-                "local_ip": "",
-                "selection": "",
-            },
         }
         service["notes"] = f"Service enumeration gagal: {exc}"
         service["enumerated_at"] = now_iso()
