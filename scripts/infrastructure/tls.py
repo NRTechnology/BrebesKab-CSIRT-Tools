@@ -3,7 +3,7 @@
 BrebesKab-CSIRT-Tools
 Infrastructure - TLS Protocol & Cipher Assessment
 
-Version: 1.0.2
+Version: 1.0.3
 Schema: 1.2
 
 Checklist mapping:
@@ -632,6 +632,154 @@ def ensure_nmap() -> tuple[str, str]:
     return executable, version
 
 
+def detect_local_route(target_ip: str) -> str:
+    """
+    Ask the operating system which local address would be used to reach target.
+
+    A UDP connect does not send application data; it only lets the OS select
+    the route/local address. This mirrors service.py so VPN/DCO routing is
+    respected instead of guessing an interface.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(2)
+    try:
+        sock.connect((target_ip, TARGET_PORT))
+        local_ip = str(sock.getsockname()[0]).strip()
+    except OSError:
+        local_ip = ""
+    finally:
+        sock.close()
+
+    return local_ip
+
+
+def nmap_iflist(nmap_path: str) -> list[dict[str, str]]:
+    """
+    Read Nmap's interface inventory and retain the Nmap device/IP mapping.
+    An interface with WINDEVICE=<none> is not pcap-usable on Windows.
+    """
+    try:
+        completed = subprocess.run(
+            [nmap_path, "--iflist"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+
+    lines = completed.stdout.splitlines()
+    interfaces: dict[str, dict[str, str]] = {}
+
+    section = ""
+    for raw_line in lines:
+        line = raw_line.strip()
+
+        if line == "************************INTERFACES************************":
+            section = "interfaces"
+            continue
+
+        if line == "**************************ROUTES**************************":
+            break
+
+        if not line or section != "interfaces":
+            continue
+
+        if line.startswith("DEV  (SHORT)") or line.startswith("DEV    WINDEVICE"):
+            continue
+
+        parts = line.split()
+
+        # Interface table:
+        # eth1 (eth1) 15.0.14.5/24 ethernet up 1500 MAC
+        if len(parts) >= 4 and parts[0] != "DEV":
+            dev = parts[0]
+            ip = parts[2].split("/", 1)[0]
+            interfaces.setdefault(
+                dev,
+                {"dev": dev, "ip": "", "windevice": ""},
+            )
+            if ip and ip not in {"<none>"}:
+                interfaces[dev]["ip"] = ip
+            continue
+
+        # Windows/Npcap table:
+        # eth1 \\Device\\NPF_{...}
+        if len(parts) >= 2:
+            dev = parts[0]
+            windev = parts[1]
+            interfaces.setdefault(
+                dev,
+                {"dev": dev, "ip": "", "windevice": ""},
+            )
+            interfaces[dev]["windevice"] = windev
+
+    return list(interfaces.values())
+
+
+def choose_nmap_network_path(
+    target_ip: str,
+    nmap_path: str,
+) -> dict[str, str]:
+    """
+    Select the Nmap path using the same routing model as service.py.
+
+    1. Ask the OS which local IP routes to the target.
+    2. If that IP maps to a usable Npcap WINDEVICE, use '-e <interface>'.
+    3. On Windows, if the OS route has no matching Npcap device (for example
+       a VPN/DCO route), use TCP connect scan with '--unprivileged'.
+    4. Never guess another interface merely because it is available.
+    """
+    local_ip = detect_local_route(target_ip)
+    interfaces = nmap_iflist(nmap_path)
+
+    usable = [
+        item
+        for item in interfaces
+        if item.get("windevice")
+        and item["windevice"].lower() != "<none>"
+    ]
+
+    matching = [
+        item
+        for item in usable
+        if local_ip and item.get("ip") == local_ip
+    ]
+
+    if matching:
+        return {
+            "mode": "interface",
+            "interface": matching[0]["dev"],
+            "local_ip": local_ip,
+            "selection": "os-route-local-ip",
+        }
+
+    if sys.platform.startswith("win"):
+        return {
+            "mode": "unprivileged",
+            "interface": "",
+            "local_ip": local_ip,
+            "selection": "os-route-vpn-or-non-pcap",
+        }
+
+    if usable and local_ip:
+        return {
+            "mode": "unprivileged",
+            "interface": "",
+            "local_ip": local_ip,
+            "selection": "os-route-no-pcap-match",
+        }
+
+    raise TLSError(
+        "Tidak dapat menentukan network path yang aman untuk Nmap TLS. "
+        f"Local IP ke target: {local_ip or '-'}; "
+        "Nmap tidak menyediakan interface pcap yang cocok."
+    )
+
+
 def discover_openssl() -> tuple[str, str]:
     # The installer updates the User PATH. A PowerShell parent process that
     # launched the elevated installer does not automatically inherit that
@@ -679,115 +827,12 @@ def discover_openssl() -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 
-def detect_local_route(target: str) -> str:
-    """Ask the OS which local IPv4 address is selected for the target."""
-    try:
-        target_ip = socket.gethostbyname(target)
-    except OSError:
-        target_ip = target
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(2)
-    try:
-        sock.connect((target_ip, TARGET_PORT))
-        return str(sock.getsockname()[0]).strip()
-    except OSError:
-        return ""
-    finally:
-        sock.close()
-
-
-def nmap_iflist(nmap_path: str) -> list[dict[str, str]]:
-    """Read Nmap interface inventory and Windows Npcap WINDEVICE mappings."""
-    try:
-        completed = subprocess.run(
-            [nmap_path, "--iflist"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return []
-
-    interfaces: dict[str, dict[str, str]] = {}
-    section = ""
-    for raw_line in completed.stdout.splitlines():
-        line = raw_line.strip()
-        if line == "************************INTERFACES************************":
-            section = "interfaces"
-            continue
-        if line == "**************************ROUTES**************************":
-            break
-        if not line or section != "interfaces":
-            continue
-        if line.startswith("DEV  (SHORT)") or line.startswith("DEV    WINDEVICE"):
-            continue
-
-        parts = line.split()
-        if len(parts) >= 4 and parts[0] != "DEV":
-            dev = parts[0]
-            ip = parts[2].split("/", 1)[0]
-            interfaces.setdefault(dev, {"dev": dev, "ip": "", "windevice": ""})
-            if ip and ip != "<none>":
-                interfaces[dev]["ip"] = ip
-            continue
-
-        if len(parts) >= 2:
-            dev = parts[0]
-            interfaces.setdefault(dev, {"dev": dev, "ip": "", "windevice": ""})
-            interfaces[dev]["windevice"] = parts[1]
-
-    return list(interfaces.values())
-
-
-def choose_nmap_network_path(target: str) -> dict[str, str]:
-    """Choose an Nmap interface from the OS-selected route, with VPN fallback."""
-    nmap_path = find_nmap()
-    local_ip = detect_local_route(target)
-    interfaces = nmap_iflist(nmap_path)
-
-    usable = [
-        item for item in interfaces
-        if item.get("windevice") and item["windevice"].lower() != "<none>"
-    ]
-    matching = [item for item in usable if local_ip and item.get("ip") == local_ip]
-
-    if matching:
-        return {
-            "mode": "interface",
-            "interface": matching[0]["dev"],
-            "local_ip": local_ip,
-            "selection": "os-route-local-ip",
-        }
-
-    if sys.platform.startswith("win"):
-        return {
-            "mode": "unprivileged",
-            "interface": "",
-            "local_ip": local_ip,
-            "selection": "os-route-vpn-or-non-pcap",
-        }
-
-    if local_ip:
-        return {
-            "mode": "unprivileged",
-            "interface": "",
-            "local_ip": local_ip,
-            "selection": "os-route-no-pcap-match",
-        }
-
-    raise TLSError(
-        "Tidak dapat menentukan network path yang aman untuk Nmap TLS. "
-        f"Local IP ke target: {local_ip or '-'}; Nmap tidak menyediakan interface pcap yang cocok."
-    )
-
-
-def run_nmap_tls_probe(hostname: str) -> dict[str, Any]:
+def run_nmap_tls_probe(
+    hostname: str,
+    target_ip: str,
+) -> dict[str, Any]:
     executable, version = ensure_nmap()
-    network_path = choose_nmap_network_path(hostname)
+    network_path = choose_nmap_network_path(target_ip, executable)
 
     command = [
         executable,
@@ -797,23 +842,27 @@ def run_nmap_tls_probe(hostname: str) -> dict[str, Any]:
     if network_path["mode"] == "interface":
         command.extend(["-e", network_path["interface"]])
     else:
+        # Same fallback used by service.py for Windows VPN/DCO routes where
+        # Npcap does not expose the OS-selected route as a usable device.
         command.extend(["-sT", "--unprivileged"])
 
-    command.extend([
-        "-p",
-        str(TARGET_PORT),
-        "--script",
-        "ssl-enum-ciphers",
-        "--script-args",
-        f"tls.servername={hostname}",
-        "--script-timeout",
-        "90s",
-        "--host-timeout",
-        "120s",
-        "-oX",
-        "-",
-        hostname,
-    ])
+    command.extend(
+        [
+            "-p",
+            str(TARGET_PORT),
+            "--script",
+            "ssl-enum-ciphers",
+            "--script-args",
+            f"tls.servername={hostname}",
+            "--script-timeout",
+            "90s",
+            "--host-timeout",
+            "120s",
+            "-oX",
+            "-",
+            hostname,
+        ]
+    )
 
     started = dt.datetime.now().astimezone()
     try:
@@ -1593,7 +1642,15 @@ def build_document(
         "timed_out": nmap_result["timed_out"],
         "xml_sha256": xml_hash,
         "stderr_sha256": stderr_hash,
-        "network_path": nmap_result.get("network_path", {}),
+        "network_path": nmap_result.get(
+            "network_path",
+            {
+                "mode": "",
+                "interface": "",
+                "local_ip": "",
+                "selection": "",
+            },
+        ),
     }
     tls["protocols"] = normalized_protocols
     tls["ciphers"] = normalized_ciphers
@@ -1649,7 +1706,7 @@ def cmd_analyze() -> int:
     print(f"[INFO] TLS probe target: {target['hostname']}:{TARGET_PORT}")
     print("[INFO] Primary tool: Nmap NSE ssl-enum-ciphers")
 
-    nmap_result = run_nmap_tls_probe(target["hostname"])
+    nmap_result = run_nmap_tls_probe(target["hostname"], target["ipv4"][0])
     if nmap_result.get("returncode") not in (0, None):
         # Nmap can still provide valid NSE evidence with a non-zero return code,
         # but retain the condition explicitly in YAML. Parsing decides whether
