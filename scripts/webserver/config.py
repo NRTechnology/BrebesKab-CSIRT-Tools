@@ -28,7 +28,7 @@ import typer
 import yaml
 
 APP_NAME = "BrebesKab-CSIRT-Tools config.py"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 SCHEMA_VERSION = "1.0"
 CHECKLIST_ID = "4-005"
 CHECKLIST_NAME = "Web server configuration exposure"
@@ -100,6 +100,36 @@ CONFIG_CONTENT_MARKERS = (
     "php_admin_value",
     "<configuration",
     "[database]",
+)
+
+# Indicators of externally exposed application/framework error information.
+# These are deliberately conservative: a generic 404 page is not classified as
+# an error-information disclosure unless one or more strong indicators are
+# present in the response body.
+ERROR_INFO_PATTERNS = (
+    ("framework_exception", re.compile(
+        r"(?i)(?:exception|error)\s*(?:class|type)?\s*[:=]?\s*"
+        r"(?:CodeIgniter|Laravel|Symfony|CakePHP|Yii|Slim)"
+    )),
+    ("codeigniter_exception", re.compile(
+        r"(?i)\b(?:CodeIgniter\\)?(?:\w+Exception|PageNotFoundException)\b"
+    )),
+    ("stack_trace", re.compile(
+        r"(?i)\b(?:stack trace|stacktrace|traceback|exception trace)\b"
+    )),
+    ("filesystem_path", re.compile(
+        r"(?i)(?:/home/[^\s<>]+|/var/www/[^\s<>]+|"
+        r"/var/apps/[^\s<>]+|[A-Z]:\\[^\r\n<>]+)"
+    )),
+    ("source_file_disclosure", re.compile(
+        r"(?i)\b(?:CodeIgniter|Laravel|Symfony|system|vendor)[^\r\n<>]*\.php\b"
+    )),
+    ("line_number_disclosure", re.compile(
+        r'(?i)(?:"(?:line|line_number)"|\b(?:line|ln)\b)\s*[:#]?\s*\d{1,6}\b'
+    )),
+    ("trace_field", re.compile(
+        r'(?i)"(?:trace|traceback|stack_trace)"\s*[:=]'
+    )),
 )
 
 
@@ -292,6 +322,7 @@ def initial_artifact(context: dict[str, Any], project_id: str) -> dict[str, Any]
             "errors": [],
             "notes": [
                 "Configuration exposure is evidence; it is not an automatic vulnerability finding.",
+                "Detailed framework/error information in an HTTP response is classified as an observation requiring review; it is not by itself proof that debug mode is enabled.",
                 "Raw evidence is retained; credential/secret redaction is performed during report generation.",
                 "CVE correlation is triage evidence only and does not establish exploitability.",
             ],
@@ -370,6 +401,15 @@ def extract_config_cves(version_data: dict[str, Any]) -> list[dict[str, Any]]:
     return selected
 
 
+def detect_error_information(text: str) -> list[str]:
+    """Return conservative indicators of detailed error/debug information."""
+    indicators: list[str] = []
+    for name, pattern in ERROR_INFO_PATTERNS:
+        if pattern.search(text):
+            indicators.append(name)
+    return indicators
+
+
 def probe(url: str) -> dict[str, Any]:
     started = now_iso()
     try:
@@ -401,9 +441,12 @@ def probe(url: str) -> dict[str, Any]:
         marker_hits = [
             marker for marker in CONFIG_CONTENT_MARKERS if marker in lowered
         ]
+        error_information_indicators = detect_error_information(text)
 
         status = response.status_code
-        if status in (200, 206):
+        if error_information_indicators and status == 404:
+            classification = "error-information-disclosure"
+        elif status in (200, 206):
             classification = "accessible"
         elif status in (301, 302, 303, 307, 308):
             classification = "redirect"
@@ -429,6 +472,8 @@ def probe(url: str) -> dict[str, Any]:
             "body_preview": text[:4000],
             "config_marker_hits": marker_hits,
             "secret_pattern_observed": secret_observed,
+            "error_information_indicators": error_information_indicators,
+            "error_information_disclosure": bool(error_information_indicators),
             "classification": classification,
             "error": "",
         }
@@ -448,6 +493,8 @@ def probe(url: str) -> dict[str, Any]:
             "body_preview": "",
             "config_marker_hits": [],
             "secret_pattern_observed": False,
+            "error_information_indicators": [],
+            "error_information_disclosure": False,
             "classification": "probe-error",
             "error": str(exc),
         }
@@ -466,6 +513,8 @@ def compact_result(result: dict[str, Any], scheme: str, path: str) -> dict[str, 
         "body_sha256": result["body_sha256"],
         "config_marker_hits": result["config_marker_hits"],
         "secret_pattern_observed": result["secret_pattern_observed"],
+        "error_information_indicators": result["error_information_indicators"],
+        "error_information_disclosure": result["error_information_disclosure"],
         "classification": result["classification"],
         "error": result["error"],
     }
@@ -563,6 +612,11 @@ def analyze_cmd() -> None:
     not_found = [
         item for item in results if item["classification"] == "not-found"
     ]
+    error_information_disclosures = [
+        item
+        for item in results
+        if item["classification"] == "error-information-disclosure"
+    ]
     not_confirmed = [
         item for item in results if item["classification"] == "not-confirmed"
     ]
@@ -585,11 +639,14 @@ def analyze_cmd() -> None:
         or controlled
         or redirects
         or secret_observations
+        or error_information_disclosures
         or cve_candidates
     )
 
     if accessible:
         assessment_result = "configuration-exposure-observed"
+    elif error_information_disclosures:
+        assessment_result = "error-information-disclosure-observed"
     elif controlled:
         assessment_result = "configuration-paths-access-controlled"
     elif not_confirmed:
@@ -613,6 +670,7 @@ def analyze_cmd() -> None:
         "access_controlled": len(controlled),
         "redirects": len(redirects),
         "not_found": len(not_found),
+        "error_information_disclosures": len(error_information_disclosures),
         "not_confirmed": len(not_confirmed),
         "probe_errors": len(probe_errors),
         "secret_pattern_observations": len(secret_observations),
@@ -623,8 +681,10 @@ def analyze_cmd() -> None:
         "requires_review": requires_review,
         "finding": False,
         "note": (
-            "HTTP accessibility of a configuration-sensitive path is an "
-            "observation. It does not by itself prove a vulnerability."
+            "Configuration-path accessibility and externally exposed detailed "
+            "error information are observations requiring assessment. They do "
+            "not by themselves prove a vulnerability or confirm exploitable "
+            "debug configuration."
         ),
     }
     block["cve_correlation"] = {
@@ -683,6 +743,7 @@ def list_cmd() -> None:
         review = item.get("classification") in (
             "accessible",
             "access-controlled",
+            "error-information-disclosure",
         )
         print(
             f"{str(item.get('scheme', '')).upper():6} "
@@ -754,6 +815,27 @@ def verify_cmd() -> None:
         errors.append("summary tidak valid.")
     elif summary.get("probes") != len(results or []):
         errors.append("summary.probes tidak sama dengan jumlah results.")
+    else:
+        expected_error_info = sum(
+            1
+            for item in results
+            if item.get("classification") == "error-information-disclosure"
+        )
+        if summary.get("error_information_disclosures", 0) != expected_error_info:
+            errors.append(
+                "summary.error_information_disclosures tidak sama dengan hasil probe."
+            )
+
+        for item in results:
+            if item.get("classification") == "error-information-disclosure":
+                if not item.get("error_information_disclosure"):
+                    errors.append(
+                        "Probe error-information-disclosure tidak memiliki flag evidence."
+                    )
+                if not item.get("error_information_indicators"):
+                    errors.append(
+                        "Probe error-information-disclosure tidak memiliki indikator."
+                    )
 
     if not isinstance(cve, dict):
         errors.append("cve_correlation tidak valid.")
@@ -787,6 +869,10 @@ def verify_cmd() -> None:
     print(f"[PASS] Target    : {block.get('hostname')}")
     print(f"[PASS] Probes    : {summary.get('probes')}")
     print(f"[PASS] Accessible: {summary.get('accessible')}")
+    print(
+        "[PASS] Error Info: "
+        f"{summary.get('error_information_disclosures', 0)} observation(s)"
+    )
     print(f"[PASS] CVE       : {cve.get('candidate_count')} candidate(s)")
     print(f"[PASS] Review    : {summary.get('requires_review')}")
     print("[PASS] CVE Triage: configuration candidates are evidence; no automatic finding.")
