@@ -55,7 +55,6 @@ import datetime as dt
 import hashlib
 import re
 import shutil
-import socket
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -102,7 +101,7 @@ except ImportError as exc:
 # Constants
 # ---------------------------------------------------------------------------
 
-SCRIPT_VERSION = "1.0.3"
+SCRIPT_VERSION = "1.0.2"
 SCHEMA_VERSION = "1.2"
 
 CHECKLIST_PROTOCOL = "3-008"
@@ -679,127 +678,12 @@ def discover_openssl() -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 
-def detect_local_route(target: str) -> str:
-    """Ask the OS which local IPv4 address is selected for the target."""
-    try:
-        target_ip = socket.gethostbyname(target)
-    except OSError:
-        target_ip = target
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(2)
-    try:
-        sock.connect((target_ip, TARGET_PORT))
-        return str(sock.getsockname()[0]).strip()
-    except OSError:
-        return ""
-    finally:
-        sock.close()
-
-
-def nmap_iflist(nmap_path: str) -> list[dict[str, str]]:
-    """Read Nmap interface inventory and Windows Npcap WINDEVICE mappings."""
-    try:
-        completed = subprocess.run(
-            [nmap_path, "--iflist"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return []
-
-    interfaces: dict[str, dict[str, str]] = {}
-    section = ""
-    for raw_line in completed.stdout.splitlines():
-        line = raw_line.strip()
-        if line == "************************INTERFACES************************":
-            section = "interfaces"
-            continue
-        if line == "**************************ROUTES**************************":
-            break
-        if not line or section != "interfaces":
-            continue
-        if line.startswith("DEV  (SHORT)") or line.startswith("DEV    WINDEVICE"):
-            continue
-
-        parts = line.split()
-        if len(parts) >= 4 and parts[0] != "DEV":
-            dev = parts[0]
-            ip = parts[2].split("/", 1)[0]
-            interfaces.setdefault(dev, {"dev": dev, "ip": "", "windevice": ""})
-            if ip and ip != "<none>":
-                interfaces[dev]["ip"] = ip
-            continue
-
-        if len(parts) >= 2:
-            dev = parts[0]
-            interfaces.setdefault(dev, {"dev": dev, "ip": "", "windevice": ""})
-            interfaces[dev]["windevice"] = parts[1]
-
-    return list(interfaces.values())
-
-
-def choose_nmap_network_path(target: str) -> dict[str, str]:
-    """Choose an Nmap interface from the OS-selected route, with VPN fallback."""
-    nmap_path = find_nmap()
-    local_ip = detect_local_route(target)
-    interfaces = nmap_iflist(nmap_path)
-
-    usable = [
-        item for item in interfaces
-        if item.get("windevice") and item["windevice"].lower() != "<none>"
-    ]
-    matching = [item for item in usable if local_ip and item.get("ip") == local_ip]
-
-    if matching:
-        return {
-            "mode": "interface",
-            "interface": matching[0]["dev"],
-            "local_ip": local_ip,
-            "selection": "os-route-local-ip",
-        }
-
-    if sys.platform.startswith("win"):
-        return {
-            "mode": "unprivileged",
-            "interface": "",
-            "local_ip": local_ip,
-            "selection": "os-route-vpn-or-non-pcap",
-        }
-
-    if local_ip:
-        return {
-            "mode": "unprivileged",
-            "interface": "",
-            "local_ip": local_ip,
-            "selection": "os-route-no-pcap-match",
-        }
-
-    raise TLSError(
-        "Tidak dapat menentukan network path yang aman untuk Nmap TLS. "
-        f"Local IP ke target: {local_ip or '-'}; Nmap tidak menyediakan interface pcap yang cocok."
-    )
-
-
 def run_nmap_tls_probe(hostname: str) -> dict[str, Any]:
     executable, version = ensure_nmap()
-    network_path = choose_nmap_network_path(hostname)
 
     command = [
         executable,
         "-Pn",
-    ]
-
-    if network_path["mode"] == "interface":
-        command.extend(["-e", network_path["interface"]])
-    else:
-        command.extend(["-sT", "--unprivileged"])
-
-    command.extend([
         "-p",
         str(TARGET_PORT),
         "--script",
@@ -813,7 +697,7 @@ def run_nmap_tls_probe(hostname: str) -> dict[str, Any]:
         "-oX",
         "-",
         hostname,
-    ])
+    ]
 
     started = dt.datetime.now().astimezone()
     try:
@@ -875,7 +759,6 @@ def run_nmap_tls_probe(hostname: str) -> dict[str, Any]:
         "timed_out": timed_out,
         "stdout": stdout,
         "stderr": stderr,
-        "network_path": network_path,
     }
 
 
@@ -1593,7 +1476,6 @@ def build_document(
         "timed_out": nmap_result["timed_out"],
         "xml_sha256": xml_hash,
         "stderr_sha256": stderr_hash,
-        "network_path": nmap_result.get("network_path", {}),
     }
     tls["protocols"] = normalized_protocols
     tls["ciphers"] = normalized_ciphers
