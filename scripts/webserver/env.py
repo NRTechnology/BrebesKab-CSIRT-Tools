@@ -55,7 +55,7 @@ except ImportError:
 
 
 APP_NAME = "BrebesKab-CSIRT-Tools"
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 SCHEMA_VERSION = "1.0"
 
 CHECKLIST_ID = "4-006"
@@ -454,20 +454,36 @@ def load_recon_paths(root: Path) -> List[str]:
 
 def derive_environment_candidates(recon_paths: Iterable[str]) -> List[str]:
     """
-    Recon remains authoritative for discovered endpoints, but environment
-    files are sensitive server-side configuration targets that may not be
-    discovered by directory enumeration. Therefore a small explicit,
-    bounded candidate set is permitted.
+    Build the bounded target set specifically for environment-file exposure.
 
-    If Recon already contains an environment path, it is retained once.
+    Recon is used only as supporting evidence: if Recon already discovered
+    an environment-style path, it is retained. Ordinary application paths
+    such as /favicon.ico, /robots.txt, /login, /dashboard, etc. are NOT
+    environment-file candidates.
+
+    This checklist must test environment/configuration exposure, not replay
+    the entire Recon directory list.
     """
-    candidates = {canonical_path(path) for path in recon_paths}
+    environment_paths = set(ROOT_CANDIDATE_PATHS)
 
-    for path in ROOT_CANDIDATE_PATHS:
-        candidates.add(path)
+    for path in recon_paths:
+        canonical = canonical_path(path)
+        lower = canonical.lower()
+
+        if (
+            lower.startswith("/.env")
+            or lower in {
+                "/env",
+                "/environment",
+                "/config/.env",
+                "/config/env",
+                "/config/environment",
+            }
+        ):
+            environment_paths.add(canonical)
 
     return sorted(
-        candidates,
+        environment_paths,
         key=lambda item: (
             0 if item in ROOT_CANDIDATE_PATHS else 1,
             item.lower(),
@@ -637,6 +653,7 @@ def classify_response(
     content_type: str,
     body: str,
     indicators: Dict[str, Any],
+    is_environment_candidate: bool,
 ) -> str:
     if status_code in STATUS_ACCESS_CONTROL:
         return "access-controlled"
@@ -655,7 +672,9 @@ def classify_response(
         # environment candidate is useful evidence, but content exposure
         # itself must be established with GET.
         if 200 <= status_code < 300:
-            return "candidate-accessible"
+            if is_environment_candidate:
+                return "candidate-accessible"
+            return "application-response"
         return "application-response"
 
     if 200 <= status_code < 300:
@@ -812,6 +831,8 @@ def build_probe_record(
             content_type,
             body,
             indicators,
+            path in ROOT_CANDIDATE_PATHS
+            or path.lower().startswith("/.env"),
         )
 
     return {
@@ -1031,7 +1052,7 @@ def build_artifact(
         "recon": {
             "path_count": recon_count,
             "candidate_count": len(candidates),
-            "candidate_source": "Recon directory + bounded explicit environment paths",
+            "candidate_source": "Bounded environment/configuration paths; Recon used only to retain discovered environment-style paths",
         },
         "summary": {
             "probes": len(probes),
@@ -1131,7 +1152,7 @@ def command_init(root: Path) -> int:
         "recon": {
             "path_count": len(recon_paths),
             "candidate_count": len(candidates),
-            "candidate_source": "Recon directory + bounded explicit environment paths",
+            "candidate_source": "Bounded environment/configuration paths; Recon used only to retain discovered environment-style paths",
         },
         "candidates": candidates,
         "probes": [],
@@ -1327,14 +1348,27 @@ def command_list(root: Path) -> int:
     interesting = [
         probe
         for probe in probes
-        if probe.get("classification")
-        in {
-            "environment-file-exposed",
-            "environment-file-template-exposed",
-            "environment-file-candidate",
-            "candidate-accessible",
-            "probe-error",
-        }
+        if (
+            probe.get("classification")
+            in {
+                "environment-file-exposed",
+                "environment-file-template-exposed",
+                "environment-file-candidate",
+                "candidate-accessible",
+                "probe-error",
+            }
+            and (
+                str(probe.get("path", "")).lower().startswith("/.env")
+                or str(probe.get("path", "")).lower() in {
+                    "/env",
+                    "/environment",
+                    "/config/.env",
+                    "/config/env",
+                    "/config/environment",
+                }
+                or probe.get("classification") == "probe-error"
+            )
+        )
     ]
 
     if not interesting:
@@ -1444,6 +1478,34 @@ def command_verify(root: Path) -> int:
 
         classification = probe.get("classification")
         indicators = probe.get("environment_indicators") or {}
+        path_lower = str(probe.get("path", "")).lower()
+        is_environment_candidate = (
+            path_lower.startswith("/.env")
+            or path_lower in {
+                "/env",
+                "/environment",
+                "/config/.env",
+                "/config/env",
+                "/config/environment",
+            }
+        )
+
+        if classification == "candidate-accessible" and not is_environment_candidate:
+            errors.append(
+                f"Probe #{index}: candidate-accessible hanya boleh "
+                "digunakan untuk environment candidate."
+            )
+
+        if classification in {
+            "environment-file-exposed",
+            "environment-file-template-exposed",
+            "environment-file-candidate",
+            "candidate-accessible",
+        } and not is_environment_candidate:
+            errors.append(
+                f"Probe #{index}: environment classification pada "
+                "non-environment path."
+            )
 
         if classification == "environment-file-exposed":
             if probe.get("path") != "/.env":
