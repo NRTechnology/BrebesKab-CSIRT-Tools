@@ -1548,7 +1548,7 @@ def command_analyze(
         "REQUIRES REVIEW : "
         f"{artifact['assessment']['requires_review']}"
     )
-    print(f"STATUS          : {artifact['assessment']['classification']}")
+    print(f"STATUS          : {artifact['assessment']['result']}")
     print(f"FILE            : {output}")
     print(f"EVIDENCE        : {evidence_output}")
 
