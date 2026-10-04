@@ -42,7 +42,7 @@ except ImportError:
     sys.exit(1)
 
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 SCHEMA_VERSION = "1.0"
 CHECKLIST_ID = "WEB-SERVER-SUMMARY"
 
@@ -268,33 +268,85 @@ def extract_checklist_summary(
     if data is None:
         return item
 
-    item["status"] = first_value(data, ["status", "assessment_status"])
-    item["target"] = first_value(data, ["target", "target_url", "domain"])
+    checklist = data.get("checklist")
+    if not isinstance(checklist, dict):
+        checklist = {}
+
+    assessment = data.get("assessment")
+    if not isinstance(assessment, dict):
+        assessment = {}
+
+    summary = data.get("summary")
+    if not isinstance(summary, dict):
+        summary = {}
+
+    cve_correlation = data.get("cve_correlation")
+    if not isinstance(cve_correlation, dict):
+        cve_correlation = {}
+
+    item["status"] = first_value(
+        checklist,
+        ["status", "assessment_status"],
+        first_value(data, ["status", "assessment_status"]),
+    )
+    item["target"] = first_value(
+        data,
+        ["target", "target_url", "domain"],
+    )
+    if isinstance(item["target"], dict):
+        item["target"] = first_value(
+            item["target"],
+            ["url", "hostname", "value"],
+        )
 
     review_value = first_value(
-        data,
+        assessment,
         ["requires_review", "review_required", "review"],
-        False,
+        first_value(
+            data,
+            ["requires_review", "review_required", "review"],
+            False,
+        ),
     )
     item["requires_review"] = bool_value(review_value)
 
     finding_value = first_value(
-        data,
+        assessment,
         ["finding", "confirmed_finding", "vulnerability_confirmed"],
-        False,
+        first_value(
+            data,
+            ["finding", "confirmed_finding", "vulnerability_confirmed"],
+            False,
+        ),
     )
     item["finding"] = finding_value in FINDING_TRUE_VALUES
 
     counts = extract_counts(data)
+    for name, aliases in {
+        "probes": ["probes", "probe_count"],
+        "candidates": ["candidates", "candidate_count"],
+        "observations": ["observations", "observation_count"],
+        "review": ["requires_review_count", "review_count"],
+    }.items():
+        if name not in counts:
+            value = first_value(summary, aliases)
+            if isinstance(value, int) and not isinstance(value, bool):
+                counts[name] = value
+            elif isinstance(value, str) and value.isdigit():
+                counts[name] = int(value)
     item["counts"] = counts
 
     cve_ids: set[str] = set()
     collect_cve_ids(data, cve_ids)
 
     explicit_cve_count = first_value(
-        data,
-        ["cve_candidates", "cve_candidate_count"],
-        None,
+        cve_correlation,
+        ["candidate_count", "cve_candidates", "cve_candidate_count"],
+        first_value(
+            data,
+            ["cve_candidates", "cve_candidate_count"],
+            None,
+        ),
     )
     if isinstance(explicit_cve_count, int):
         item["cve_candidates"] = explicit_cve_count
@@ -631,6 +683,30 @@ def command_verify() -> int:
             f"urutan/ID checklist tidak sesuai: expected={expected_ids}, actual={actual_ids}"
         )
 
+    if len(items) != len(CHECKLISTS):
+        errors.append(
+            f"jumlah checklist tidak sesuai: expected={len(CHECKLISTS)}, actual={len(items)}"
+        )
+
+    expected_completed = sum(
+        1 for item in items
+        if isinstance(item, dict) and item.get("status") in STATUS_COMPLETED
+    )
+    expected_incomplete = len(items) - expected_completed
+    expected_review = sum(
+        1 for item in items
+        if isinstance(item, dict) and item.get("requires_review")
+    )
+    expected_findings = sum(
+        1 for item in items
+        if isinstance(item, dict) and item.get("finding")
+    )
+    expected_cve_observations = sum(
+        int(item.get("cve_candidates", 0) or 0)
+        for item in items
+        if isinstance(item, dict)
+    )
+
     for item in items:
         if not isinstance(item, dict):
             errors.append("item checklist bukan mapping.")
@@ -646,18 +722,38 @@ def command_verify() -> int:
                 f"{item.get('id')}: cve_candidates bernilai negatif."
             )
 
-    assessment = data.get("assessment", {})
-    if assessment.get("confirmed_findings", 0) != sum(
-        1 for item in items
-        if isinstance(item, dict) and item.get("finding")
-    ):
-        errors.append("confirmed_findings tidak konsisten dengan checklist.")
+    if assessment.get("checklists_total") != len(items):
+        errors.append("checklists_total tidak konsisten dengan jumlah checklist.")
 
-    if assessment.get("requires_review", 0) != sum(
-        1 for item in items
-        if isinstance(item, dict) and item.get("requires_review")
-    ):
-        errors.append("requires_review tidak konsisten dengan checklist.")
+    if assessment.get("completed") != expected_completed:
+        errors.append(
+            f"completed tidak konsisten: expected={expected_completed}, "
+            f"actual={assessment.get('completed')}"
+        )
+
+    if assessment.get("incomplete") != expected_incomplete:
+        errors.append(
+            f"incomplete tidak konsisten: expected={expected_incomplete}, "
+            f"actual={assessment.get('incomplete')}"
+        )
+
+    if assessment.get("requires_review") != expected_review:
+        errors.append(
+            f"requires_review tidak konsisten: expected={expected_review}, "
+            f"actual={assessment.get('requires_review')}"
+        )
+
+    if assessment.get("cve_candidate_observations") != expected_cve_observations:
+        errors.append(
+            "cve_candidate_observations tidak konsisten dengan checklist."
+        )
+
+    assessment = data.get("assessment", {})
+    if assessment.get("confirmed_findings") != expected_findings:
+        errors.append(
+            f"confirmed_findings tidak konsisten: expected={expected_findings}, "
+            f"actual={assessment.get('confirmed_findings')}"
+        )
 
     if errors:
         print("[FAIL] Web Server Summary gagal validasi.")
