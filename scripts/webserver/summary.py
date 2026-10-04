@@ -707,6 +707,10 @@ def command_verify() -> int:
         if isinstance(item, dict)
     )
 
+    assessment = data.get("assessment", {})
+    if not isinstance(assessment, dict):
+        errors.append("assessment harus berupa mapping.")
+
     for item in items:
         if not isinstance(item, dict):
             errors.append("item checklist bukan mapping.")
@@ -748,7 +752,6 @@ def command_verify() -> int:
             "cve_candidate_observations tidak konsisten dengan checklist."
         )
 
-    assessment = data.get("assessment", {})
     if assessment.get("confirmed_findings") != expected_findings:
         errors.append(
             f"confirmed_findings tidak konsisten: expected={expected_findings}, "
