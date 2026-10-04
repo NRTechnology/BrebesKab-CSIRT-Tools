@@ -28,7 +28,7 @@ import typer
 import yaml
 
 APP_NAME = "BrebesKab-CSIRT-Tools config.py"
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.2"
 SCHEMA_VERSION = "1.0"
 CHECKLIST_ID = "4-005"
 CHECKLIST_NAME = "Web server configuration exposure"
@@ -280,102 +280,53 @@ def source_status(path: Path, block_name: str) -> str:
 
 
 def initial_artifact(context: dict[str, Any], project_id: str) -> dict[str, Any]:
-    """Create the canonical 4-005 artifact skeleton.
-
-    The probe methodology and candidate set remain unchanged. Only the
-    artifact layout is normalized so summary.py can consume all Web Server
-    checklist artifacts consistently.
-    """
     return {
         "schema_version": SCHEMA_VERSION,
         "project_id": project_id,
-        "checklist": {
-            "id": CHECKLIST_ID,
-            "name": CHECKLIST_NAME,
-            "phase": PHASE_NAME,
-            "focus": "Public exposure of web-server configuration and detailed error information",
-            "status": "initialized",
-        },
-        "target": {
+        "updated_at": now_iso(),
+        "webserver_config": {
+            "status": "not-started",
+            "checklist": {
+                "id": CHECKLIST_ID,
+                "name": CHECKLIST_NAME,
+                "phase": PHASE_NAME,
+            },
             "application": "Bangsaku",
             "hostname": context["hostname"],
-            "url": context["target_url"],
+            "target_url": context["target_url"],
             "environment": "Production",
             "assessment_type": "Black Box",
-            "scope_id": context["scope_id"],
             "scope_reference": "01-preparation/scope/scope.yaml",
+            "scope_id": context["scope_id"],
             "authorized_ports": context["authorized_ports"],
+            "method": "controlled HTTP GET against configuration-sensitive paths",
+            "source_status": {},
+            "probe": {
+                "paths": PROBE_PATHS,
+                "request_count": 0,
+            },
+            "results": [],
+            "assessment": {
+                "result": "not-analyzed",
+                "requires_review": False,
+                "finding": False,
+            },
+            "cve_correlation": {
+                "source": "4-001 version/CPE evidence",
+                "status": "not-run",
+                "candidate_count": 0,
+                "requires_validation": 0,
+                "candidates": [],
+            },
+            "evidence": {},
+            "errors": [],
+            "notes": [
+                "Configuration exposure is evidence; it is not an automatic vulnerability finding.",
+                "Detailed framework/error information in an HTTP response is classified as an observation requiring review; it is not by itself proof that debug mode is enabled.",
+                "Raw evidence is retained; credential/secret redaction is performed during report generation.",
+                "CVE correlation is triage evidence only and does not establish exploitability.",
+            ],
         },
-        "methodology": {
-            "method": "Controlled HTTP GET against configuration-sensitive paths",
-            "candidate_sources": ["bounded"],
-            "redirect_following": False,
-            "mutation": False,
-            "bruteforce": False,
-            "exploitation": False,
-            "authentication_guessing": False,
-        },
-        "baseline": {
-            "version_4_001": "04-web-server-configuration/version/version.yaml",
-            "recon_directory": "02-reconnaissance/directory/directory.yaml",
-        },
-        "toolchain": {
-            "required": ["Python", "requests", "PyYAML"],
-            "optional": [],
-        },
-        "probe": {
-            "paths": PROBE_PATHS,
-            "methods": ["GET"],
-            "ports": context["authorized_ports"],
-            "schemes": ["http", "https"],
-            "allow_redirects": False,
-            "timeout_seconds": DEFAULT_TIMEOUT,
-            "max_body_bytes": MAX_BODY_BYTES,
-            "request_count": 0,
-        },
-        "source_status": {},
-        "results": [],
-        "summary": {
-            "probes": 0,
-            "accessible": 0,
-            "access_controlled": 0,
-            "redirects": 0,
-            "not_found": 0,
-            "error_information_disclosures": 0,
-            "not_confirmed": 0,
-            "probe_errors": 0,
-            "secret_pattern_observations": 0,
-            "requires_review": 0,
-        },
-        "cve_correlation": {
-            "source": "4-001 version/CPE evidence",
-            "status": "not-run",
-            "candidate_count": 0,
-            "requires_validation": 0,
-            "candidates": [],
-        },
-        "assessment": {
-            "result": "not-analyzed",
-            "classification": "not-analyzed",
-            "requires_review": False,
-            "finding": False,
-            "note": (
-                "Configuration-path accessibility and externally exposed detailed "
-                "error information are observations requiring assessment. They do "
-                "not by themselves prove a vulnerability or confirm exploitable "
-                "debug configuration."
-            ),
-        },
-        "evidence": {},
-        "errors": [],
-        "notes": [
-            "Configuration exposure is evidence; it is not an automatic vulnerability finding.",
-            "Detailed framework/error information in an HTTP response is classified as an observation requiring review; it is not by itself proof that debug mode is enabled.",
-            "Raw evidence is retained; credential/secret redaction is performed during report generation.",
-            "CVE correlation is triage evidence only and does not establish exploitability.",
-        ],
-        "generated_at": now_iso(),
-        "updated_at": now_iso(),
     }
 
 
@@ -573,13 +524,6 @@ def compact_result(result: dict[str, Any], scheme: str, path: str) -> dict[str, 
 def version_cmd() -> None:
     print(f"config.py v{APP_VERSION}")
     print(f"Schema: {SCHEMA_VERSION}")
-    print(f"Checklist: {CHECKLIST_ID} {CHECKLIST_NAME}")
-    print("Mode: controlled HTTP GET only")
-    print("Network probes: enabled by analyze")
-    print("Artifact: canonical Web Server Configuration schema")
-    print("CVE correlation: inherited configuration-relevant candidates from 4-001")
-    print("Finding creation: disabled")
-    print("Report redaction: separate report-generation layer")
 
 
 @app.command("init")
@@ -604,21 +548,13 @@ def analyze_cmd() -> None:
     path = artifact_file(repo_root, project_id)
 
     if not path.is_file():
-        raise typer.BadParameter(
-            "Artifact belum diinisialisasi. Jalankan init terlebih dahulu."
-        )
+        raise typer.BadParameter("Artifact belum diinisialisasi. Jalankan init terlebih dahulu.")
 
     artifact = load_yaml(path)
+    block = artifact["webserver_config"]
     sources = context["sources"]
 
-    checklist = artifact["checklist"]
-    target = artifact["target"]
-    methodology = artifact["methodology"]
-    probe_config = artifact["probe"]
-
-    checklist["status"] = "completed"
-
-    artifact["source_status"] = {
+    block["source_status"] = {
         "version": source_status(sources["version"], "webserver_version"),
         "directory": source_status(sources["directory"], "directory"),
     }
@@ -718,24 +654,17 @@ def analyze_cmd() -> None:
     else:
         assessment_result = "no-configuration-exposure-observed"
 
-    checklist["status"] = "completed"
-
-    probe_config.update(
-        {
-            "paths": PROBE_PATHS,
-            "methods": ["GET"],
-            "ports": context["authorized_ports"],
-            "schemes": ["http", "https"],
-            "allow_redirects": False,
-            "timeout_seconds": DEFAULT_TIMEOUT,
-            "max_body_bytes": MAX_BODY_BYTES,
-            "request_count": len(results),
-            "completed_at": now_iso(),
-        }
-    )
-
-    artifact["results"] = results
-    artifact["summary"] = {
+    block["status"] = "completed"
+    block["probe"] = {
+        "paths": PROBE_PATHS,
+        "request_count": len(results),
+        "schemes": ["http", "https"],
+        "allow_redirects": False,
+        "max_body_bytes": MAX_BODY_BYTES,
+        "completed_at": now_iso(),
+    }
+    block["results"] = results
+    block["summary"] = {
         "probes": len(results),
         "accessible": len(accessible),
         "access_controlled": len(controlled),
@@ -747,9 +676,8 @@ def analyze_cmd() -> None:
         "secret_pattern_observations": len(secret_observations),
         "requires_review": int(requires_review),
     }
-    artifact["assessment"] = {
+    block["assessment"] = {
         "result": assessment_result,
-        "classification": assessment_result,
         "requires_review": requires_review,
         "finding": False,
         "note": (
@@ -759,7 +687,7 @@ def analyze_cmd() -> None:
             "debug configuration."
         ),
     }
-    artifact["cve_correlation"] = {
+    block["cve_correlation"] = {
         "source": "4-001 version/CPE evidence",
         "status": "completed" if version_data else "not-available",
         "candidate_count": len(cve_candidates),
@@ -771,14 +699,13 @@ def analyze_cmd() -> None:
             "or applicability of configuration prerequisites."
         ),
     }
-    artifact["evidence"] = {
+    block["evidence"] = {
         "config_probes": str(
             evidence_file.relative_to(repo_root)
         ).replace("\\", "/"),
-        "raw_evidence_retained": True,
-        "report_redaction": "separate report-generation layer; raw evidence is not redacted",
     }
-    artifact["errors"] = errors
+    block["errors"] = errors
+    block["updated_at"] = now_iso()
     artifact["updated_at"] = now_iso()
 
     write_yaml(path, artifact)
@@ -803,15 +730,16 @@ def list_cmd() -> None:
     project_id = discover_project_id(repo_root)
     path = artifact_file(repo_root, project_id)
     data = load_yaml(path)
+    block = data["webserver_config"]
 
     print(f"PROJECT: {project_id}")
-    print(f"STATUS : {data.get('checklist', {}).get('status', '')}")
-    print(f"TARGET : {data.get('target', {}).get('hostname', '')}")
+    print(f"STATUS : {block.get('status', '')}")
+    print(f"TARGET : {block.get('hostname', '')}")
     print()
     print("SCHEME  PATH                       STATUS  CLASSIFICATION           REVIEW")
     print("-" * 78)
 
-    for item in data.get("results", []):
+    for item in block.get("results", []):
         review = item.get("classification") in (
             "accessible",
             "access-controlled",
@@ -825,7 +753,7 @@ def list_cmd() -> None:
             f"{str(review)}"
         )
 
-    cve = data.get("cve_correlation", {})
+    cve = block.get("cve_correlation", {})
     print()
     print(f"CVE CANDIDATES: {cve.get('candidate_count', 0)}")
 
@@ -860,179 +788,70 @@ def verify_cmd() -> None:
         print(f"[FAIL] Artifact tidak dapat dibaca: {exc}")
         raise typer.Exit(code=1)
 
+    block = data.get("webserver_config", {})
     errors: list[str] = []
 
     if data.get("schema_version") != SCHEMA_VERSION:
         errors.append("schema_version tidak sesuai.")
     if data.get("project_id") != project_id:
         errors.append("project_id tidak sesuai.")
-
-    checklist = data.get("checklist", {})
-    target = data.get("target", {})
-    methodology = data.get("methodology", {})
-    baseline = data.get("baseline", {})
-    toolchain = data.get("toolchain", {})
-    probe = data.get("probe", {})
-    source_status_data = data.get("source_status", {})
-    results = data.get("results")
-    summary = data.get("summary", {})
-    cve = data.get("cve_correlation", {})
-    assessment = data.get("assessment", {})
-    evidence = data.get("evidence", {})
-
-    if not isinstance(checklist, dict):
-        errors.append("checklist tidak valid.")
-        checklist = {}
+    if block.get("status") != "completed":
+        errors.append("status bukan completed.")
+    checklist = block.get("checklist", {})
     if checklist.get("id") != CHECKLIST_ID:
         errors.append("checklist ID tidak sesuai.")
-    if checklist.get("name") != CHECKLIST_NAME:
-        errors.append("checklist name tidak sesuai.")
-    if checklist.get("phase") != PHASE_NAME:
-        errors.append("checklist phase tidak sesuai.")
-    if checklist.get("status") != "completed":
-        errors.append("checklist status bukan completed.")
+    if not block.get("hostname"):
+        errors.append("hostname kosong.")
 
-    if not isinstance(target, dict):
-        errors.append("target tidak valid.")
-        target = {}
-    if not target.get("hostname"):
-        errors.append("target.hostname kosong.")
-    if not target.get("url"):
-        errors.append("target.url kosong.")
-    if not isinstance(target.get("authorized_ports"), list):
-        errors.append("target.authorized_ports tidak valid.")
-
-    if not isinstance(methodology, dict):
-        errors.append("methodology tidak valid.")
-    else:
-        if methodology.get("method") != (
-            "Controlled HTTP GET against configuration-sensitive paths"
-        ):
-            errors.append("methodology.method tidak sesuai.")
-        if methodology.get("redirect_following") is not False:
-            errors.append("redirect_following harus false.")
-        if methodology.get("mutation") is not False:
-            errors.append("mutation harus false.")
-        if methodology.get("bruteforce") is not False:
-            errors.append("bruteforce harus false.")
-
-    if not isinstance(baseline, dict):
-        errors.append("baseline tidak valid.")
-    else:
-        if not baseline.get("version_4_001"):
-            errors.append("baseline 4-001 tidak tercatat.")
-        if not baseline.get("recon_directory"):
-            errors.append("baseline recon directory tidak tercatat.")
-
-    if not isinstance(toolchain, dict):
-        errors.append("toolchain tidak valid.")
-
-    if not isinstance(probe, dict):
-        errors.append("probe tidak valid.")
-        probe = {}
-
-    if probe.get("methods") != ["GET"]:
-        errors.append("probe.methods tidak sesuai.")
-    if probe.get("schemes") != ["http", "https"]:
-        errors.append("probe.schemes tidak sesuai.")
-    if probe.get("allow_redirects") is not False:
-        errors.append("probe.allow_redirects harus false.")
-    if probe.get("paths") != PROBE_PATHS:
-        errors.append("probe.paths tidak sesuai dengan bounded candidate set.")
-
-    if not isinstance(source_status_data, dict):
-        errors.append("source_status tidak valid.")
+    results = block.get("results")
+    summary = block.get("summary", {})
+    cve = block.get("cve_correlation", {})
+    assessment = block.get("assessment", {})
+    evidence = block.get("evidence", {})
 
     if not isinstance(results, list) or not results:
         errors.append("results kosong.")
-        results = []
-
     if not isinstance(summary, dict):
         errors.append("summary tidak valid.")
-        summary = {}
-
-    expected_summary = {
-        "probes": len(results),
-        "accessible": sum(
-            1 for item in results if item.get("classification") == "accessible"
-        ),
-        "access_controlled": sum(
-            1
-            for item in results
-            if item.get("classification") == "access-controlled"
-        ),
-        "redirects": sum(
-            1 for item in results if item.get("classification") == "redirect"
-        ),
-        "not_found": sum(
-            1 for item in results if item.get("classification") == "not-found"
-        ),
-        "error_information_disclosures": sum(
+    elif summary.get("probes") != len(results or []):
+        errors.append("summary.probes tidak sama dengan jumlah results.")
+    else:
+        expected_error_info = sum(
             1
             for item in results
             if item.get("classification") == "error-information-disclosure"
-        ),
-        "not_confirmed": sum(
-            1
-            for item in results
-            if item.get("classification") == "not-confirmed"
-        ),
-        "probe_errors": sum(
-            1 for item in results if item.get("classification") == "probe-error"
-        ),
-        "secret_pattern_observations": sum(
-            1 for item in results if item.get("secret_pattern_observed")
-        ),
-    }
-
-    for key, expected in expected_summary.items():
-        if summary.get(key) != expected:
+        )
+        if summary.get("error_information_disclosures", 0) != expected_error_info:
             errors.append(
-                f"summary.{key} tidak konsisten: "
-                f"expected={expected}, actual={summary.get(key)}"
+                "summary.error_information_disclosures tidak sama dengan hasil probe."
             )
 
-    expected_requires_review = bool(
-        expected_summary["accessible"]
-        or expected_summary["access_controlled"]
-        or expected_summary["redirects"]
-        or expected_summary["secret_pattern_observations"]
-        or expected_summary["error_information_disclosures"]
-        or cve.get("candidate_count", 0)
-    )
-    if summary.get("requires_review") != int(expected_requires_review):
-        errors.append("summary.requires_review tidak konsisten.")
+        for item in results:
+            if item.get("classification") == "error-information-disclosure":
+                if not item.get("error_information_disclosure"):
+                    errors.append(
+                        "Probe error-information-disclosure tidak memiliki flag evidence."
+                    )
+                if not item.get("error_information_indicators"):
+                    errors.append(
+                        "Probe error-information-disclosure tidak memiliki indikator."
+                    )
 
     if not isinstance(cve, dict):
         errors.append("cve_correlation tidak valid.")
-        cve = {}
     else:
         candidates = cve.get("candidates", [])
-        if not isinstance(candidates, list):
-            errors.append("cve_correlation.candidates tidak valid.")
-            candidates = []
         if cve.get("candidate_count") != len(candidates):
-            errors.append(
-                "candidate_count tidak sama dengan jumlah CVE candidates."
-            )
-        if any(
-            isinstance(item, dict) and item.get("finding") is True
-            for item in candidates
-        ):
+            errors.append("candidate_count tidak sama dengan jumlah CVE candidates.")
+        if any(item.get("finding") is True for item in candidates):
             errors.append("CVE candidate tidak boleh menjadi automatic finding.")
 
     if not isinstance(assessment, dict):
         errors.append("assessment tidak valid.")
-        assessment = {}
-    else:
-        if assessment.get("finding") is True:
-            errors.append("config.py tidak boleh membuat automatic finding.")
-        if assessment.get("requires_review") != expected_requires_review:
-            errors.append("assessment.requires_review tidak konsisten.")
-        if assessment.get("result") != assessment.get("classification"):
-            errors.append("assessment.result/classification tidak konsisten.")
+    elif assessment.get("finding") is True:
+        errors.append("config.py tidak boleh membuat automatic finding.")
 
-    evidence_rel = evidence.get("config_probes", "") if isinstance(evidence, dict) else ""
+    evidence_rel = evidence.get("config_probes", "")
     if not evidence_rel:
         errors.append("Evidence config probes belum tercatat.")
     elif not (repo_root / evidence_rel).is_file():
@@ -1046,9 +865,8 @@ def verify_cmd() -> None:
 
     print("[PASS] Web Server Configuration memenuhi validasi.")
     print(f"[PASS] Checklist : {CHECKLIST_ID} {CHECKLIST_NAME}")
-    print(f"[PASS] Version   : {APP_VERSION}")
-    print(f"[PASS] Status    : {checklist.get('status')}")
-    print(f"[PASS] Target    : {target.get('hostname')}")
+    print(f"[PASS] Status    : {block.get('status')}")
+    print(f"[PASS] Target    : {block.get('hostname')}")
     print(f"[PASS] Probes    : {summary.get('probes')}")
     print(f"[PASS] Accessible: {summary.get('accessible')}")
     print(
