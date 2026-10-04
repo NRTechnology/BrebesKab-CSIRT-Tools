@@ -40,7 +40,7 @@ import requests
 import yaml
 
 
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.2"
 SCHEMA_VERSION = "1.0"
 
 CHECKLIST_ID = "4-009"
@@ -703,23 +703,6 @@ def build_urls(
 
 
 def load_version_cves() -> List[Dict[str, Any]]:
-    """
-    Load heuristic CVE correlation from the canonical 4-001 version.yaml.
-
-    Canonical 4-001 structure:
-        cve_correlation:
-          products:
-            - product: ...
-              version: ...
-              cves:
-                - cve: CVE-...
-                  description: ...
-                  ...
-
-    Only HTTP-method-related keywords are used for triage. A CVE candidate
-    remains supporting evidence and is never treated as an automatic finding.
-    A compatibility fallback for older wrapper artifacts is retained.
-    """
     path = version_artifact_path()
 
     if not path.exists():
@@ -730,85 +713,16 @@ def load_version_cves() -> List[Dict[str, Any]]:
     except Exception:
         return []
 
-    correlation = data.get("cve_correlation", {})
-    if not isinstance(correlation, dict):
-        correlation = {}
+    candidates: List[Dict[str, Any]] = []
 
-    raw_candidates: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
-
-    # Canonical 4-001 structure.
-    products = correlation.get("products", [])
-    if isinstance(products, list):
-        for product in products:
-            if not isinstance(product, dict):
-                continue
-
-            product_name = str(product.get("product", "")).strip()
-            product_version = str(product.get("version", "")).strip()
-            product_cves = product.get("cves", [])
-
-            if not isinstance(product_cves, list):
-                continue
-
-            for cve in product_cves:
-                if isinstance(cve, dict):
-                    raw_candidates.append(
-                        (
-                            {
-                                "product": product_name,
-                                "version": product_version,
-                            },
-                            cve,
-                        )
-                    )
-
-    # Compatibility with older 4-001 wrapper artifacts.
-    if not raw_candidates:
-        legacy_products = (
-            data.get("webserver_version", {})
-            if isinstance(data.get("webserver_version"), dict)
-            else {}
-        ).get("cve_correlation", {})
-
-        if isinstance(legacy_products, dict):
-            products = legacy_products.get("products", [])
-            if isinstance(products, list):
-                for product in products:
-                    if not isinstance(product, dict):
-                        continue
-
-                    product_name = str(product.get("product", "")).strip()
-                    product_version = str(product.get("version", "")).strip()
-                    product_cves = product.get("cves", [])
-
-                    if not isinstance(product_cves, list):
-                        continue
-
-                    for cve in product_cves:
-                        if isinstance(cve, dict):
-                            raw_candidates.append(
-                                (
-                                    {
-                                        "product": product_name,
-                                        "version": product_version,
-                                    },
-                                    cve,
-                                )
-                            )
-
-            legacy_candidates = legacy_products.get("candidates", [])
-            if isinstance(legacy_candidates, list):
-                for cve in legacy_candidates:
-                    if isinstance(cve, dict):
-                        raw_candidates.append(({}, cve))
-
-    # Last compatibility fallback for a root-level candidate list.
-    if not raw_candidates:
-        legacy_candidates = correlation.get("candidates", [])
-        if isinstance(legacy_candidates, list):
-            for cve in legacy_candidates:
-                if isinstance(cve, dict):
-                    raw_candidates.append(({}, cve))
+    def walk(value: Any) -> Iterable[Dict[str, Any]]:
+        if isinstance(value, dict):
+            yield value
+            for child in value.values():
+                yield from walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from walk(child)
 
     keywords = (
         "http method",
@@ -826,23 +740,20 @@ def load_version_cves() -> List[Dict[str, Any]]:
     )
 
     seen = set()
-    candidates: List[Dict[str, Any]] = []
 
-    for product_info, item in raw_candidates:
+    for item in walk(data):
         cve_id = (
-            item.get("cve")
-            or item.get("cve_id")
+            item.get("cve_id")
             or item.get("id")
+            or item.get("cve")
         )
 
         if not cve_id:
             continue
 
         cve_id = str(cve_id).strip()
-        if not cve_id:
-            continue
 
-        description_parts: List[str] = []
+        description_parts = []
         for key in (
             "description",
             "summary",
@@ -865,38 +776,15 @@ def load_version_cves() -> List[Dict[str, Any]]:
 
         seen.add(cve_id)
 
-        candidate = {
-            "cve_id": cve_id,
-            "description": description,
-            "source": str(path),
-            "correlation": "http-method-related keyword match",
-            "classification": "cve-candidate",
-        }
-
-        if product_info.get("product"):
-            candidate["product"] = product_info["product"]
-        if product_info.get("version"):
-            candidate["version"] = product_info["version"]
-
-        # Preserve useful authoritative CVE metadata when present.
-        for key in (
-            "vuln_status",
-            "published",
-            "last_modified",
-            "cwe",
-            "cvss",
-            "known_exploited_vulnerability",
-            "kev_date_added",
-            "applicability",
-            "nvd_url",
-            "correlation_basis",
-            "requires_validation",
-            "finding",
-        ):
-            if key in item:
-                candidate[key] = item[key]
-
-        candidates.append(candidate)
+        candidates.append(
+            {
+                "cve_id": cve_id,
+                "description": description,
+                "source": str(path),
+                "correlation": "http-method-related keyword match",
+                "classification": "cve-candidate",
+            }
+        )
 
     return candidates
 
@@ -1029,38 +917,6 @@ def assessment_from_probes(
     }
 
 
-
-def build_source_status(
-    version_data: Dict[str, Any],
-    directory_data: Dict[str, Any],
-) -> Dict[str, str]:
-    """Return source artifact statuses without performing network access."""
-
-    def artifact_status(data: Optional[Dict[str, Any]]) -> str:
-        if not isinstance(data, dict) or not data:
-            return "unknown"
-
-        checklist = data.get("checklist")
-        if isinstance(checklist, dict):
-            status = checklist.get("status")
-            if status:
-                return str(status)
-
-        # Compatibility with existing wrapper artifacts.
-        for block_name in ("directory", "methods", "webserver_version"):
-            block = data.get(block_name)
-            if isinstance(block, dict) and block.get("status"):
-                return str(block.get("status"))
-
-        status = data.get("status")
-        return str(status) if status else "unknown"
-
-    return {
-        "version": artifact_status(version_data),
-        "directory": artifact_status(directory_data),
-    }
-
-
 def initialize_artifact() -> int:
     scope = load_project_scope()
     target = choose_primary_scope(scope)
@@ -1075,146 +931,58 @@ def initialize_artifact() -> int:
     recon_results = extract_recon_results(recon_data)
     candidates = build_endpoint_candidates(recon_data)
 
-    version_path = version_artifact_path()
-    version_data = load_yaml(version_path) if version_path.exists() else {}
-
-    now = utc_now()
-
     data = {
         "schema_version": SCHEMA_VERSION,
-        "tool": {
-            "name": "BrebesKab-CSIRT-Tools",
-            "script": "methods.py",
-            "version": APP_VERSION,
-        },
         "project_id": project_id_from_dir(project_dir()),
-        "checklist": {
-            "id": CHECKLIST_ID,
-            "name": CHECKLIST_NAME,
-            "phase": "04 Web Server Configuration",
-            "focus": "Controlled assessment of HTTP method exposure",
+        "updated_at": utc_now(),
+        "methods": {
             "status": "initialized",
-        },
-        "target": {
+            "checklist_id": CHECKLIST_ID,
+            "checklist_name": CHECKLIST_NAME,
             "application": "Bangsaku",
-            "hostname": target["value"],
-            "url": f"https://{target['value']}/",
-            "environment": "Production",
-            "assessment_type": "Grey Box",
-            "scope_id": target.get("scope_id"),
-            "scope_reference": str(project_dir() / SCOPE_REL),
-            "authorized_ports": target["ports"],
-        },
-        "methodology": {
-            "endpoint_source": "Recon directory.yaml",
-            "endpoint_source_path": str(recon_path),
-            "recon_paths": len(recon_results),
-            "selected_candidates": len(candidates),
-            "cve_source": "4-001 version.yaml",
-            "methods": METHODS,
-            "http_https_separate": True,
-            "redirect_following": False,
-            "mutation_payload": False,
-            "request_body_sent": False,
-            "discovery": False,
-            "brute_force": False,
-            "automatic_finding": False,
-            "raw_evidence_retained": True,
-        },
-        "baseline": {
-            "scope": str(project_dir() / SCOPE_REL),
-            "recon_directory": str(recon_path),
-            "version_artifact": str(version_path),
-        },
-        "toolchain": {
-            "python": True,
-            "requests": True,
-            "pyyaml": True,
-            "curl": "optional",
-            "nmap": False,
-            "gobuster": False,
-            "ffuf": False,
-            "nikto": False,
-        },
-        "probe": {
-            "methods": METHODS,
-            "authorized_ports": target["ports"],
-            "timeout_seconds": DEFAULT_TIMEOUT,
-            "max_body_bytes": MAX_BODY_BYTES,
-            "allow_redirects": False,
-            "verify_tls": True,
-            "request_body_sent": False,
-            "candidate_count": len(candidates),
-            "target_count": len(
-                [port for port in target["ports"] if int(port) in {80, 443}]
-            ),
-            "expected_probe_count": (
-                len(candidates)
-                * len(METHODS)
-                * len([port for port in target["ports"] if int(port) in {80, 443}])
-            ),
-        },
-        "source_status": build_source_status(
-            version_data,
-            recon_data,
-        ),
-        "results": {
-            "candidates": candidates,
+            "target": {
+                "type": target["type"],
+                "value": target["value"],
+                "ports": target["ports"],
+                "scope_id": target.get("scope_id"),
+            },
+            "method_set": METHODS,
+            "endpoint_source": {
+                "type": "recon-directory",
+                "path": str(recon_path),
+                "recon_status": recon_data.get(
+                    "directory", {}
+                ).get(
+                    "status",
+                    recon_data.get("status", ""),
+                ),
+                "recon_paths": len(recon_results),
+                "selected_candidates": len(candidates),
+            },
             "probes": [],
+            "summary": {
+                "probes": 0,
+                "accepted": 0,
+                "rejected": 0,
+                "not_allowed": 0,
+                "access_controlled": 0,
+                "redirected": 0,
+                "not_found": 0,
+                "server_errors": 0,
+                "request_rejected": 0,
+                "probe_errors": 0,
+                "other": 0,
+            },
+            "cve_candidates": [],
+            "assessment": {
+                "status": "initialized",
+                "finding": False,
+                "requires_review": False,
+                "summary": (
+                    "Artifact diinisialisasi; belum dilakukan method probing."
+                ),
+            },
         },
-        "summary": {
-            "probes": 0,
-            "accepted": 0,
-            "rejected": 0,
-            "not_allowed": 0,
-            "access_controlled": 0,
-            "redirected": 0,
-            "not_found": 0,
-            "server_errors": 0,
-            "request_rejected": 0,
-            "probe_errors": 0,
-            "other": 0,
-        },
-        "cve_correlation": {
-            "source": "4-001 version.yaml",
-            "source_path": str(version_path),
-            "candidate_count": 0,
-            "candidates": [],
-            "applicability_validated": False,
-            "automatic_finding": False,
-            "triage_note": (
-                "CVE correlation is heuristic candidate evidence only; "
-                "no automatic vulnerability finding."
-            ),
-        },
-        "assessment": {
-            "result": "initialized",
-            "finding": False,
-            "requires_review": False,
-            "accepted_mutating_count": 0,
-            "accepted_trace_count": 0,
-            "accepted_post_count": 0,
-            "cve_candidate_count": 0,
-            "summary": (
-                "Artifact diinisialisasi; belum dilakukan method probing."
-            ),
-        },
-        "evidence": {
-            "raw_probe_file": str(evidence_path()),
-        },
-        "errors": [],
-        "notes": [
-            "Accepted HTTP methods are evidence, not automatic vulnerabilities.",
-            "PUT/PATCH/DELETE probes send no request body.",
-            "TRACE acceptance is recorded for security review.",
-            "CVE correlation is heuristic candidate evidence only.",
-            "No redirect following is performed.",
-            "No application CRUD operation is intentionally executed.",
-            "No brute-force directory discovery is performed.",
-            "Raw evidence is retained for auditability.",
-        ],
-        "generated_at": now,
-        "updated_at": now,
     }
 
     save_yaml(artifact_path(), data)
@@ -1241,8 +1009,6 @@ def analyze() -> int:
     recon_results = extract_recon_results(recon_data)
     candidates = build_endpoint_candidates(recon_data)
 
-    version_path = version_artifact_path()
-    version_data = load_yaml(version_path) if version_path.exists() else {}
     cves = load_version_cves()
 
     session = requests.Session()
@@ -1285,130 +1051,52 @@ def analyze() -> int:
 
     summary = summarize_probes(probes)
     assessment = assessment_from_probes(probes, cves)
-    now = utc_now()
 
     artifact = {
         "schema_version": SCHEMA_VERSION,
-        "tool": {
-            "name": "BrebesKab-CSIRT-Tools",
-            "script": "methods.py",
-            "version": APP_VERSION,
-        },
         "project_id": project_id_from_dir(project_dir()),
-        "checklist": {
-            "id": CHECKLIST_ID,
-            "name": CHECKLIST_NAME,
-            "phase": "04 Web Server Configuration",
-            "focus": "Controlled assessment of HTTP method exposure",
+        "updated_at": utc_now(),
+        "methods": {
             "status": "completed",
-        },
-        "target": {
+            "checklist_id": CHECKLIST_ID,
+            "checklist_name": CHECKLIST_NAME,
             "application": "Bangsaku",
-            "hostname": target["value"],
-            "url": f"https://{target['value']}/",
-            "environment": "Production",
-            "assessment_type": "Grey Box",
-            "scope_id": target.get("scope_id"),
-            "scope_reference": str(project_dir() / SCOPE_REL),
-            "authorized_ports": target["ports"],
-        },
-        "methodology": {
-            "endpoint_source": "Recon directory.yaml",
-            "endpoint_source_path": str(recon_path),
-            "recon_paths": len(recon_results),
-            "selected_candidates": len(candidates),
-            "cve_source": "4-001 version.yaml",
-            "methods": METHODS,
-            "http_https_separate": True,
-            "redirect_following": False,
-            "mutation_payload": False,
-            "request_body_sent": False,
-            "discovery": False,
-            "brute_force": False,
-            "automatic_finding": False,
-            "raw_evidence_retained": True,
-        },
-        "baseline": {
-            "scope": str(project_dir() / SCOPE_REL),
-            "recon_directory": str(recon_path),
-            "version_artifact": str(version_path),
-        },
-        "toolchain": {
-            "python": True,
-            "requests": True,
-            "pyyaml": True,
-            "curl": "optional",
-            "nmap": False,
-            "gobuster": False,
-            "ffuf": False,
-            "nikto": False,
-        },
-        "probe": {
-            "methods": METHODS,
-            "authorized_ports": target["ports"],
-            "timeout_seconds": DEFAULT_TIMEOUT,
-            "max_body_bytes": MAX_BODY_BYTES,
-            "allow_redirects": False,
-            "verify_tls": True,
-            "request_body_sent": False,
-            "candidate_count": len(candidates),
-            "target_count": len(
-                [port for port in target["ports"] if int(port) in {80, 443}]
-            ),
-            "expected_probe_count": (
-                len(candidates)
-                * len(METHODS)
-                * len([port for port in target["ports"] if int(port) in {80, 443}])
-            ),
-            "actual_probe_count": len(probes),
-        },
-        "source_status": build_source_status(
-            version_data,
-            recon_data,
-        ),
-        "results": {
-            "candidates": candidates,
+            "target": {
+                "type": target["type"],
+                "value": target["value"],
+                "ports": target["ports"],
+                "scope_id": target.get("scope_id"),
+            },
+            "method_set": METHODS,
+            "endpoint_source": {
+                "type": "recon-directory",
+                "path": str(recon_path),
+                "recon_status": recon_data.get(
+                    "directory", {}
+                ).get(
+                    "status",
+                    recon_data.get("status", ""),
+                ),
+                "recon_paths": len(recon_results),
+                "selected_candidates": len(candidates),
+            },
+            "endpoint_candidates": candidates,
             "probes": probes,
+            "summary": summary,
+            "cve_candidates": cves,
+            "assessment": assessment,
+            "assessment_policy": {
+                "automatic_finding": False,
+                "notes": [
+                    "Accepted HTTP methods are evidence, not automatic vulnerabilities.",
+                    "PUT/PATCH/DELETE probes send no request body.",
+                    "TRACE acceptance is recorded for security review.",
+                    "CVE correlation is heuristic candidate evidence only.",
+                    "No redirect following is performed.",
+                    "No application CRUD operation is intentionally executed.",
+                ],
+            },
         },
-        "summary": summary,
-        "cve_correlation": {
-            "source": "4-001 version.yaml",
-            "source_path": str(version_path),
-            "candidate_count": len(cves),
-            "candidates": cves,
-            "applicability_validated": False,
-            "automatic_finding": False,
-            "triage_note": (
-                "CVE correlation is heuristic candidate evidence only; "
-                "no automatic vulnerability finding."
-            ),
-        },
-        "assessment": {
-            **assessment,
-            "result": assessment["status"],
-            "cve_candidate_count": len(cves),
-        },
-        "evidence": {
-            "raw_probe_file": str(evidence_path()),
-            "probe_count": len(probes),
-        },
-        "errors": [
-            item
-            for item in probes
-            if item.get("classification") == "probe-error"
-        ],
-        "notes": [
-            "Accepted HTTP methods are evidence, not automatic vulnerabilities.",
-            "PUT/PATCH/DELETE probes send no request body.",
-            "TRACE acceptance is recorded for security review.",
-            "CVE correlation is heuristic candidate evidence only.",
-            "No redirect following is performed.",
-            "No application CRUD operation is intentionally executed.",
-            "No brute-force directory discovery is performed.",
-            "Raw evidence is retained for auditability.",
-        ],
-        "generated_at": now,
-        "updated_at": now,
     }
 
     save_yaml(artifact_path(), artifact)
@@ -1416,7 +1104,7 @@ def analyze() -> int:
     raw_evidence = {
         "schema_version": SCHEMA_VERSION,
         "project_id": project_id_from_dir(project_dir()),
-        "generated_at": now,
+        "generated_at": utc_now(),
         "checklist_id": CHECKLIST_ID,
         "target": target,
         "methods": METHODS,
@@ -1459,10 +1147,11 @@ def load_artifact() -> Dict[str, Any]:
 
 def list_results() -> int:
     data = load_artifact()
+    block = data.get("methods", {})
 
     print(f"PROJECT: {data.get('project_id')}")
-    print(f"STATUS : {data.get('checklist', {}).get('status')}")
-    print(f"TARGET : {data.get('target', {}).get('hostname')}")
+    print(f"STATUS : {block.get('status')}")
+    print(f"TARGET : {block.get('target', {}).get('value')}")
     print()
 
     print(
@@ -1471,7 +1160,7 @@ def list_results() -> int:
     )
     print("-" * 100)
 
-    probes = data.get("results", {}).get("probes", [])
+    probes = block.get("probes", [])
     if not isinstance(probes, list):
         probes = []
 
@@ -1481,28 +1170,23 @@ def list_results() -> int:
         method = str(item.get("method", "-"))
         path = str(item.get("path", "-"))
         status = str(item.get("status_code", "-"))
-        classification = str(item.get("classification", "-"))
+        classification = str(
+            item.get("classification", "-")
+        )
 
         print(
             f"{scheme:<6} {port:<5} {method:<9} "
             f"{path[:28]:<29} {status:<6} {classification}"
         )
 
-    summary = data.get("summary", {})
+    summary = block.get("summary", {})
     print()
     print("SUMMARY")
     print("-" * 100)
-    if isinstance(summary, dict):
-        for key, value in summary.items():
-            print(f"{key}: {value}")
+    for key, value in summary.items():
+        print(f"{key}: {value}")
 
-    cve_correlation = data.get("cve_correlation", {})
-    cves = (
-        cve_correlation.get("candidates", [])
-        if isinstance(cve_correlation, dict)
-        else []
-    )
-
+    cves = block.get("cve_candidates", [])
     print()
     print(f"CVE CANDIDATES: {len(cves)}")
 
@@ -1512,13 +1196,15 @@ def list_results() -> int:
             f"{cve.get('description', '')[:180]}"
         )
 
-    assessment = data.get("assessment", {})
+    assessment = block.get("assessment", {})
     print()
     print("ASSESSMENT")
     print("-" * 100)
     print(f"status          : {assessment.get('status')}")
     print(f"finding         : {assessment.get('finding')}")
-    print(f"requires_review : {assessment.get('requires_review')}")
+    print(
+        f"requires_review : {assessment.get('requires_review')}"
+    )
     print(f"summary         : {assessment.get('summary')}")
 
     return 0
@@ -1531,129 +1217,100 @@ def verify() -> int:
         print(f"[FAIL] Tidak dapat membaca artifact: {exc}")
         return 1
 
+    block = data.get("methods")
+    if not isinstance(block, dict):
+        print("[FAIL] Block methods tidak ditemukan.")
+        return 1
+
     errors: List[str] = []
 
     if data.get("schema_version") != SCHEMA_VERSION:
-        errors.append(f"schema_version harus {SCHEMA_VERSION}")
+        errors.append(
+            f"schema_version harus {SCHEMA_VERSION}"
+        )
 
-    if data.get("project_id") != project_id_from_dir(project_dir()):
-        errors.append("project_id tidak sesuai dengan active project directory")
+    if block.get("checklist_id") != CHECKLIST_ID:
+        errors.append(
+            f"checklist_id harus {CHECKLIST_ID}"
+        )
 
-    checklist = data.get("checklist")
-    if not isinstance(checklist, dict):
-        errors.append("checklist tidak valid")
-        checklist = {}
+    if block.get("status") != "completed":
+        errors.append("status artifact bukan completed")
 
-    if checklist.get("id") != CHECKLIST_ID:
-        errors.append(f"checklist.id harus {CHECKLIST_ID}")
-
-    if checklist.get("name") != CHECKLIST_NAME:
-        errors.append("checklist.name tidak sesuai")
-
-    if checklist.get("status") != "completed":
-        errors.append("checklist.status bukan completed")
-
-    target = data.get("target")
+    target = block.get("target", {})
     if not isinstance(target, dict):
         errors.append("target tidak valid")
         target = {}
 
-    hostname = target.get("hostname")
-    if not hostname:
-        errors.append("target.hostname kosong")
+    if not target.get("value"):
+        errors.append("target.value kosong")
 
-    authorized_ports = target.get("authorized_ports", [])
-    if not isinstance(authorized_ports, list):
-        errors.append("target.authorized_ports bukan list")
-        authorized_ports = []
+    method_set = block.get("method_set")
+    if method_set != METHODS:
+        errors.append(
+            "method_set tidak sesuai dengan 8 method yang diwajibkan"
+        )
 
-    supported_target_ports = []
-    for port in authorized_ports:
-        try:
-            value = int(port)
-        except (TypeError, ValueError):
-            continue
-        if value in {80, 443}:
-            supported_target_ports.append(value)
+    endpoint_source = block.get("endpoint_source", {})
+    if not isinstance(endpoint_source, dict):
+        errors.append("endpoint_source tidak valid")
+        endpoint_source = {}
 
-    supported_target_ports = list(dict.fromkeys(supported_target_ports))
+    if endpoint_source.get("type") != "recon-directory":
+        errors.append(
+            "endpoint source harus recon-directory"
+        )
 
-    if not supported_target_ports:
-        errors.append("target tidak memiliki port HTTP/HTTPS yang didukung")
+    recon_count = endpoint_source.get("recon_paths")
+    candidate_count = endpoint_source.get("selected_candidates")
 
-    methodology = data.get("methodology")
-    if not isinstance(methodology, dict):
-        errors.append("methodology tidak valid")
-        methodology = {}
-
-    if methodology.get("endpoint_source") != "Recon directory.yaml":
-        errors.append("endpoint source harus Recon directory.yaml")
-
-    if methodology.get("cve_source") != "4-001 version.yaml":
-        errors.append("CVE source harus 4-001 version.yaml")
-
-    if methodology.get("methods") != METHODS:
-        errors.append("methodology.methods tidak sesuai dengan 8 method")
-
-    if methodology.get("redirect_following") is not False:
-        errors.append("redirect_following harus False")
-
-    if methodology.get("request_body_sent") is not False:
-        errors.append("request_body_sent harus False")
-
-    probe = data.get("probe")
-    if not isinstance(probe, dict):
-        errors.append("probe tidak valid")
-        probe = {}
-
-    if probe.get("methods") != METHODS:
-        errors.append("probe.methods tidak sesuai dengan 8 method")
-
-    probe_ports = probe.get("authorized_ports", [])
-    if not isinstance(probe_ports, list):
-        errors.append("probe.authorized_ports bukan list")
-        probe_ports = []
-
-    if [int(p) for p in probe_ports if str(p).isdigit()] != [
-        int(p) for p in authorized_ports if str(p).isdigit()
-    ]:
-        errors.append("probe.authorized_ports tidak konsisten dengan target")
-
-    candidates = data.get("results", {}).get("candidates", [])
-    probes = data.get("results", {}).get("probes", [])
-    summary = data.get("summary", {})
-    cve_correlation = data.get("cve_correlation", {})
-    assessment = data.get("assessment", {})
+    candidates = block.get("endpoint_candidates", [])
+    probes = block.get("probes", [])
+    summary = block.get("summary", {})
+    cves = block.get("cve_candidates", [])
 
     if not isinstance(candidates, list):
-        errors.append("results.candidates bukan list")
+        errors.append("endpoint_candidates bukan list")
         candidates = []
 
     if not isinstance(probes, list):
-        errors.append("results.probes bukan list")
+        errors.append("probes bukan list")
         probes = []
 
     if not isinstance(summary, dict):
         errors.append("summary bukan mapping")
         summary = {}
 
-    if not isinstance(cve_correlation, dict):
-        errors.append("cve_correlation bukan mapping")
-        cve_correlation = {}
-
-    cves = cve_correlation.get("candidates", [])
     if not isinstance(cves, list):
-        errors.append("cve_correlation.candidates bukan list")
+        errors.append("cve_candidates bukan list")
         cves = []
 
-    if not isinstance(assessment, dict):
-        errors.append("assessment bukan mapping")
-        assessment = {}
+    if candidate_count != len(candidates):
+        errors.append(
+            "jumlah selected_candidates tidak sama dengan endpoint_candidates"
+        )
 
+    # analyze() probes every candidate against every supported target
+    # (HTTP/80 and HTTPS/443) and every method. The previous validator
+    # counted only candidates x methods and therefore rejected the valid
+    # 2-scheme artifact (32 x 8 x 2 = 512).
+    target_ports = target.get("ports", [])
+    if not isinstance(target_ports, list):
+        target_ports = []
+
+    supported_target_ports = [
+        int(port)
+        for port in target_ports
+        if str(port).isdigit() and int(port) in {80, 443}
+    ]
+    supported_target_ports = list(dict.fromkeys(supported_target_ports))
+
+    if not supported_target_ports:
+        errors.append("target tidak memiliki port HTTP/HTTPS yang didukung")
+
+    expected_target_count = len(supported_target_ports)
     expected_probe_count = (
-        len(candidates)
-        * len(METHODS)
-        * len(supported_target_ports)
+        len(candidates) * len(METHODS) * expected_target_count
     )
 
     if len(probes) != expected_probe_count:
@@ -1661,26 +1318,16 @@ def verify() -> int:
             f"jumlah probes {len(probes)} != "
             f"candidates({len(candidates)}) x "
             f"methods({len(METHODS)}) x "
-            f"targets({len(supported_target_ports)}) "
+            f"targets({expected_target_count}) "
             f"= {expected_probe_count}"
         )
-
-    if probe.get("candidate_count") != len(candidates):
-        errors.append("probe.candidate_count tidak konsisten")
-
-    if probe.get("expected_probe_count") != expected_probe_count:
-        errors.append("probe.expected_probe_count tidak konsisten")
-
-    if probe.get("actual_probe_count") != len(probes):
-        errors.append("probe.actual_probe_count tidak konsisten")
 
     expected_target_pairs = {
         (80, "HTTP"),
         (443, "HTTPS"),
     }
     expected_target_pairs = {
-        pair
-        for pair in expected_target_pairs
+        pair for pair in expected_target_pairs
         if pair[0] in supported_target_ports
     }
 
@@ -1720,20 +1367,26 @@ def verify() -> int:
 
         if item.get("method") not in METHODS:
             errors.append(
-                f"probe[{index}] method tidak valid: {item.get('method')}"
+                f"probe[{index}] method tidak valid: "
+                f"{item.get('method')}"
             )
 
         if item.get("port") not in {80, 443}:
             errors.append(
-                f"probe[{index}] port di luar checklist: {item.get('port')}"
+                f"probe[{index}] port di luar checklist: "
+                f"{item.get('port')}"
             )
 
-        if item.get("request_body_sent") not in {False, None}:
+        if item.get("request_body_sent") not in {
+            False,
+            None,
+        }:
             errors.append(
                 f"probe[{index}] request body seharusnya tidak dikirim"
             )
 
     recalculated = summarize_probes(probes)
+
     for key, value in recalculated.items():
         if summary.get(key) != value:
             errors.append(
@@ -1741,11 +1394,10 @@ def verify() -> int:
                 f"berbeda dari hasil recalculation={value}"
             )
 
-    if cve_correlation.get("source") != "4-001 version.yaml":
-        errors.append("cve_correlation.source tidak sesuai")
-
-    if cve_correlation.get("candidate_count") != len(cves):
-        errors.append("cve_correlation.candidate_count tidak konsisten")
+    assessment = block.get("assessment", {})
+    if not isinstance(assessment, dict):
+        errors.append("assessment bukan mapping")
+        assessment = {}
 
     if assessment.get("finding") is not False:
         errors.append(
@@ -1753,14 +1405,17 @@ def verify() -> int:
             "checklist ini tidak membuat automatic vulnerability finding"
         )
 
-    if assessment.get("cve_candidate_count") != len(cves):
-        errors.append("assessment.cve_candidate_count tidak konsisten")
+    if len(cves) != int(
+        assessment.get("cve_candidate_count", len(cves))
+    ):
+        errors.append(
+            "cve_candidate_count tidak konsisten"
+        )
 
-    if not isinstance(data.get("source_status"), dict):
-        errors.append("source_status tidak valid")
-
-    if not isinstance(data.get("errors"), list):
-        errors.append("errors harus berupa list")
+    if not isinstance(recon_count, int):
+        errors.append(
+            "endpoint_source.recon_paths bukan integer"
+        )
 
     if errors:
         print("[FAIL] HTTP Methods gagal validasi.")
@@ -1770,13 +1425,9 @@ def verify() -> int:
 
     print("[PASS] HTTP Methods memenuhi validasi.")
     print(f"[PASS] Checklist : {CHECKLIST_ID} {CHECKLIST_NAME}")
-    print(f"[PASS] Version   : {APP_VERSION}")
-    print(f"[PASS] Status    : {checklist.get('status')}")
-    print(f"[PASS] Target    : {target.get('hostname')}")
-    print(
-        f"[PASS] Recon     : "
-        f"{methodology.get('recon_paths')} path(s)"
-    )
+    print(f"[PASS] Status    : {block.get('status')}")
+    print(f"[PASS] Target    : {target.get('value')}")
+    print(f"[PASS] Recon     : {recon_count} path(s)")
     print(f"[PASS] Candidates: {len(candidates)}")
     print(f"[PASS] Methods   : {len(METHODS)}")
     print(f"[PASS] Probes    : {len(probes)}")
