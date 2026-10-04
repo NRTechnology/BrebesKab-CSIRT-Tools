@@ -2405,6 +2405,8 @@ function Install-AuthWordlists {
             Category='passwords'
             File='10-million-password-list-top-1000.txt'
             SourcePath='Passwords/Common-Credentials/10-million-password-list-top-1000.txt'
+            SourceRepository='pentesting-tools/SecLists'
+            SourceUrl='https://gitlab.com/pentesting-tools/SecLists/-/raw/master/Passwords/Common-Credentials/10-million-password-list-top-1000.txt'
             DestinationRoot=$AuthPasswordsDir
         },
         [pscustomobject]@{
@@ -2419,7 +2421,17 @@ function Install-AuthWordlists {
     $manifest=New-Object System.Collections.ArrayList
 
     foreach($item in $authWordlists){
+        $sourceRepository='danielmiessler/SecLists'
         $url="https://raw.githubusercontent.com/danielmiessler/SecLists/master/$($item.SourcePath)"
+
+        if($item.PSObject.Properties['SourceRepository']){
+            $sourceRepository=[string]$item.SourceRepository
+        }
+
+        if($item.PSObject.Properties['SourceUrl']){
+            $url=[string]$item.SourceUrl
+        }
+
         $destination=Join-Path $item.DestinationRoot $item.File
         $previous=@(
             $previousManifest |
@@ -2430,10 +2442,13 @@ function Install-AuthWordlists {
         )
         $previousEntry=if($previous.Count -gt 0){ $previous[0] } else { $null }
 
-        $sourceMeta=Get-GitHubFileMetadata `
-            -Repository 'danielmiessler/SecLists' `
-            -Path $item.SourcePath `
-            -Ref 'master'
+        $sourceMeta=$null
+        if($sourceRepository -eq 'danielmiessler/SecLists'){
+            $sourceMeta=Get-GitHubFileMetadata `
+                -Repository $sourceRepository `
+                -Path $item.SourcePath `
+                -Ref 'master'
+        }
 
         $sourceSha=if($sourceMeta){ [string]$sourceMeta.Sha } else { '' }
         $sourceSize=if($sourceMeta){ [int64]$sourceMeta.Size } else { 0 }
@@ -2444,7 +2459,7 @@ function Install-AuthWordlists {
             -Destination $destination `
             -Source 'SecLists' `
             -Category "authentication/$($item.Category)" `
-            -SourceId "danielmiessler/SecLists:$($item.SourcePath)" `
+            -SourceId "${sourceRepository}:$($item.SourcePath)" `
             -SourceSha $sourceSha `
             -RemoteSize $sourceSize `
             -PreviousEntry $previousEntry `
@@ -2457,9 +2472,9 @@ function Install-AuthWordlists {
                 -Category "authentication/$($item.Category)" `
                 -Name $item.Name `
                 -Path (Get-RepoRelativePath $destination) `
-                -Source 'danielmiessler/SecLists' `
+                -Source $sourceRepository `
                 -Url $url `
-                -SourceId "danielmiessler/SecLists:$($item.SourcePath)" `
+                -SourceId "${sourceRepository}:$($item.SourcePath)" `
                 -SourceSha $sourceSha
         }
     }

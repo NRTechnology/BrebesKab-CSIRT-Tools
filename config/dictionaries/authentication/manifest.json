@@ -1,6 +1,6 @@
 {
     "schema_version":  1,
-    "generated_at":  "2026-10-04T18:43:25.2385747+07:00",
+    "generated_at":  "2026-10-04T18:55:39.3203245+07:00",
     "root":  "config/dictionaries/authentication",
     "purpose":  "Controlled authentication login-attempt testing",
     "sources":  [
@@ -27,7 +27,7 @@
                           "sha256":  "",
                           "etag":  "",
                           "last_modified":  "",
-                          "checked_at":  "2026-10-04T18:43:24.1419618+07:00"
+                          "checked_at":  "2026-10-04T18:55:38.2882469+07:00"
                       },
                       {
                           "category":  "authentication/default-credentials",
@@ -44,7 +44,7 @@
                           "sha256":  "",
                           "etag":  "",
                           "last_modified":  "",
-                          "checked_at":  "2026-10-04T18:43:25.2385747+07:00"
+                          "checked_at":  "2026-10-04T18:55:39.3203245+07:00"
                       }
                   ]
 }
