@@ -28,7 +28,7 @@ import typer
 import yaml
 
 APP_NAME = "BrebesKab-CSIRT-Tools config.py"
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 SCHEMA_VERSION = "1.0"
 CHECKLIST_ID = "4-005"
 CHECKLIST_NAME = "Web server configuration exposure"
@@ -269,13 +269,29 @@ def load_context(repo_root: Path, project_id: str) -> dict[str, Any]:
 
 
 def source_status(path: Path, block_name: str) -> str:
+    """Read source status from canonical schema, with legacy fallback.
+
+    Canonical Web Server checklist artifacts keep completion status under
+    ``checklist.status``.  The legacy wrapper schema used a named block such
+    as ``webserver_version.status``.  Prefer the canonical location so the
+    reader follows the current 4-001 version.yaml without changing probe
+    behavior.
+    """
     try:
         data = load_yaml(path)
     except FileNotFoundError:
         return "not-available"
+
+    checklist = data.get("checklist", {})
+    if isinstance(checklist, dict):
+        status = checklist.get("status")
+        if status:
+            return str(status)
+
     block = data.get(block_name, {})
     if isinstance(block, dict):
         return str(block.get("status") or "unknown")
+
     return "unknown"
 
 
@@ -380,8 +396,22 @@ def initial_artifact(context: dict[str, Any], project_id: str) -> dict[str, Any]
 
 
 def extract_config_cves(version_data: dict[str, Any]) -> list[dict[str, Any]]:
-    ws = version_data.get("webserver_version", {})
-    correlation = ws.get("cve_correlation", {})
+    """Extract configuration-relevant CVE candidates from 4-001.
+
+    The canonical 4-001 artifact stores ``cve_correlation`` at the YAML root.
+    Keep a legacy ``webserver_version`` fallback so older artifacts remain
+    readable, without changing the existing CVE filtering logic below.
+    """
+    correlation = version_data.get("cve_correlation", {})
+
+    if not isinstance(correlation, dict) or not correlation:
+        ws = version_data.get("webserver_version", {})
+        if isinstance(ws, dict):
+            correlation = ws.get("cve_correlation", {})
+
+    if not isinstance(correlation, dict):
+        return []
+
     products = correlation.get("products", [])
     if not isinstance(products, list):
         return []

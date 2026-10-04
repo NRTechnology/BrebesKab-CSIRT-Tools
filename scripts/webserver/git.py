@@ -55,7 +55,7 @@ except ImportError:
 
 
 APP_NAME = "BrebesKab-CSIRT-Tools"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.2"
 SCHEMA_VERSION = "1.0"
 
 CHECKLIST_ID = "4-007"
@@ -965,6 +965,18 @@ def build_cve_correlation(
     version_target = version_data.get("target", {})
     version_summary = version_data.get("summary", {})
 
+    if not isinstance(version_checklist, dict):
+        version_checklist = {}
+    if not isinstance(version_target, dict):
+        version_target = {}
+    if not isinstance(version_summary, dict):
+        version_summary = {}
+
+    source_target = (
+        version_target.get("hostname")
+        or version_target.get("value")
+    )
+
     return {
         "source": (
             "04-web-server-configuration/version/version.yaml"
@@ -972,12 +984,8 @@ def build_cve_correlation(
             else None
         ),
         "source_checklist": version_checklist.get("id"),
-        "source_target": version_target.get("value"),
-        "source_disclosed_versions": (
-            version_summary.get("unique_versions")
-            if isinstance(version_summary, dict)
-            else None
-        ),
+        "source_target": source_target,
+        "source_disclosed_versions": version_summary.get("unique_versions"),
         "candidate_count": 0,
         "candidates": [],
         "assessment_note": (
@@ -1023,6 +1031,8 @@ def build_artifact(
 
     cve = build_cve_correlation(version_data)
 
+    target_url = make_url("https", target, 443, "/")
+
     return {
         "schema_version": SCHEMA_VERSION,
         "tool": {
@@ -1030,37 +1040,96 @@ def build_artifact(
             "script": "git.py",
             "version": APP_VERSION,
         },
+        "project_id": project,
         "checklist": {
             "id": CHECKLIST_ID,
-            "name": CHECKLIST_NAME,
+            "name": "Git repository / metadata exposure",
+            "phase": "04 Web Server Configuration",
+            "focus": (
+                "Controlled assessment of accidentally exposed Git "
+                "repository metadata through HTTP/HTTPS."
+            ),
+            "status": "completed",
+        },
+        "target": {
+            "application": target,
+            "hostname": target,
+            "url": target_url,
+            "environment": "Production",
+            "assessment_type": "Grey Box",
+            "scope_id": scope_id,
+            "scope_reference": "01-preparation/scope/scope.yaml",
+            "authorized_ports": ports,
+        },
+        "methodology": {
+            "description": (
+                "Controlled GET/HEAD assessment of a bounded set of Git "
+                "metadata paths. Recon directory.yaml is authoritative for "
+                "discovered /.git-style candidates; no generic endpoint "
+                "fuzzing is performed."
+            ),
             "methods": list(METHODS),
-            "automatic_finding": False,
             "redirect_following": False,
             "mutation": False,
-            "discovery_bruteforce": False,
+            "request_body": False,
             "repository_clone": False,
+            "recursive_git_object_download": False,
+            "discovery_bruteforce": False,
+            "classification": (
+                "HTTP behavior plus conservative Git metadata indicators; "
+                "HTTP status alone is not treated as Git exposure."
+            ),
+            "automatic_finding": False,
         },
-        "project": project,
-        "target": {
-            "scope_id": scope_id,
-            "value": target,
-            "ports": ports,
-            "protocols": ["http", "https"],
-        },
-        "recon": {
-            "source": (
+        "baseline": {
+            "scope_source": "01-preparation/scope/scope.yaml",
+            "recon_source": (
                 "02-reconnaissance/directory/directory.yaml"
             ),
-            "path_count": recon_count,
-            "candidate_count": len(candidates),
-            "candidate_source": (
-                "Bounded Git metadata paths; Recon used only to retain "
-                "discovered /.git-style paths"
+            "version_source": (
+                "04-web-server-configuration/version/version.yaml"
+            ),
+            "error_source": (
+                "04-web-server-configuration/errors/errors.yaml"
+            ),
+            "candidate_policy": (
+                "Bounded Git metadata paths plus discovered /.git-style "
+                "paths from Recon."
             ),
         },
-        "candidates": candidates,
+        "toolchain": {
+            "python": True,
+            "requests": True,
+            "pyyaml": True,
+            "optional_tools": [],
+        },
+        "probe": {
+            "methods": list(METHODS),
+            "authorized_ports": ports,
+            "timeout_seconds": DEFAULT_TIMEOUT,
+            "max_body_bytes": MAX_BODY_BYTES,
+            "body_sample_chars": BODY_SAMPLE_CHARS,
+            "redirects": False,
+            "streaming": True,
+            "mutation": False,
+            "repository_clone": False,
+        },
+        "source_status": {
+            "scope": "completed",
+            "directory": "completed",
+            "version": "completed" if version_data else "unknown",
+            "errors": "completed" if error_data else "unknown",
+        },
+        "results": {
+            "recon_path_count": recon_count,
+            "candidate_count": len(candidates),
+            "probe_count": len(probes),
+            "summary": summary,
+        },
         "summary": summary,
+        "cve_correlation": cve,
         "assessment": {
+            "result": classification,
             "finding": False,
             "requires_review": requires_review,
             "classification": classification,
@@ -1069,23 +1138,47 @@ def build_artifact(
                 "vulnerability finding is created."
             ),
         },
-        "cve": cve,
-        "supporting_evidence": {
-            "errors_artifact": bool(error_data),
-            "errors_source": (
-                "04-web-server-configuration/errors/errors.yaml"
-                if error_data
-                else None
+        "evidence": {
+            "raw_probe_file": (
+                "04-web-server-configuration/git/evidence/"
+                "git-probes.json"
             ),
-            "version_artifact": bool(version_data),
-            "version_source": (
-                "04-web-server-configuration/version/version.yaml"
-                if version_data
-                else None
+            "raw_body_retained": True,
+            "report_redaction": (
+                "separate report-generation layer"
             ),
+            "supporting_artifacts": {
+                "version": bool(version_data),
+                "version_source": (
+                    "04-web-server-configuration/version/version.yaml"
+                    if version_data
+                    else None
+                ),
+                "errors": bool(error_data),
+                "errors_source": (
+                    "04-web-server-configuration/errors/errors.yaml"
+                    if error_data
+                    else None
+                ),
+            },
         },
-        "probes": probes,
+        "errors": [
+            probe.get("error")
+            for probe in probes
+            if probe.get("error")
+        ],
+        "notes": [
+            "Git exposure is not automatically mapped to a CVE.",
+            (
+                "4-001 version evidence is supporting traceability only; "
+                "version match is not a vulnerability finding."
+            ),
+            "Repository cloning and recursive object retrieval are disabled.",
+        ],
         "generated_at": utc_now(),
+        "updated_at": utc_now(),
+        "candidates": candidates,
+        "probes": probes,
     }
 
 
@@ -1125,6 +1218,8 @@ def command_init(root: Path) -> int:
         / "git.yaml"
     )
 
+    target_url = make_url("https", target, 443, "/")
+
     artifact = {
         "schema_version": SCHEMA_VERSION,
         "tool": {
@@ -1132,46 +1227,124 @@ def command_init(root: Path) -> int:
             "script": "git.py",
             "version": APP_VERSION,
         },
+        "project_id": project,
         "checklist": {
             "id": CHECKLIST_ID,
-            "name": CHECKLIST_NAME,
+            "name": "Git repository / metadata exposure",
+            "phase": "04 Web Server Configuration",
+            "focus": (
+                "Controlled assessment of accidentally exposed Git "
+                "repository metadata through HTTP/HTTPS."
+            ),
+            "status": "initialized",
+        },
+        "target": {
+            "application": target,
+            "hostname": target,
+            "url": target_url,
+            "environment": "Production",
+            "assessment_type": "Grey Box",
+            "scope_id": scope_id,
+            "scope_reference": "01-preparation/scope/scope.yaml",
+            "authorized_ports": ports,
+        },
+        "methodology": {
+            "description": (
+                "Controlled GET/HEAD assessment of bounded Git metadata "
+                "paths. Recon is used only for discovered /.git-style paths."
+            ),
             "methods": list(METHODS),
-            "automatic_finding": False,
             "redirect_following": False,
             "mutation": False,
-            "discovery_bruteforce": False,
+            "request_body": False,
             "repository_clone": False,
+            "recursive_git_object_download": False,
+            "discovery_bruteforce": False,
+            "automatic_finding": False,
         },
-        "project": project,
-        "target": {
-            "scope_id": scope_id,
-            "value": target,
-            "ports": ports,
-            "protocols": ["http", "https"],
-        },
-        "recon": {
-            "source": (
+        "baseline": {
+            "scope_source": "01-preparation/scope/scope.yaml",
+            "recon_source": (
                 "02-reconnaissance/directory/directory.yaml"
             ),
-            "path_count": len(recon_paths),
-            "candidate_count": len(candidates),
-            "candidate_source": (
-                "Bounded Git metadata paths; Recon used only to retain "
-                "discovered /.git-style paths"
+            "version_source": (
+                "04-web-server-configuration/version/version.yaml"
+            ),
+            "error_source": (
+                "04-web-server-configuration/errors/errors.yaml"
             ),
         },
-        "candidates": candidates,
-        "probes": [],
+        "toolchain": {
+            "python": True,
+            "requests": True,
+            "pyyaml": True,
+            "optional_tools": [],
+        },
+        "probe": {
+            "methods": list(METHODS),
+            "authorized_ports": ports,
+            "timeout_seconds": DEFAULT_TIMEOUT,
+            "max_body_bytes": MAX_BODY_BYTES,
+            "body_sample_chars": BODY_SAMPLE_CHARS,
+            "redirects": False,
+            "mutation": False,
+            "repository_clone": False,
+        },
+        "source_status": {
+            "scope": "completed",
+            "directory": "completed",
+            "version": "unknown",
+            "errors": "unknown",
+        },
+        "results": {
+            "recon_path_count": len(recon_paths),
+            "candidate_count": len(candidates),
+            "probe_count": 0,
+            "summary": build_summary([]),
+        },
+        "summary": build_summary([]),
+        "cve_correlation": {
+            "source": (
+                "04-web-server-configuration/version/version.yaml"
+            ),
+            "source_checklist": None,
+            "source_target": None,
+            "source_disclosed_versions": None,
+            "candidate_count": 0,
+            "candidates": [],
+            "assessment_note": (
+                "Tidak ada CVE yang dikaitkan otomatis dengan Git exposure. "
+                "CVE/version evidence dari 4-001 hanya digunakan sebagai "
+                "supporting traceability; version match bukan vulnerability."
+            ),
+        },
         "assessment": {
+            "result": "initialized",
             "finding": False,
             "requires_review": False,
             "classification": "initialized",
+            "note": (
+                "Git metadata indicators are review evidence; no automatic "
+                "vulnerability finding is created."
+            ),
         },
-        "cve": {
-            "candidate_count": 0,
-            "candidates": [],
+        "evidence": {
+            "raw_probe_file": (
+                "04-web-server-configuration/git/evidence/"
+                "git-probes.json"
+            ),
+            "raw_body_retained": True,
+            "report_redaction": "separate report-generation layer",
         },
+        "errors": [],
+        "notes": [
+            "Repository cloning and recursive object retrieval are disabled.",
+            "Automatic vulnerability finding is disabled.",
+        ],
         "generated_at": utc_now(),
+        "updated_at": utc_now(),
+        "candidates": candidates,
+        "probes": [],
     }
 
     dump_yaml(output, artifact)
@@ -1274,16 +1447,26 @@ def command_analyze(
         error_data=error_data,
     )
 
+    artifact["checklist"]["status"] = "completed"
+    artifact["updated_at"] = utc_now()
+
     evidence = {
         "schema_version": SCHEMA_VERSION,
+        "project_id": project,
+        "checklist": {
+            "id": CHECKLIST_ID,
+            "name": CHECKLIST_NAME,
+        },
+        "target": {
+            "hostname": target,
+            "scope_id": scope_id,
+            "authorized_ports": ports,
+        },
         "tool": {
             "name": APP_NAME,
             "script": "git.py",
             "version": APP_VERSION,
         },
-        "checklist": CHECKLIST_ID,
-        "project": project,
-        "target": target,
         "generated_at": utc_now(),
         "raw_evidence_policy": {
             "body_retained": True,
@@ -1346,7 +1529,7 @@ def command_analyze(
     )
     print(
         "CVE CANDIDATES  : "
-        f"{artifact['cve']['candidate_count']}"
+        f"{artifact['cve_correlation']['candidate_count']}"
     )
     print(
         "REQUIRES REVIEW : "
@@ -1420,48 +1603,96 @@ def command_list(root: Path) -> int:
 
 def command_verify(root: Path) -> int:
     artifact = load_existing_artifact(root)
-
     errors: List[str] = []
 
     if artifact.get("schema_version") != SCHEMA_VERSION:
         errors.append("schema_version tidak sesuai.")
 
+    project_id = artifact.get("project_id")
+    if not project_id:
+        errors.append("project_id wajib tersedia.")
+
     checklist = artifact.get("checklist", {})
+    if not isinstance(checklist, dict):
+        checklist = {}
+        errors.append("checklist harus berupa object.")
 
     if checklist.get("id") != CHECKLIST_ID:
         errors.append("checklist.id tidak sesuai.")
 
-    if checklist.get("repository_clone") is not False:
-        errors.append("repository_clone harus false.")
+    if checklist.get("phase") != "04 Web Server Configuration":
+        errors.append("checklist.phase tidak sesuai.")
+
+    if checklist.get("status") not in {"initialized", "completed"}:
+        errors.append("checklist.status tidak valid.")
+
+    target = artifact.get("target", {})
+    if not isinstance(target, dict):
+        target = {}
+        errors.append("target harus berupa object.")
+
+    target_hostname = target.get("hostname")
+    ports = target.get("authorized_ports") or []
+
+    if not target_hostname:
+        errors.append("target.hostname wajib tersedia.")
+
+    if not isinstance(ports, list):
+        errors.append("target.authorized_ports harus berupa list.")
+        ports = []
+
+    methodology = artifact.get("methodology", {})
+    if not isinstance(methodology, dict):
+        methodology = {}
+        errors.append("methodology harus berupa object.")
+
+    if methodology.get("repository_clone") is not False:
+        errors.append("methodology.repository_clone harus false.")
+
+    if methodology.get("redirect_following") is not False:
+        errors.append("methodology.redirect_following harus false.")
+
+    if methodology.get("mutation") is not False:
+        errors.append("methodology.mutation harus false.")
+
+    if methodology.get("automatic_finding") is not False:
+        errors.append("methodology.automatic_finding harus false.")
+
+    probe_config = artifact.get("probe", {})
+    if not isinstance(probe_config, dict):
+        probe_config = {}
+        errors.append("probe harus berupa object.")
+
+    if probe_config.get("methods") != list(METHODS):
+        errors.append("probe.methods tidak sesuai.")
+
+    if probe_config.get("redirects") is not False:
+        errors.append("probe.redirects harus false.")
 
     probes = artifact.get("probes")
-
     if not isinstance(probes, list):
         errors.append("probes harus berupa list.")
         probes = []
 
-    target = artifact.get("target", {})
-    target_value = target.get("value")
-    ports = target.get("ports") or []
+    results = artifact.get("results", {})
+    if not isinstance(results, dict):
+        results = {}
+        errors.append("results harus berupa object.")
 
-    candidates = artifact.get("recon", {}).get(
-        "candidate_count",
-        0,
-    )
-
+    candidates = int(results.get("candidate_count", 0) or 0)
+    expected_pairs = 0
     try:
         expected_pairs = len(
             target_pairs(
-                str(target_value or ""),
+                str(target_hostname or ""),
                 [int(port) for port in ports],
             )
         )
     except (TypeError, ValueError):
-        expected_pairs = 0
-        errors.append("target.ports tidak valid.")
+        errors.append("target.authorized_ports tidak valid.")
 
     expected_probes = (
-        int(candidates)
+        candidates
         * len(METHODS)
         * expected_pairs
     )
@@ -1491,9 +1722,7 @@ def command_verify(root: Path) -> int:
         path = canonical_path(str(probe.get("path") or ""))
 
         if method not in METHODS:
-            errors.append(
-                f"Probe #{index}: method tidak valid."
-            )
+            errors.append(f"Probe #{index}: method tidak valid.")
 
         if classification not in allowed_classifications:
             errors.append(
@@ -1554,22 +1783,52 @@ def command_verify(root: Path) -> int:
             "git-head-exposed",
         }:
             indicators = probe.get("git_indicators") or {}
-
             if not indicators.get("strong_git_indicator"):
                 errors.append(
                     f"Probe #{index}: positive Git classification "
                     "tanpa strong_git_indicator."
                 )
 
+    summary = artifact.get("summary", {})
+    if not isinstance(summary, dict):
+        summary = {}
+        errors.append("summary harus berupa object.")
+
+    summary_keys = {
+        "git_metadata_exposed",
+        "git_config_exposed",
+        "git_head_exposed",
+        "git_metadata_candidate",
+        "access_controlled",
+        "redirected",
+        "not_found",
+        "application_response",
+        "server_errors",
+        "probe_errors",
+    }
+
+    for key in summary_keys:
+        try:
+            int(summary.get(key, 0))
+        except (TypeError, ValueError):
+            errors.append(f"summary.{key} tidak valid.")
+
+    calculated_summary = build_summary(probes)
+    for key in summary_keys:
+        if int(summary.get(key, 0)) != calculated_summary[key]:
+            errors.append(
+                f"summary.{key} tidak konsisten dengan probes."
+            )
+
     assessment = artifact.get("assessment", {})
+    if not isinstance(assessment, dict):
+        assessment = {}
+        errors.append("assessment harus berupa object.")
 
     if assessment.get("finding") is not False:
         errors.append(
-            "assessment.finding harus false; "
-            "automatic finding disabled."
+            "assessment.finding harus false; automatic finding disabled."
         )
-
-    summary = artifact.get("summary", {})
 
     positive_count = (
         int(summary.get("git_metadata_exposed", 0))
@@ -1585,8 +1844,7 @@ def command_verify(root: Path) -> int:
 
     if assessment.get("requires_review") != expected_review:
         errors.append(
-            "assessment.requires_review tidak konsisten "
-            "dengan summary."
+            "assessment.requires_review tidak konsisten dengan summary."
         )
 
     expected_classification = (
@@ -1601,52 +1859,49 @@ def command_verify(root: Path) -> int:
 
     if assessment.get("classification") != expected_classification:
         errors.append(
-            "assessment.classification tidak konsisten "
-            "dengan summary."
+            "assessment.classification tidak konsisten dengan summary."
         )
 
-    cve = artifact.get("cve", {})
+    cve = artifact.get("cve_correlation", {})
+    if not isinstance(cve, dict):
+        cve = {}
+        errors.append("cve_correlation harus berupa object.")
 
-    if cve.get("candidate_count") != len(
-        cve.get("candidates", [])
-        if isinstance(cve.get("candidates", []), list)
-        else []
-    ):
+    cve_candidates = cve.get("candidates", [])
+    if not isinstance(cve_candidates, list):
+        errors.append("cve_correlation.candidates harus berupa list.")
+        cve_candidates = []
+
+    if cve.get("candidate_count") != len(cve_candidates):
         errors.append(
-            "cve.candidate_count tidak konsisten "
-            "dengan cve.candidates."
+            "cve_correlation.candidate_count tidak konsisten "
+            "dengan candidates."
         )
+
+    if cve.get("candidate_count") != 0:
+        errors.append(
+            "4-007 tidak boleh membuat CVE candidate otomatis."
+        )
+
+    if artifact.get("project_id") != project_id:
+        errors.append("project_id tidak konsisten.")
 
     if errors:
         print("[FAIL] Git Exposure gagal validasi.")
-
         for error in errors:
             print(f"[FAIL] {error}")
-
         return 1
 
     print("[PASS] Git Exposure memenuhi validasi.")
     print(f"[PASS] Checklist : {CHECKLIST_ID} {CHECKLIST_NAME}")
     print(
-        f"[PASS] Status    : "
-        f"{'completed' if probes else 'initialized'}"
+        f"[PASS] Version   : {artifact.get('tool', {}).get('version', APP_VERSION)}"
     )
-    print(
-        f"[PASS] Target    : "
-        f"{target_value}"
-    )
-    print(
-        f"[PASS] Candidates: "
-        f"{candidates}"
-    )
-    print(
-        f"[PASS] Methods   : "
-        f"{len(METHODS)}"
-    )
-    print(
-        f"[PASS] Probes    : "
-        f"{len(probes)}"
-    )
+    print(f"[PASS] Status    : {checklist.get('status')}")
+    print(f"[PASS] Target    : {target_hostname}")
+    print(f"[PASS] Candidates: {candidates}")
+    print(f"[PASS] Methods   : {len(METHODS)}")
+    print(f"[PASS] Probes    : {len(probes)}")
     print(
         f"[PASS] Git       : "
         f"{summary.get('git_metadata_exposed', 0)}"
