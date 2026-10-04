@@ -42,7 +42,7 @@ import typer
 import yaml
 
 
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.1"
 SCHEMA_VERSION = "1.0"
 
 CHECKLIST_ID = "4-002"
@@ -509,7 +509,7 @@ def load_version_cves() -> tuple[list[dict[str, Any]], str]:
     except Exception:
         return [], "error"
 
-    block = data
+    block = data.get("webserver_version", {})
     if not isinstance(block, dict):
         return [], "invalid"
 
@@ -567,124 +567,97 @@ def load_version_cves() -> tuple[list[dict[str, Any]], str]:
 
 
 def initialize_artifact() -> dict[str, Any]:
-    """Create the canonical Web Server 4-002 artifact envelope."""
     scope = get_scope_context()
     recon_path = recon_directory_path()
-    return {
+
+    artifact = {
         "schema_version": SCHEMA_VERSION,
         "project_id": PROJECT_ID,
-        "checklist": {
-            "id": CHECKLIST_ID,
-            "name": CHECKLIST_NAME,
-            "phase": PHASE_NAME,
-            "focus": "Directory listing / directory indexing exposure",
-        },
-        "status": "initialized",
-        "target": {
+        "updated_at": utc_now(),
+        "webserver_directory": {
+            "status": "not-started",
+            "checklist": {
+                "id": CHECKLIST_ID,
+                "name": CHECKLIST_NAME,
+                "phase": PHASE_NAME,
+            },
             "application": "Bangsaku",
             "hostname": scope["hostname"],
-            "url": scope["target_url"],
+            "target_url": scope["target_url"],
             "environment": "Production",
-            "assessment_type": "Grey Box",
-            "authorized_ports": scope["ports"],
-            "scope_id": scope["scope_id"],
+            "assessment_type": "Black Box",
             "scope_reference": scope["scope_reference"],
-        },
-        "methodology": {
+            "scope_id": scope["scope_id"],
+            "authorized_ports": scope["ports"],
             "method": (
                 "Consume completed Recon directory evidence and perform controlled "
                 "HTTP/HTTPS GET against selected directory-like paths; no directory "
                 "brute-force discovery is performed by this checklist."
             ),
-            "candidate_source": relative_to_repo(recon_path),
-            "requests_library": "requests",
-            "allow_redirects": False,
-            "timeout_seconds": REQUEST_TIMEOUT,
-            "max_body_bytes": MAX_BODY_BYTES,
-            "discovery": False,
-            "brute_force": False,
-            "exploitation": False,
-            "automatic_finding": False,
-            "cve_correlation": "Inherited directory/index-related candidates from 4-001",
+            "source": {
+                "recon_directory": relative_to_repo(recon_path),
+                "version": relative_to_repo(version_artifact_path()),
+            },
+            "probe": {
+                "requests_library": "requests",
+                "allow_redirects": False,
+                "max_body_bytes": MAX_BODY_BYTES,
+                "timeout_seconds": REQUEST_TIMEOUT,
+                "candidate_source": "02-reconnaissance/directory/directory.yaml",
+                "candidate_selection": "directory-like paths from Recon artifact",
+            },
+            "results": [],
+            "cve_correlation": {
+                "source": "4-001 version/CPE evidence",
+                "status": "not-run",
+                "candidate_count": 0,
+                "requires_validation": 0,
+                "candidates": [],
+            },
+            "assessment": {
+                "result": "not-analyzed",
+                "requires_review": False,
+                "finding": False,
+                "note": (
+                    "Directory listing/index behavior is assessed from Recon-derived "
+                    "candidate paths; no automatic vulnerability finding."
+                ),
+            },
+            "evidence": {
+                "directory_probes": relative_to_repo(evidence_path()),
+            },
+            "errors": [],
+            "notes": [
+                "Recon directory.yaml is the authoritative candidate source.",
+                "Gobuster is not executed by Web Server 4-002.",
+                "HTTP/HTTPS probes are controlled GET requests only.",
+                "HTTP 200 alone does not prove directory listing.",
+                "Directory index markers are required before classification as directory-index-observed.",
+                "Raw evidence is retained; credential/secret redaction belongs to report generation.",
+                "CVE correlation is triage evidence only and does not establish exploitability or applicability.",
+            ],
+            "summary": {
+                "recon_paths": 0,
+                "selected_candidates": 0,
+                "probes": 0,
+                "directory_index_observed": 0,
+                "accessible_no_index": 0,
+                "access_controlled": 0,
+                "not_found": 0,
+                "redirected": 0,
+                "probe_errors": 0,
+                "requires_review": 0,
+            },
         },
-        "baseline": {
-            "recon_directory": relative_to_repo(recon_path),
-            "version_artifact": relative_to_repo(version_artifact_path()),
-            "scope": scope["scope_reference"],
-        },
-        "toolchain": {
-            "mandatory": ["Python", "requests", "PyYAML"],
-            "recon_source": "Gobuster evidence consumed from Recon artifact",
-            "optional": ["curl.exe"],
-            "not_used": ["Gobuster", "Nmap", "Nikto"],
-        },
-        "probe": {
-            "started_at": None,
-            "completed_at": None,
-            "candidate_count": 0,
-            "recon_result_count": 0,
-            "request_count": 0,
-            "targets": [],
-        },
-        "results": [],
-        "cve_correlation": {
-            "source": "4-001 version/CPE evidence",
-            "status": "not-run",
-            "candidate_count": 0,
-            "requires_validation": 0,
-            "candidates": [],
-        },
-        "assessment": {
-            "result": "not-analyzed",
-            "finding": False,
-            "requires_review": False,
-            "note": (
-                "Directory listing/index behavior is assessed from Recon-derived "
-                "candidate paths; no automatic vulnerability finding."
-            ),
-        },
-        "evidence": {
-            "directory_probes": relative_to_repo(evidence_path()),
-            "recon_directory": relative_to_repo(recon_path),
-        },
-        "errors": [],
-        "notes": [
-            "Recon directory.yaml is the authoritative candidate source.",
-            "Gobuster is not executed by Web Server 4-002.",
-            "HTTP/HTTPS probes are controlled GET requests only.",
-            "HTTP 200 alone does not prove directory listing.",
-            "Directory index markers are required before classification as directory-index-observed.",
-            "Raw evidence is retained; credential/secret redaction belongs to report generation.",
-            "CVE correlation is triage evidence only and does not establish exploitability or applicability.",
-        ],
-        "summary": {
-            "recon_paths": 0,
-            "selected_candidates": 0,
-            "probes": 0,
-            "directory_index_observed": 0,
-            "accessible_no_index": 0,
-            "access_controlled": 0,
-            "not_found": 0,
-            "redirected": 0,
-            "probe_errors": 0,
-            "requires_review": 0,
-        },
-        "generated_at": utc_now(),
-        "updated_at": utc_now(),
     }
+    return artifact
 
 
 @app.command()
 def version() -> None:
-    """Show script, checklist, and methodology boundary."""
-    print(f"BrebesKab-CSIRT-Tools directory.py v{APP_VERSION}")
-    print(f"Checklist: {CHECKLIST_ID} {CHECKLIST_NAME}")
-    print(f"Schema   : {SCHEMA_VERSION}")
-    print("Primary  : Recon-derived directory candidate + controlled HTTP/HTTPS GET")
-    print("Correlate: 4-001 version/CPE evidence for directory/index-related CVEs")
-    print("Discovery: Recon artifact only; no Gobuster/brute-force execution")
-    print("Validate : canonical YAML + raw JSON evidence integrity")
-    print("Boundary : no exploitation; CVE match is review evidence only")
+    """Show script and schema version."""
+    print(f"directory.py v{APP_VERSION}")
+    print(f"Schema: {SCHEMA_VERSION}")
 
 
 @app.command()
@@ -695,14 +668,14 @@ def init() -> None:
         save_yaml(artifact_path(), artifact)
         print("[PASS] Directory Listing berhasil diinisialisasi.")
         print(f"PROJECT : {PROJECT_ID}")
-        print(f"TARGET  : {artifact['target']['hostname']}")
+        print(f"TARGET  : {artifact['webserver_directory']['hostname']}")
         print(
             "PORTS   : "
             + ", ".join(
-                str(p) for p in artifact["target"]["authorized_ports"]
+                str(p) for p in artifact["webserver_directory"]["authorized_ports"]
             )
         )
-        print(f"SOURCE  : {artifact['directory_legacy_removed']['source']['recon_directory']}")
+        print(f"SOURCE  : {artifact['webserver_directory']['source']['recon_directory']}")
         print(f"FILE    : {artifact_path()}")
     except Exception as exc:
         print(f"[FAIL] {exc}", file=sys.stderr)
@@ -719,6 +692,7 @@ def analyze() -> None:
             )
 
         artifact = initialize_artifact()
+        block = artifact["webserver_directory"]
         scope = get_scope_context()
         recon = load_yaml(recon_directory_path())
         recon_status = str(
@@ -733,7 +707,6 @@ def analyze() -> None:
 
         results: list[dict[str, Any]] = []
         errors: list[str] = []
-        probe_started_at = utc_now()
 
         for base_url, port in build_bases(scope["hostname"], scope["ports"]):
             scheme = urlparse(base_url).scheme
@@ -845,20 +818,14 @@ def analyze() -> None:
         }
         save_json(evidence_path(), evidence)
 
-        artifact["status"] = "completed"
-        artifact["updated_at"] = utc_now()
-        artifact["probe"]["started_at"] = probe_started_at
-        artifact["probe"]["completed_at"] = utc_now()
-        artifact["probe"]["recon_status"] = recon_status
-        artifact["probe"]["request_count"] = len(results)
-        artifact["probe"]["targets"] = [
-            {"scheme": urlparse(base_url).scheme, "port": port, "base_url": base_url}
-            for base_url, port in build_bases(scope["hostname"], scope["ports"])
-        ]
-        artifact["probe"]["candidate_count"] = len(candidates)
-        artifact["probe"]["recon_result_count"] = len(recon_results)
-        artifact["results"] = results
-        artifact["cve_correlation"] = {
+        block["status"] = "completed"
+        block["updated_at"] = utc_now()
+        block["probe"]["completed_at"] = utc_now()
+        block["probe"]["recon_status"] = recon_status
+        block["probe"]["candidate_count"] = len(candidates)
+        block["probe"]["recon_result_count"] = len(recon_results)
+        block["results"] = results
+        block["cve_correlation"] = {
             "source": "4-001 version/CPE evidence",
             "status": cve_status,
             "candidate_count": len(cve_candidates),
@@ -872,18 +839,18 @@ def analyze() -> None:
                 "or configuration prerequisites."
             ),
         }
-        artifact["assessment"] = {
+        block["assessment"] = {
             "result": assessment_result,
             "requires_review": requires_review,
             "finding": finding,
             "note": note,
         }
-        artifact["evidence"] = {
+        block["evidence"] = {
             "directory_probes": relative_to_repo(evidence_path()),
             "recon_directory": relative_to_repo(recon_directory_path()),
         }
-        artifact["errors"] = errors
-        artifact["summary"] = {
+        block["errors"] = errors
+        block["summary"] = {
             "recon_paths": len(recon_results),
             "selected_candidates": len(candidates),
             "probes": len(results),
@@ -924,21 +891,22 @@ def status() -> None:
     """Show concise lifecycle status."""
     try:
         data = load_yaml(artifact_path())
-        summary = data.get("summary", {})
-        assessment = data.get("assessment", {})
-        cve = data.get("cve_correlation", {})
-        print(f"PROJECT ID        : {data.get('project_id', '-')}")
-        print(f"STATUS             : {data.get('status', '-')}")
-        print(f"TARGET             : {data.get('target', {}).get('hostname', '-')}")
-        print(f"4-002 RESULT       : {assessment.get('result', '-')}")
-        print(f"RECON PATHS        : {summary.get('recon_paths', 0)}")
-        print(f"CANDIDATES         : {summary.get('selected_candidates', 0)}")
-        print(f"PROBES             : {summary.get('probes', 0)}")
-        print(f"INDEX OBSERVED     : {summary.get('directory_index_observed', 0)}")
-        print(f"CVE CANDIDATES     : {cve.get('candidate_count', 0)}")
-        print(f"REQUIRES REVIEW    : {int(bool(assessment.get('requires_review')))}")
-        print(f"FINDING            : {int(bool(assessment.get('finding')))}")
-        print(f"FILE               : {artifact_path()}")
+        block = data.get("webserver_directory", {})
+        summary = block.get("summary", {})
+        assessment = block.get("assessment", {})
+        cve = block.get("cve_correlation", {})
+
+        print(f"PROJECT         : {data.get('project_id', '-')}")
+        print(f"STATUS          : {block.get('status', '-')}")
+        print(f"TARGET          : {block.get('hostname', '-')}")
+        print(f"RECON PATHS     : {summary.get('recon_paths', 0)}")
+        print(f"CANDIDATES      : {summary.get('selected_candidates', 0)}")
+        print(f"PROBES          : {summary.get('probes', 0)}")
+        print(f"INDEX OBSERVED  : {summary.get('directory_index_observed', 0)}")
+        print(f"CVE CANDIDATES  : {cve.get('candidate_count', 0)}")
+        print(f"REQUIRES REVIEW : {int(bool(assessment.get('requires_review')))}")
+        print(f"FINDING         : {int(bool(assessment.get('finding')))}")
+        print(f"FILE            : {artifact_path()}")
     except Exception as exc:
         print(f"[FAIL] {exc}", file=sys.stderr)
         raise typer.Exit(code=1)
@@ -949,18 +917,23 @@ def list_results() -> None:
     """List concise probe classifications."""
     try:
         data = load_yaml(artifact_path())
-        results = data.get("results", [])
-        summary = data.get("summary", {})
-        cve = data.get("cve_correlation", {})
-        target = data.get("target", {})
-        assessment = data.get("assessment", {})
+        block = data.get("webserver_directory", {})
+        results = block.get("results", [])
+        summary = block.get("summary", {})
+        cve = block.get("cve_correlation", {})
+
         print(f"PROJECT: {data.get('project_id', '-')}")
-        print(f"STATUS : {data.get('status', '-')}")
-        print(f"TARGET : {target.get('hostname', '-')}")
-        print(f"RESULT : {assessment.get('result', '-')}")
+        print(f"STATUS : {block.get('status', '-')}")
+        print(f"TARGET : {block.get('hostname', '-')}")
         print()
-        print("SCHEME PORT PATH".ljust(34) + "STATUS".ljust(9) + "CLASSIFICATION".ljust(30) + "REVIEW")
+        print(
+            "SCHEME PORT PATH".ljust(34)
+            + "STATUS".ljust(9)
+            + "CLASSIFICATION".ljust(30)
+            + "REVIEW"
+        )
         print("-" * 90)
+
         for item in results:
             path = str(item.get("path", ""))[:30]
             print(
@@ -971,16 +944,24 @@ def list_results() -> None:
                 f"{str(item.get('classification', '')):<30}"
                 f"{int(bool(item.get('requires_review')))}"
             )
+
         print()
         print("SUMMARY")
         print("-" * 90)
         for key in (
-            "recon_paths", "selected_candidates", "probes",
-            "directory_index_observed", "accessible_no_index",
-            "access_controlled", "not_found", "redirected",
-            "probe_errors", "requires_review",
+            "recon_paths",
+            "selected_candidates",
+            "probes",
+            "directory_index_observed",
+            "accessible_no_index",
+            "access_controlled",
+            "not_found",
+            "redirected",
+            "probe_errors",
+            "requires_review",
         ):
             print(f"{key}: {summary.get(key, 0)}")
+
         print()
         print(f"CVE CANDIDATES: {cve.get('candidate_count', 0)}")
     except Exception as exc:
@@ -1005,66 +986,46 @@ def show() -> None:
 
 @app.command()
 def verify() -> None:
-    """Validate Web Server 4-002 canonical artifact and evidence integrity."""
+    """Validate Web Server 4-002 artifact and evidence integrity."""
     try:
         data = load_yaml(artifact_path())
+        block = data.get("webserver_directory", {})
         errors: list[str] = []
 
         if data.get("schema_version") != SCHEMA_VERSION:
             errors.append("schema_version tidak sesuai.")
+
         if data.get("project_id") != PROJECT_ID:
             errors.append("project_id tidak sesuai.")
 
-        checklist = data.get("checklist", {})
-        if not isinstance(checklist, dict):
-            errors.append("checklist tidak valid.")
-        else:
-            if checklist.get("id") != CHECKLIST_ID:
-                errors.append("checklist.id tidak sesuai.")
-            if checklist.get("name") != CHECKLIST_NAME:
-                errors.append("checklist.name tidak sesuai.")
-            if checklist.get("phase") != PHASE_NAME:
-                errors.append("checklist.phase tidak sesuai.")
-
-        if data.get("status") != "completed":
+        if block.get("status") != "completed":
             errors.append("status belum completed.")
 
-        target = data.get("target", {})
-        if not isinstance(target, dict):
-            errors.append("target tidak valid.")
-        else:
-            if not target.get("hostname"):
-                errors.append("target.hostname belum tercatat.")
-            if not isinstance(target.get("authorized_ports"), list) or not target.get("authorized_ports"):
-                errors.append("target.authorized_ports belum tercatat.")
+        checklist = block.get("checklist", {})
+        if checklist.get("id") != CHECKLIST_ID:
+            errors.append("checklist.id tidak sesuai.")
+        if checklist.get("name") != CHECKLIST_NAME:
+            errors.append("checklist.name tidak sesuai.")
 
-        results = data.get("results")
-        summary = data.get("summary", {})
-        assessment = data.get("assessment", {})
-        cve = data.get("cve_correlation", {})
-        evidence = data.get("evidence", {})
-        baseline = data.get("baseline", {})
-        methodology = data.get("methodology", {})
-        probe = data.get("probe", {})
+        results = block.get("results")
+        summary = block.get("summary", {})
+        assessment = block.get("assessment", {})
+        cve = block.get("cve_correlation", {})
+        evidence = block.get("evidence", {})
+        source = block.get("source", {})
 
         if not isinstance(results, list) or not results:
             errors.append("results kosong.")
+
         if not isinstance(summary, dict):
             errors.append("summary tidak valid.")
         else:
             if summary.get("probes") != len(results or []):
                 errors.append("summary.probes tidak sama dengan jumlah results.")
-            for field in (
-                "recon_paths", "selected_candidates", "directory_index_observed",
-                "accessible_no_index", "access_controlled", "not_found",
-                "redirected", "probe_errors", "requires_review",
-            ):
-                if not isinstance(summary.get(field, 0), int):
-                    errors.append(f"summary.{field} bukan integer.")
 
-        recon_rel = baseline.get("recon_directory", "")
+        recon_rel = source.get("recon_directory", "")
         if not recon_rel:
-            errors.append("baseline.recon_directory belum tercatat.")
+            errors.append("source.recon_directory belum tercatat.")
         elif not (repo_root() / Path(recon_rel)).is_file():
             errors.append("Recon directory artifact tidak ditemukan.")
 
@@ -1078,29 +1039,17 @@ def verify() -> None:
             errors.append("cve_correlation tidak valid.")
         else:
             candidates = cve.get("candidates", [])
-            if not isinstance(candidates, list):
-                errors.append("cve_correlation.candidates tidak valid.")
-            elif cve.get("candidate_count") != len(candidates):
-                errors.append("candidate_count tidak sama dengan jumlah CVE candidates.")
-            if any(isinstance(item, dict) and item.get("finding") is True for item in candidates):
+            if cve.get("candidate_count") != len(candidates):
+                errors.append(
+                    "candidate_count tidak sama dengan jumlah CVE candidates."
+                )
+            if any(item.get("finding") is True for item in candidates):
                 errors.append("CVE candidate tidak boleh menjadi automatic finding.")
 
         if not isinstance(assessment, dict):
             errors.append("assessment tidak valid.")
         elif assessment.get("finding") is True:
             errors.append("directory.py tidak boleh membuat automatic finding.")
-
-        if methodology.get("automatic_finding") is not False:
-            errors.append("methodology.automatic_finding harus false.")
-        if methodology.get("brute_force") is not False:
-            errors.append("methodology.brute_force harus false.")
-        if methodology.get("exploitation") is not False:
-            errors.append("methodology.exploitation harus false.")
-
-        if not isinstance(probe, dict):
-            errors.append("probe tidak valid.")
-        elif probe.get("request_count") != len(results or []):
-            errors.append("probe.request_count tidak sama dengan jumlah results.")
 
         if errors:
             print("[FAIL] Directory Listing gagal validasi.")
@@ -1110,16 +1059,25 @@ def verify() -> None:
 
         print("[PASS] Directory Listing memenuhi validasi.")
         print(f"[PASS] Checklist : {CHECKLIST_ID} {CHECKLIST_NAME}")
-        print(f"[PASS] Status    : {data.get('status')}")
-        print(f"[PASS] Target    : {target.get('hostname')}")
+        print(f"[PASS] Status    : {block.get('status')}")
+        print(f"[PASS] Target    : {block.get('hostname')}")
         print(f"[PASS] Recon     : {summary.get('recon_paths', 0)} path(s)")
         print(f"[PASS] Candidates: {summary.get('selected_candidates', 0)}")
         print(f"[PASS] Probes    : {summary.get('probes', 0)}")
-        print(f"[PASS] Index     : {summary.get('directory_index_observed', 0)} observation(s)")
+        print(
+            f"[PASS] Index     : "
+            f"{summary.get('directory_index_observed', 0)} observation(s)"
+        )
         print(f"[PASS] CVE       : {cve.get('candidate_count', 0)} candidate(s)")
         print(f"[PASS] Review    : {int(bool(assessment.get('requires_review')))}")
-        print("[PASS] CVE Triage: directory/index candidates are evidence; no automatic finding.")
-        print("[PASS] Assessment: directory listing/index behavior is recorded for review; no automatic vulnerability finding.")
+        print(
+            "[PASS] CVE Triage: directory/index candidates are evidence; "
+            "no automatic finding."
+        )
+        print(
+            "[PASS] Assessment: directory listing/index behavior is recorded "
+            "for review; no automatic vulnerability finding."
+        )
     except typer.Exit:
         raise
     except Exception as exc:
