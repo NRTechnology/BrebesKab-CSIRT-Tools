@@ -34,7 +34,7 @@ import typer
 import yaml
 
 APP_NAME = "BrebesKab-CSIRT-Tools default.py"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.3"
 SCHEMA_VERSION = "1.0"
 CHECKLIST_ID = "4-003"
 CHECKLIST_NAME = "Default virtual host / unintended host handling"
@@ -46,7 +46,7 @@ REQUEST_USER_AGENT = f"BrebesKab-CSIRT-Tools/{APP_VERSION} Web-Server-Default"
 OBSERVED_IP = "36.94.238.158"
 
 HOST_VARIANTS = (
-    ("authorized", "authorized hostname", "normal"),
+    ("authorized", "", "normal"),
     ("unknown", "unknown.invalid", "unknown-host"),
     ("ip", OBSERVED_IP, "ip-host"),
 )
@@ -221,82 +221,172 @@ def load_context(repo_root: Path, project_id: str) -> dict[str, Any]:
 
 
 def source_status(path: Path, block_name: str) -> str:
+    """Return source artifact status from canonical or legacy-compatible layouts."""
     try:
         data = load_yaml(path)
     except FileNotFoundError:
         return "not-available"
+
+    # Canonical artifacts expose status at the root.
+    root_status = str(data.get("status") or "").strip()
+    if root_status:
+        return root_status
+
+    # Backward compatibility for checklist-specific nested artifacts.
     block = data.get(block_name, {})
     if isinstance(block, dict):
-        return str(block.get("status") or "unknown")
+        nested_status = str(block.get("status") or "").strip()
+        if nested_status:
+            return nested_status
+
+    # Additional compatibility for existing infrastructure/service layouts.
+    for key in ("service", "checklist", "result", "summary"):
+        candidate = data.get(key)
+        if isinstance(candidate, dict):
+            nested_status = str(candidate.get("status") or "").strip()
+            if nested_status:
+                return nested_status
+
     return "unknown"
 
 
 def initial_artifact(context: dict[str, Any], project_id: str) -> dict[str, Any]:
+    """Create the canonical Web Server 4-003 artifact envelope."""
+    now = now_iso()
     return {
         "schema_version": SCHEMA_VERSION,
         "project_id": project_id,
-        "updated_at": now_iso(),
-        "webserver_default": {
-            "status": "not-started",
-            "checklist": {
-                "id": CHECKLIST_ID,
-                "name": CHECKLIST_NAME,
-                "phase": PHASE_NAME,
-            },
+        "checklist": {
+            "id": CHECKLIST_ID,
+            "name": CHECKLIST_NAME,
+            "phase": PHASE_NAME,
+            "focus": "Default virtual host / unintended Host handling",
+        },
+        "status": "initialized",
+        "target": {
             "application": "Bangsaku",
             "hostname": context["hostname"],
-            "target_url": context["target_url"],
-            "observed_ip": context["observed_ip"],
+            "url": context["target_url"],
             "environment": "Production",
-            "assessment_type": "Black Box",
-            "scope_reference": "01-preparation/scope/scope.yaml",
-            "scope_id": context["scope_id"],
+            "assessment_type": "Grey Box",
+            "observed_ip": context["observed_ip"],
             "authorized_ports": context["authorized_ports"],
             "probe_ports": context["probe_ports"],
-            "method": (
-                "controlled HTTP GET comparing the authorized Host header with "
-                "unknown.invalid and the observed IP; HTTPS keeps target hostname "
-                "as TLS SNI while changing the HTTP Host header"
-            ),
-            "source_status": {},
-            "probe": {
-                "host_variants": [
-                    {"id": item_id, "value": value, "role": role}
-                    for item_id, value, role in HOST_VARIANTS
-                ],
-                "request_count": 0,
-                "ports": context["probe_ports"],
-            },
-            "results": [],
-            "comparisons": [],
-            "assessment": {
-                "result": "not-analyzed",
-                "requires_review": False,
-                "finding": False,
-            },
-            "cve_correlation": {
-                "source": "4-001 version/CPE evidence",
-                "status": "not-run",
-                "candidate_count": 0,
-                "requires_validation": 0,
-                "candidates": [],
-            },
-            "evidence": {},
-            "errors": [],
-            "notes": [
-                "A default/alternate virtual-host response is an observation requiring assessment, not an automatic vulnerability finding.",
-                "HTTPS probes preserve the authorized hostname in TLS SNI and change only the HTTP Host header.",
-                "The observed IP is used as a controlled Host-header value; it is not treated as a separate scope target.",
-                "Raw evidence is retained; credential/secret redaction is performed during report generation.",
-                "CVE correlation is triage evidence only and does not establish exploitability or applicability.",
-            ],
+            "scope_id": context["scope_id"],
+            "scope_reference": "01-preparation/scope/scope.yaml",
         },
+        "methodology": {
+            "method": (
+                "Controlled HTTP GET comparing the authorized Host header with "
+                "unknown.invalid and the observed IP; HTTPS keeps the target "
+                "hostname as TLS SNI while changing the HTTP Host header."
+            ),
+            "http_probe": "Python requests GET with redirects disabled",
+            "corroboration": "curl optional independent Host-header corroboration",
+            "host_variants": [
+                {
+                    "id": item_id,
+                    "value": context["hostname"] if item_id == "authorized" else value,
+                    "role": role,
+                }
+                for item_id, value, role in HOST_VARIANTS
+            ],
+            "https_sni": context["hostname"],
+            "allow_redirects": False,
+            "timeout_seconds": DEFAULT_TIMEOUT,
+            "max_body_bytes": MAX_BODY_BYTES,
+            "brute_force": False,
+            "host_fuzzing": False,
+            "cache_poisoning": False,
+            "request_smuggling": False,
+            "authentication_guessing": False,
+            "exploitation": False,
+            "destructive_action": False,
+            "automatic_finding": False,
+            "cve_correlation": "Inherited virtual-host/default-host candidates from 4-001",
+        },
+        "baseline": {
+            "version_artifact": str(
+                context["sources"]["version"].relative_to(discover_repo_root())
+            ).replace("\\", "/"),
+            "service_artifact": str(
+                context["sources"]["service"].relative_to(discover_repo_root())
+            ).replace("\\", "/"),
+            "scope_artifact": str(
+                context["sources"]["scope"].relative_to(discover_repo_root())
+            ).replace("\\", "/"),
+        },
+        "toolchain": {
+            "mandatory": ["Python", "requests", "PyYAML"],
+            "optional": ["curl.exe"],
+            "nmap": "not-required",
+        },
+        "probe": {
+            "host_variants": [
+                {"id": item_id, "value": value, "role": role}
+                for item_id, value, role in HOST_VARIANTS
+            ],
+            "ports": context["probe_ports"],
+            "schemes": [
+                scheme for scheme in (
+                    "http" if 80 in context["probe_ports"] else None,
+                    "https" if 443 in context["probe_ports"] else None,
+                ) if scheme
+            ],
+            "request_count": 0,
+            "allow_redirects": False,
+            "max_body_bytes": MAX_BODY_BYTES,
+            "requests_library": "requests",
+            "curl_corroboration": curl_available(),
+            "started_at": None,
+            "completed_at": None,
+        },
+        "results": [],
+        "comparisons": [],
+        "cve_correlation": {
+            "source": "4-001 version/CPE evidence",
+            "status": "not-run",
+            "candidate_count": 0,
+            "requires_validation": 0,
+            "candidates": [],
+        },
+        "assessment": {
+            "result": "not-analyzed",
+            "requires_review": False,
+            "finding": False,
+            "note": (
+                "Default/alternate virtual-host behavior is an observation requiring "
+                "assessment. A matching or differing response does not by itself prove "
+                "host-header poisoning, cache poisoning, request smuggling, access-control "
+                "bypass, or another vulnerability."
+            ),
+        },
+        "evidence": {},
+        "errors": [],
+        "notes": [
+            "A default/alternate virtual-host response is an observation requiring assessment, not an automatic vulnerability finding.",
+            "HTTPS probes preserve the authorized hostname in TLS SNI and change only the HTTP Host header.",
+            "The observed IP is used as a controlled Host-header value; it is not treated as a separate scope target.",
+            "Raw evidence is retained; credential/secret redaction is performed during report generation.",
+            "CVE correlation is triage evidence only and does not establish exploitability or applicability.",
+        ],
+        "summary": {
+            "probes": 0,
+            "comparisons": 0,
+            "equivalent_responses": 0,
+            "host_rejected_or_separated": 0,
+            "different_responses": 0,
+            "probe_errors": 0,
+            "requires_review_comparisons": 0,
+            "requires_review": 0,
+        },
+        "generated_at": now,
+        "updated_at": now,
     }
 
 
 def extract_default_host_cves(version_data: dict[str, Any]) -> list[dict[str, Any]]:
-    ws = version_data.get("webserver_version", {})
-    correlation = ws.get("cve_correlation", {})
+    correlation = version_data.get("cve_correlation", {})
     products = correlation.get("products", [])
     if not isinstance(products, list):
         return []
@@ -705,8 +795,13 @@ def compare_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 @app.command("version")
 def version_cmd() -> None:
-    print(f"default.py v{APP_VERSION}")
-    print(f"Schema: {SCHEMA_VERSION}")
+    print(f"BrebesKab-CSIRT-Tools default.py v{APP_VERSION}")
+    print(f"Checklist: {CHECKLIST_ID} {CHECKLIST_NAME}")
+    print(f"Schema   : {SCHEMA_VERSION}")
+    print("Primary  : controlled Host-header comparison over HTTP/HTTPS")
+    print("Correlate: 4-001 version/CPE evidence + service baseline")
+    print("Validate : requests mandatory; curl optional corroboration")
+    print("Boundary : no host fuzzing/exploitation; CVE match is review evidence only")
 
 
 @app.command("init")
@@ -724,6 +819,65 @@ def init_cmd() -> None:
     print(f"FILE    : {path}")
 
 
+@app.command("status")
+def status_cmd() -> None:
+    """Show the current 4-003 artifact status without performing network probes."""
+    repo_root = discover_repo_root()
+    project_id = discover_project_id(repo_root)
+    path = artifact_file(repo_root, project_id)
+
+    if not path.is_file():
+        print("[FAIL] Artifact 4-003 belum diinisialisasi.")
+        print(f"PROJECT : {project_id}")
+        print(f"FILE    : {path}")
+        raise typer.Exit(code=1)
+
+    data = load_yaml(path)
+    checklist = data.get("checklist", {})
+    target = data.get("target", {})
+    probe = data.get("probe", {})
+    summary = data.get("summary", {})
+    cve = data.get("cve_correlation", {})
+    assessment = data.get("assessment", {})
+    source_status_data = data.get("source_status", {})
+
+    if not isinstance(checklist, dict):
+        checklist = {}
+    if not isinstance(target, dict):
+        target = {}
+    if not isinstance(probe, dict):
+        probe = {}
+    if not isinstance(summary, dict):
+        summary = {}
+    if not isinstance(cve, dict):
+        cve = {}
+    if not isinstance(assessment, dict):
+        assessment = {}
+    if not isinstance(source_status_data, dict):
+        source_status_data = {}
+
+    print(f"PROJECT          : {project_id}")
+    print(f"STATUS           : {data.get('status', '-')}")
+    print(f"CHECKLIST        : {checklist.get('id', CHECKLIST_ID)}")
+    print(f"TARGET           : {target.get('hostname', '-')}")
+    print(f"RESULT           : {assessment.get('result', '-')}")
+    print(f"PROBES           : {summary.get('probes', probe.get('request_count', 0))}")
+    print(f"COMPARISONS      : {summary.get('comparisons', 0)}")
+    print(f"EQUIVALENT       : {summary.get('equivalent_responses', 0)}")
+    print(f"REJECTED/SEPAR.  : {summary.get('host_rejected_or_separated', 0)}")
+    print(f"DIFFERENT        : {summary.get('different_responses', 0)}")
+    print(f"PROBE ERRORS     : {summary.get('probe_errors', 0)}")
+    print(f"CVE CANDIDATES   : {cve.get('candidate_count', 0)}")
+    print(f"REQUIRES REVIEW  : {summary.get('requires_review', int(bool(assessment.get('requires_review'))))}")
+    print(f"FINDING          : {assessment.get('finding', False)}")
+    if source_status_data:
+        print(
+            f"SOURCES          : version={source_status_data.get('version', '-')}, "
+            f"service={source_status_data.get('service', '-')}"
+        )
+    print(f"UPDATED           : {data.get('updated_at', '-')}")
+
+
 @app.command("analyze")
 def analyze_cmd() -> None:
     repo_root = discover_repo_root()
@@ -737,14 +891,14 @@ def analyze_cmd() -> None:
         )
 
     artifact = load_yaml(path)
-    block = artifact["webserver_default"]
     sources = context["sources"]
 
-    block["source_status"] = {
-        "version": source_status(sources["version"], "webserver_version"),
+    artifact["source_status"] = {
+        "version": source_status(sources["version"], "status"),
         "service": source_status(sources["service"], "service_enumeration"),
     }
 
+    probe_started_at = now_iso()
     full_evidence: list[dict[str, Any]] = []
     results: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
@@ -859,8 +1013,8 @@ def analyze_cmd() -> None:
         },
     )
 
-    block["status"] = "completed" if not probe_errors else "partial"
-    block["probe"] = {
+    artifact["status"] = "completed" if not probe_errors else "partial"
+    artifact["probe"] = {
         "host_variants": [
             {
                 "id": item_id,
@@ -879,12 +1033,13 @@ def analyze_cmd() -> None:
         "max_body_bytes": MAX_BODY_BYTES,
         "requests_library": "requests",
         "curl_corroboration": curl_available(),
+        "started_at": probe_started_at,
         "completed_at": now_iso(),
     }
-    block["probe"]["schemes"] = [item for item in block["probe"]["schemes"] if item]
-    block["results"] = results
-    block["comparisons"] = comparisons
-    block["summary"] = {
+    artifact["probe"]["schemes"] = [item for item in artifact["probe"]["schemes"] if item]
+    artifact["results"] = results
+    artifact["comparisons"] = comparisons
+    artifact["summary"] = {
         "probes": len(results),
         "comparisons": len(comparisons),
         "equivalent_responses": len(equivalent),
@@ -894,7 +1049,7 @@ def analyze_cmd() -> None:
         "requires_review_comparisons": len(requires_review_comparisons),
         "requires_review": int(requires_review),
     }
-    block["assessment"] = {
+    artifact["assessment"] = {
         "result": assessment_result,
         "requires_review": requires_review,
         "finding": False,
@@ -905,7 +1060,7 @@ def analyze_cmd() -> None:
             "bypass, or another vulnerability."
         ),
     }
-    block["cve_correlation"] = {
+    artifact["cve_correlation"] = {
         "source": "4-001 version/CPE evidence",
         "status": "completed" if version_data else "not-available",
         "candidate_count": len(cve_candidates),
@@ -917,13 +1072,12 @@ def analyze_cmd() -> None:
             "configuration prerequisites."
         ),
     }
-    block["evidence"] = {
+    artifact["evidence"] = {
         "default_host_probes": str(
             evidence_file.relative_to(repo_root)
         ).replace("\\", "/"),
     }
-    block["errors"] = errors
-    block["updated_at"] = now_iso()
+    artifact["errors"] = errors
     artifact["updated_at"] = now_iso()
 
     write_yaml(path, artifact)
@@ -939,7 +1093,7 @@ def analyze_cmd() -> None:
     print(f"PROBE ERRORS    : {len(probe_errors)}")
     print(f"CVE CANDIDATES  : {len(cve_candidates)}")
     print(f"REQUIRES REVIEW : {int(requires_review)}")
-    print(f"STATUS          : {block['status']}")
+    print(f"STATUS          : {artifact.get('status', '-')}")
     print(f"FILE            : {path}")
 
 
@@ -949,11 +1103,11 @@ def list_cmd() -> None:
     project_id = discover_project_id(repo_root)
     path = artifact_file(repo_root, project_id)
     data = load_yaml(path)
-    block = data["webserver_default"]
 
     print(f"PROJECT: {project_id}")
-    print(f"STATUS : {block.get('status', '')}")
-    print(f"TARGET : {block.get('hostname', '')}")
+    print(f"STATUS : {data.get('status', '-')}")
+    print(f"TARGET : {data.get('target', {}).get('hostname', '-')}")
+    print(f"RESULT : {data.get('assessment', {}).get('result', '-')}")
     print()
     print("SCHEME PORT HOST-VARIANT  STATUS CLASSIFICATION              REVIEW")
     print("-" * 78)
@@ -963,7 +1117,7 @@ def list_cmd() -> None:
         "alternate-host-other-response",
     }
 
-    for item in block.get("results", []):
+    for item in data.get("results", []):
         review = item.get("classification") in review_variants
         print(
             f"{str(item.get('scheme', '')).upper():6} "
@@ -977,7 +1131,7 @@ def list_cmd() -> None:
     print()
     print("COMPARISONS")
     print("-" * 78)
-    for item in block.get("comparisons", []):
+    for item in data.get("comparisons", []):
         print(
             f"{str(item.get('scheme', '')).upper():6} "
             f"{str(item.get('port', '')):4} "
@@ -986,7 +1140,7 @@ def list_cmd() -> None:
             f"review={item.get('requires_review', False)}"
         )
 
-    cve = block.get("cve_correlation", {})
+    cve = data.get("cve_correlation", {})
     print()
     print(f"CVE CANDIDATES: {cve.get('candidate_count', 0)}")
 
@@ -1023,34 +1177,53 @@ def verify_cmd() -> None:
         print(f"[FAIL] Artifact tidak dapat dibaca: {exc}")
         raise typer.Exit(code=1)
 
-    block = data.get("webserver_default", {})
     errors: list[str] = []
 
     if data.get("schema_version") != SCHEMA_VERSION:
         errors.append("schema_version tidak sesuai.")
     if data.get("project_id") != project_id:
         errors.append("project_id tidak sesuai.")
-    if block.get("status") not in ("completed", "partial"):
+
+    checklist = data.get("checklist", {})
+    if not isinstance(checklist, dict):
+        errors.append("checklist tidak valid.")
+    else:
+        if checklist.get("id") != CHECKLIST_ID:
+            errors.append("checklist ID tidak sesuai.")
+        if checklist.get("name") != CHECKLIST_NAME:
+            errors.append("checklist name tidak sesuai.")
+        if checklist.get("phase") != PHASE_NAME:
+            errors.append("checklist phase tidak sesuai.")
+
+    if data.get("status") not in ("completed", "partial"):
         errors.append("status bukan completed/partial.")
 
-    checklist = block.get("checklist", {})
-    if checklist.get("id") != CHECKLIST_ID:
-        errors.append("checklist ID tidak sesuai.")
-    if not block.get("hostname"):
-        errors.append("hostname kosong.")
+    target = data.get("target", {})
+    if not isinstance(target, dict):
+        errors.append("target tidak valid.")
+    else:
+        if not target.get("hostname"):
+            errors.append("target.hostname kosong.")
+        if not isinstance(target.get("authorized_ports"), list):
+            errors.append("target.authorized_ports tidak valid.")
+        if not isinstance(target.get("probe_ports"), list) or not target.get("probe_ports"):
+            errors.append("target.probe_ports kosong.")
 
-    results = block.get("results")
-    comparisons = block.get("comparisons")
-    summary = block.get("summary", {})
-    cve = block.get("cve_correlation", {})
-    assessment = block.get("assessment", {})
-    evidence = block.get("evidence", {})
-    probe = block.get("probe", {})
+    results = data.get("results")
+    comparisons = data.get("comparisons")
+    summary = data.get("summary", {})
+    cve = data.get("cve_correlation", {})
+    assessment = data.get("assessment", {})
+    evidence = data.get("evidence", {})
+    probe = data.get("probe", {})
+    methodology = data.get("methodology", {})
+    baseline = data.get("baseline", {})
 
     if not isinstance(results, list) or not results:
         errors.append("results kosong.")
     if not isinstance(comparisons, list) or not comparisons:
         errors.append("comparisons kosong.")
+
     if not isinstance(summary, dict):
         errors.append("summary tidak valid.")
     else:
@@ -1059,17 +1232,70 @@ def verify_cmd() -> None:
         if summary.get("comparisons") != len(comparisons or []):
             errors.append("summary.comparisons tidak sama dengan jumlah comparisons.")
 
-    if not isinstance(probe, dict) or not probe.get("host_variants"):
-        errors.append("probe.host_variants kosong.")
+    if not isinstance(probe, dict):
+        errors.append("probe tidak valid.")
+    else:
+        if probe.get("request_count") != len(results or []):
+            errors.append("probe.request_count tidak sama dengan jumlah results.")
+        if not probe.get("host_variants"):
+            errors.append("probe.host_variants kosong.")
+
     if not isinstance(cve, dict):
         errors.append("cve_correlation tidak valid.")
-    elif cve.get("candidate_count") != len(cve.get("candidates", []) or []):
-        errors.append("cve candidate_count tidak sama dengan candidates.")
+    else:
+        candidates = cve.get("candidates", [])
+        if not isinstance(candidates, list):
+            errors.append("cve_correlation.candidates tidak valid.")
+        elif cve.get("candidate_count") != len(candidates):
+            errors.append("cve candidate_count tidak sama dengan candidates.")
+        if any(isinstance(item, dict) and item.get("finding") is True for item in candidates):
+            errors.append("CVE candidate tidak boleh menjadi automatic finding.")
 
     if not isinstance(assessment, dict):
         errors.append("assessment tidak valid.")
     elif assessment.get("finding") is not False:
         errors.append("assessment.finding harus false; finding tidak dibuat otomatis.")
+
+    if not isinstance(methodology, dict):
+        errors.append("methodology tidak valid.")
+    else:
+        host_variants = methodology.get("host_variants", [])
+        if not isinstance(host_variants, list):
+            errors.append("methodology.host_variants tidak valid.")
+        else:
+            authorized_variant = next(
+                (
+                    item for item in host_variants
+                    if isinstance(item, dict) and item.get("id") == "authorized"
+                ),
+                None,
+            )
+            if not isinstance(authorized_variant, dict):
+                errors.append("methodology.host_variants authorized tidak ditemukan.")
+            elif authorized_variant.get("value") != target.get("hostname"):
+                errors.append(
+                    "methodology.host_variants authorized.value harus sama dengan target.hostname."
+                )
+
+        for key in (
+            "brute_force",
+            "host_fuzzing",
+            "cache_poisoning",
+            "request_smuggling",
+            "authentication_guessing",
+            "exploitation",
+            "destructive_action",
+            "automatic_finding",
+        ):
+            if methodology.get(key) is not False:
+                errors.append(f"methodology.{key} harus false.")
+
+    if not isinstance(baseline, dict):
+        errors.append("baseline tidak valid.")
+    else:
+        for key in ("version_artifact", "service_artifact", "scope_artifact"):
+            if not baseline.get(key):
+                errors.append(f"baseline.{key} belum tercatat.")
 
     evidence_path = evidence.get("default_host_probes") if isinstance(evidence, dict) else ""
     if not evidence_path:
@@ -1096,8 +1322,8 @@ def verify_cmd() -> None:
 
     print("[PASS] Default Virtual Host memenuhi validasi.")
     print(f"[PASS] Checklist : {CHECKLIST_ID} {CHECKLIST_NAME}")
-    print(f"[PASS] Status    : {block.get('status')}")
-    print(f"[PASS] Target    : {block.get('hostname')}")
+    print(f"[PASS] Status    : {data.get('status')}")
+    print(f"[PASS] Target    : {target.get('hostname')}")
     print(f"[PASS] Probes    : {summary.get('probes', 0)}")
     print(f"[PASS] Compare   : {summary.get('comparisons', 0)}")
     print(f"[PASS] Equivalent: {summary.get('equivalent_responses', 0)}")
