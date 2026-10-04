@@ -395,7 +395,6 @@ function Request-Administrator {
     if ($SkipZAP) { $elevatedArguments += '-SkipZAP' }
     if ($Force) { $elevatedArguments += '-Force' }
     if ($UpdateWordlists) { $elevatedArguments += '-UpdateWordlists' }
-    if ($InstallAuthWordlists) { $elevatedArguments += '-InstallAuthWordlists' }
     if ($ApproveSecurityChanges) { $elevatedArguments += '-ApproveSecurityChanges' }
 
     try {
@@ -1909,7 +1908,7 @@ function Get-GitHubFileMetadata {
 
 function Get-SafeObjectProperty {
     param(
-        [Parameter(Mandatory=$true)][AllowNull()][object]$Object,
+        [Parameter(Mandatory=$true)][object]$Object,
         [Parameter(Mandatory=$true)][string]$Name
     )
 

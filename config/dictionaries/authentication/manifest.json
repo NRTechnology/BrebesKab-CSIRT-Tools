@@ -1,0 +1,50 @@
+{
+    "schema_version":  1,
+    "generated_at":  "2026-10-04T18:43:25.2385747+07:00",
+    "root":  "config/dictionaries/authentication",
+    "purpose":  "Controlled authentication login-attempt testing",
+    "sources":  [
+                    {
+                        "name":  "SecLists",
+                        "repository":  "danielmiessler/SecLists",
+                        "license":  "MIT",
+                        "purpose":  "Authentication username, common-password and default-password reference data"
+                    }
+                ],
+    "wordlists":  [
+                      {
+                          "category":  "authentication/usernames",
+                          "name":  "top-usernames-shortlist",
+                          "path":  "config/dictionaries/authentication/usernames/top-usernames-shortlist.txt",
+                          "source":  "danielmiessler/SecLists",
+                          "url":  "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Usernames/top-usernames-shortlist.txt",
+                          "version":  "",
+                          "line_count":  0,
+                          "file_size":  "",
+                          "source_id":  "danielmiessler/SecLists:Usernames/top-usernames-shortlist.txt",
+                          "source_sha":  "8f714dbe94bfef25cb14daa19aeb8fb18e18ef89",
+                          "metadata_date":  "",
+                          "sha256":  "",
+                          "etag":  "",
+                          "last_modified":  "",
+                          "checked_at":  "2026-10-04T18:43:24.1419618+07:00"
+                      },
+                      {
+                          "category":  "authentication/default-credentials",
+                          "name":  "default-passwords",
+                          "path":  "config/dictionaries/authentication/default-credentials/default-passwords.txt",
+                          "source":  "danielmiessler/SecLists",
+                          "url":  "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Default-Credentials/default-passwords.txt",
+                          "version":  "",
+                          "line_count":  0,
+                          "file_size":  "",
+                          "source_id":  "danielmiessler/SecLists:Passwords/Default-Credentials/default-passwords.txt",
+                          "source_sha":  "bbe7dc1dfef59b0b196d56e7c82c078065087821",
+                          "metadata_date":  "",
+                          "sha256":  "",
+                          "etag":  "",
+                          "last_modified":  "",
+                          "checked_at":  "2026-10-04T18:43:25.2385747+07:00"
+                      }
+                  ]
+}
