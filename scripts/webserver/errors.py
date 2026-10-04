@@ -43,7 +43,7 @@ import requests
 import yaml
 
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 SCHEMA_VERSION = "1.0"
 
 CHECKLIST_ID = "4-010"
@@ -518,6 +518,14 @@ def build_urls(
 
 
 def load_version_cves() -> List[Dict[str, Any]]:
+    """Load and triage CVE candidates from canonical 4-001 version.yaml.
+
+    The authoritative source is:
+        cve_correlation.products[].cves[]
+
+    Legacy layouts are accepted only as compatibility fallbacks. CVE matches
+    remain candidate evidence and never create an automatic finding.
+    """
     path = version_artifact_path()
 
     if not path.exists():
@@ -528,21 +536,15 @@ def load_version_cves() -> List[Dict[str, Any]]:
     except Exception:
         return []
 
-    candidates: List[Dict[str, Any]] = []
+    correlation = data.get("cve_correlation", {})
+    products = correlation.get("products", []) if isinstance(correlation, dict) else []
 
-    def walk(value: Any) -> Iterable[Dict[str, Any]]:
-        if isinstance(value, dict):
-            yield value
-            for child in value.values():
-                yield from walk(child)
-        elif isinstance(value, list):
-            for child in value:
-                yield from walk(child)
+    candidates: List[Dict[str, Any]] = []
+    seen = set()
 
     keywords = (
         "error",
         "exception",
-        "information disclosure",
         "information disclosure",
         "stack trace",
         "debug",
@@ -551,21 +553,24 @@ def load_version_cves() -> List[Dict[str, Any]]:
         "http server",
     )
 
-    seen = set()
-
-    for item in walk(data):
+    def add_candidate(
+        item: Dict[str, Any],
+        product: Optional[str] = None,
+        version: Optional[str] = None,
+    ) -> None:
         cve_id = (
             item.get("cve_id")
-            or item.get("id")
             or item.get("cve")
+            or item.get("id")
         )
-
         if not cve_id:
-            continue
+            return
 
         cve_id = str(cve_id).strip()
+        if not cve_id or cve_id in seen:
+            return
 
-        description_parts = []
+        description_parts: List[str] = []
         for key in (
             "description",
             "summary",
@@ -581,22 +586,83 @@ def load_version_cves() -> List[Dict[str, Any]]:
         lower = description.lower()
 
         if not any(keyword in lower for keyword in keywords):
-            continue
-
-        if cve_id in seen:
-            continue
+            return
 
         seen.add(cve_id)
 
-        candidates.append(
-            {
-                "cve_id": cve_id,
-                "description": description,
-                "source": str(path),
-                "correlation": "error-response-related keyword match",
-                "classification": "cve-candidate",
-            }
+        candidate = {
+            "cve_id": cve_id,
+            "description": description,
+            "source": str(path),
+            "correlation": "error-response-related keyword match",
+            "classification": "cve-candidate",
+        }
+
+        if product is not None:
+            candidate["product"] = product
+        if version is not None:
+            candidate["version"] = version
+
+        # Preserve authoritative CVE metadata from 4-001 where available.
+        metadata_keys = (
+            "vuln_status",
+            "published",
+            "last_modified",
+            "cwe",
+            "cvss",
+            "known_exploited_vulnerability",
+            "kev_date_added",
+            "applicability",
+            "nvd_url",
+            "correlation_basis",
+            "requires_validation",
+            "finding",
         )
+        for key in metadata_keys:
+            if key in item:
+                candidate[key] = item[key]
+
+        candidates.append(candidate)
+
+    # Canonical 4-001 source.
+    if isinstance(products, list):
+        for product_entry in products:
+            if not isinstance(product_entry, dict):
+                continue
+
+            product_name = product_entry.get("product")
+            product_version = product_entry.get("version")
+            cves = product_entry.get("cves", [])
+
+            if not isinstance(cves, list):
+                continue
+
+            for item in cves:
+                if isinstance(item, dict):
+                    add_candidate(
+                        item,
+                        str(product_name) if product_name is not None else None,
+                        str(product_version) if product_version is not None else None,
+                    )
+
+    # Compatibility fallback for older artifacts only.
+    if not candidates:
+        legacy_candidates = correlation.get("candidates", []) if isinstance(correlation, dict) else []
+        if isinstance(legacy_candidates, list):
+            for item in legacy_candidates:
+                if isinstance(item, dict):
+                    add_candidate(item)
+
+    if not candidates:
+        legacy_wrapper = data.get("webserver_version", {})
+        if isinstance(legacy_wrapper, dict):
+            legacy_correlation = legacy_wrapper.get("cve_correlation", {})
+            if isinstance(legacy_correlation, dict):
+                legacy_candidates = legacy_correlation.get("candidates", [])
+                if isinstance(legacy_candidates, list):
+                    for item in legacy_candidates:
+                        if isinstance(item, dict):
+                            add_candidate(item)
 
     return candidates
 
@@ -926,70 +992,118 @@ def initialize_artifact() -> int:
     candidates = build_error_candidates(recon_data)
     error_paths = build_error_paths(candidates)
 
+    project_id = project_id_from_dir(project_dir())
+    recon_status = recon_data.get("directory", {})
+    if isinstance(recon_status, dict):
+        recon_status = recon_status.get("status", "")
+    else:
+        recon_status = recon_data.get("status", "")
+
     data = {
         "schema_version": SCHEMA_VERSION,
-        "project_id": project_id_from_dir(project_dir()),
-        "updated_at": utc_now(),
-        "errors": {
-            "status": "initialized",
-            "checklist_id": CHECKLIST_ID,
-            "checklist_name": CHECKLIST_NAME,
-            "application": "Bangsaku",
-            "target": {
-                "type": target["type"],
-                "value": target["value"],
-                "ports": target["ports"],
-                "scope_id": target.get("scope_id"),
-            },
-            "method_set": METHODS,
-            "endpoint_source": {
-                "type": "recon-directory",
-                "path": str(recon_path),
-                "recon_status": recon_data.get(
-                    "directory", {}
-                ).get(
-                    "status",
-                    recon_data.get("status", ""),
-                ),
-                "recon_paths": len(recon_results),
-                "selected_candidates": len(candidates),
-                "generated_error_paths": len(error_paths),
-            },
-            "probes": [],
-            "summary": {
-                "probes": 0,
-                "information_disclosure": 0,
-                "not_found": 0,
-                "access_controlled": 0,
-                "redirected": 0,
-                "server_errors": 0,
-                "normal_error": 0,
-                "known_endpoint": 0,
-                "probe_errors": 0,
-                "other": 0,
-            },
-            "cve_candidates": [],
-            "assessment": {
-                "status": "initialized",
-                "finding": False,
-                "requires_review": False,
-                "summary": (
-                    "Artifact diinisialisasi; belum dilakukan "
-                    "error-response probing."
-                ),
-            },
-            "assessment_policy": {
-                "automatic_finding": False,
-                "notes": [
-                    "Error responses are evidence, not automatic vulnerabilities.",
-                    "Server/framework identification alone is not classified as a vulnerability.",
-                    "No redirect following is performed.",
-                    "No application CRUD operation is intentionally executed.",
-                    "No brute-force directory discovery is performed.",
-                    "CVE correlation is heuristic candidate evidence only.",
-                ],
-            },
+        "project_id": project_id,
+        "tool": {
+            "name": "BrebesKab-CSIRT-Tools",
+            "script": "errors.py",
+            "version": APP_VERSION,
         },
+        "checklist": {
+            "id": CHECKLIST_ID,
+            "name": "Error information disclosure",
+            "phase": "04 Web Server Configuration",
+            "focus": "Technical information disclosure in HTTP error responses",
+            "status": "initialized",
+        },
+        "target": {
+            "application": target.get("application", "Bangsaku"),
+            "hostname": target["value"],
+            "url": f"https://{target['value']}",
+            "environment": target.get("environment", "Production"),
+            "assessment_type": target.get("assessment_type", "Grey Box"),
+            "scope_id": target.get("scope_id"),
+            "scope_reference": str(project_dir() / SCOPE_REL),
+            "authorized_ports": target["ports"],
+        },
+        "methodology": {
+            "endpoint_source": "Recon directory.yaml",
+            "endpoint_source_path": str(recon_path),
+            "error_paths": (
+                "Recon-known endpoints plus deterministic non-existent "
+                "baseline and missing-child paths"
+            ),
+            "discovery": False,
+            "brute_force": False,
+            "redirect_following": False,
+            "mutation_payload": False,
+            "application_crud": False,
+            "raw_evidence_retained": True,
+            "automatic_finding": False,
+            "cve_correlation": "4-001 version.yaml heuristic candidate evidence only",
+        },
+        "baseline": {
+            "recon_status": recon_status,
+            "recon_paths": len(recon_results),
+            "selected_candidates": len(candidates),
+            "generated_error_paths": len(error_paths),
+        },
+        "toolchain": {
+            "python": "requests + PyYAML",
+            "optional_tools": [],
+            "required_tools": ["Python", "requests", "PyYAML"],
+        },
+        "probe": {
+            "methods": METHODS,
+            "authorized_ports": target["ports"],
+            "timeout_seconds": DEFAULT_TIMEOUT,
+            "max_body_bytes": MAX_BODY_BYTES,
+            "allow_redirects": False,
+            "verify_tls": True,
+            "request_body_sent": False,
+        },
+        "source_status": {
+            "directory": recon_status or "unknown",
+            "version": "completed" if version_artifact_path().exists() else "missing",
+        },
+        "results": {
+            "candidates": candidates,
+            "error_paths": error_paths,
+            "probes": [],
+        },
+        "summary": summarize_probes([]),
+        "cve_correlation": {
+            "source": "04-web-server-configuration/version/version.yaml",
+            "method": "canonical 4-001 cve_correlation.products[].cves[]",
+            "candidates": [],
+            "candidate_count": 0,
+        },
+        "assessment": {
+            "result": "initialized",
+            "finding": False,
+            "requires_review": False,
+            "information_disclosure_count": 0,
+            "probe_error_count": 0,
+            "cve_candidate_count": 0,
+            "summary": (
+                "Artifact diinisialisasi; belum dilakukan "
+                "error-response probing."
+            ),
+        },
+        "evidence": {
+            "raw_probe_file": str(evidence_path()),
+            "raw_evidence_retained": True,
+        },
+        "errors": [],
+        "notes": [
+            "Error responses are evidence, not automatic vulnerabilities.",
+            "Server/framework identification alone is not classified as a vulnerability.",
+            "No redirect following is performed.",
+            "No application CRUD operation is intentionally executed.",
+            "No brute-force directory discovery is performed.",
+            "CVE correlation is heuristic candidate evidence only.",
+            "Report-generation redaction is separate from raw evidence collection.",
+        ],
+        "generated_at": utc_now(),
+        "updated_at": utc_now(),
     }
 
     save_yaml(artifact_path(), data)
@@ -1057,59 +1171,142 @@ def analyze() -> int:
     summary = summarize_probes(probes)
     assessment = assessment_from_probes(probes, cves)
 
+    project_id = project_id_from_dir(project_dir())
+    recon_status = recon_data.get("directory", {})
+    if isinstance(recon_status, dict):
+        recon_status = recon_status.get("status", "")
+    else:
+        recon_status = recon_data.get("status", "")
+
     artifact = {
         "schema_version": SCHEMA_VERSION,
-        "project_id": project_id_from_dir(project_dir()),
-        "updated_at": utc_now(),
-        "errors": {
+        "project_id": project_id,
+        "tool": {
+            "name": "BrebesKab-CSIRT-Tools",
+            "script": "errors.py",
+            "version": APP_VERSION,
+        },
+        "checklist": {
+            "id": CHECKLIST_ID,
+            "name": "Error information disclosure",
+            "phase": "04 Web Server Configuration",
+            "focus": "Technical information disclosure in HTTP error responses",
             "status": "completed",
-            "checklist_id": CHECKLIST_ID,
-            "checklist_name": CHECKLIST_NAME,
-            "application": "Bangsaku",
-            "target": {
-                "type": target["type"],
-                "value": target["value"],
-                "ports": target["ports"],
-                "scope_id": target.get("scope_id"),
-            },
-            "method_set": METHODS,
-            "endpoint_source": {
-                "type": "recon-directory",
-                "path": str(recon_path),
-                "recon_status": recon_data.get(
-                    "directory", {}
-                ).get(
-                    "status",
-                    recon_data.get("status", ""),
-                ),
-                "recon_paths": len(recon_results),
-                "selected_candidates": len(candidates),
-                "generated_error_paths": len(error_paths),
-            },
+        },
+        "target": {
+            "application": target.get("application", "Bangsaku"),
+            "hostname": target["value"],
+            "url": f"https://{target['value']}",
+            "environment": target.get("environment", "Production"),
+            "assessment_type": target.get("assessment_type", "Grey Box"),
+            "scope_id": target.get("scope_id"),
+            "scope_reference": str(project_dir() / SCOPE_REL),
+            "authorized_ports": target["ports"],
+        },
+        "methodology": {
+            "endpoint_source": "Recon directory.yaml",
+            "endpoint_source_path": str(recon_path),
+            "error_paths": (
+                "Recon-known endpoints plus deterministic non-existent "
+                "baseline and missing-child paths"
+            ),
+            "discovery": False,
+            "brute_force": False,
+            "redirect_following": False,
+            "mutation_payload": False,
+            "application_crud": False,
+            "raw_evidence_retained": True,
+            "automatic_finding": False,
+            "cve_correlation": "4-001 version.yaml heuristic candidate evidence only",
+        },
+        "baseline": {
+            "recon_status": recon_status,
+            "recon_paths": len(recon_results),
+            "selected_candidates": len(candidates),
+            "generated_error_paths": len(error_paths),
+        },
+        "toolchain": {
+            "python": "requests + PyYAML",
+            "optional_tools": [],
+            "required_tools": ["Python", "requests", "PyYAML"],
+        },
+        "probe": {
+            "methods": METHODS,
+            "authorized_ports": target["ports"],
+            "timeout_seconds": DEFAULT_TIMEOUT,
+            "max_body_bytes": MAX_BODY_BYTES,
+            "allow_redirects": False,
+            "verify_tls": True,
+            "request_body_sent": False,
+            "probe_count": len(probes),
+        },
+        "source_status": {
+            "directory": recon_status or "unknown",
+            "version": "completed" if version_artifact_path().exists() else "missing",
+        },
+        "results": {
+            "candidates": candidates,
             "error_paths": error_paths,
             "probes": probes,
-            "summary": summary,
-            "cve_candidates": cves,
-            "assessment": assessment,
-            "assessment_policy": {
-                "automatic_finding": False,
-                "notes": [
-                    "Error responses are evidence, not automatic vulnerabilities.",
-                    "Server/framework identification alone is not classified as a vulnerability.",
-                    "No redirect following is performed.",
-                    "No application CRUD operation is intentionally executed.",
-                    "No brute-force directory discovery is performed.",
-                    "CVE correlation is heuristic candidate evidence only.",
-                ],
-            },
         },
+        "summary": summary,
+        "cve_correlation": {
+            "source": "04-web-server-configuration/version/version.yaml",
+            "method": "canonical 4-001 cve_correlation.products[].cves[]",
+            "candidates": cves,
+            "candidate_count": len(cves),
+        },
+        "assessment": {
+            "result": assessment["status"],
+            "finding": False,
+            "requires_review": assessment["requires_review"],
+            "information_disclosure_count": assessment[
+                "information_disclosure_count"
+            ],
+            "probe_error_count": assessment["probe_error_count"],
+            "cve_candidate_count": assessment["cve_candidate_count"],
+            "summary": assessment["summary"],
+        },
+        "evidence": {
+            "raw_probe_file": str(evidence_path()),
+            "raw_evidence_retained": True,
+            "probe_sha256": sha256_bytes(
+                json.dumps(
+                    probes,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                ).encode("utf-8")
+            ),
+        },
+        "errors": [
+            {
+                "type": item.get("error_type", "probe-error"),
+                "message": item.get("error"),
+                "url": item.get("url"),
+                "method": item.get("method"),
+            }
+            for item in probes
+            if item.get("classification") == "probe-error"
+        ],
+        "notes": [
+            "Error responses are evidence, not automatic vulnerabilities.",
+            "Server/framework identification alone is not classified as a vulnerability.",
+            "No redirect following is performed.",
+            "No application CRUD operation is intentionally executed.",
+            "No brute-force directory discovery is performed.",
+            "CVE correlation is heuristic candidate evidence only.",
+            "Report-generation redaction is separate from raw evidence collection.",
+        ],
+        "generated_at": utc_now(),
+        "updated_at": utc_now(),
     }
 
     save_yaml(artifact_path(), artifact)
 
     raw_evidence = {
         "schema_version": SCHEMA_VERSION,
-        "project_id": project_id_from_dir(project_dir()),
+        "project_id": project_id,
         "generated_at": utc_now(),
         "checklist_id": CHECKLIST_ID,
         "target": target,
@@ -1152,11 +1349,17 @@ def load_artifact() -> Dict[str, Any]:
 
 def list_results() -> int:
     data = load_artifact()
-    block = data.get("errors", {})
+
+    checklist = data.get("checklist", {})
+    target = data.get("target", {})
+    summary = data.get("summary", {})
+    cve_correlation = data.get("cve_correlation", {})
+    assessment = data.get("assessment", {})
+    results = data.get("results", {})
 
     print(f"PROJECT: {data.get('project_id')}")
-    print(f"STATUS : {block.get('status')}")
-    print(f"TARGET : {block.get('target', {}).get('value')}")
+    print(f"STATUS : {checklist.get('status')}")
+    print(f"TARGET : {target.get('hostname')}")
     print()
 
     print(
@@ -1165,7 +1368,7 @@ def list_results() -> int:
     )
     print("-" * 110)
 
-    probes = block.get("probes", [])
+    probes = results.get("probes", [])
     if not isinstance(probes, list):
         probes = []
 
@@ -1175,23 +1378,28 @@ def list_results() -> int:
         method = str(item.get("method", "-"))
         path = str(item.get("path", "-"))
         status = str(item.get("status_code", "-"))
-        classification = str(
-            item.get("classification", "-")
-        )
+        classification = str(item.get("classification", "-"))
 
         print(
             f"{scheme:<6} {port:<5} {method:<7} "
             f"{path[:34]:<35} {status:<6} {classification}"
         )
 
-    summary = block.get("summary", {})
     print()
     print("SUMMARY")
     print("-" * 110)
-    for key, value in summary.items():
-        print(f"{key}: {value}")
+    if isinstance(summary, dict):
+        for key, value in summary.items():
+            print(f"{key}: {value}")
 
-    cves = block.get("cve_candidates", [])
+    cves = (
+        cve_correlation.get("candidates", [])
+        if isinstance(cve_correlation, dict)
+        else []
+    )
+    if not isinstance(cves, list):
+        cves = []
+
     print()
     print(f"CVE CANDIDATES: {len(cves)}")
 
@@ -1201,15 +1409,12 @@ def list_results() -> int:
             f"{cve.get('description', '')[:180]}"
         )
 
-    assessment = block.get("assessment", {})
     print()
     print("ASSESSMENT")
     print("-" * 110)
-    print(f"status          : {assessment.get('status')}")
+    print(f"result          : {assessment.get('result')}")
     print(f"finding         : {assessment.get('finding')}")
-    print(
-        f"requires_review : {assessment.get('requires_review')}"
-    )
+    print(f"requires_review : {assessment.get('requires_review')}")
     print(f"summary         : {assessment.get('summary')}")
 
     return 0
@@ -1222,92 +1427,128 @@ def verify() -> int:
         print(f"[FAIL] Tidak dapat membaca artifact: {exc}")
         return 1
 
-    block = data.get("errors")
-    if not isinstance(block, dict):
-        print("[FAIL] Block errors tidak ditemukan.")
-        return 1
-
     errors: List[str] = []
 
     if data.get("schema_version") != SCHEMA_VERSION:
-        errors.append(
-            f"schema_version harus {SCHEMA_VERSION}"
-        )
+        errors.append(f"schema_version harus {SCHEMA_VERSION}")
 
-    if block.get("checklist_id") != CHECKLIST_ID:
-        errors.append(
-            f"checklist_id harus {CHECKLIST_ID}"
-        )
+    if data.get("project_id") != project_id_from_dir(project_dir()):
+        errors.append("project_id tidak sesuai active project directory")
 
-    if block.get("status") != "completed":
-        errors.append("status artifact bukan completed")
+    checklist = data.get("checklist", {})
+    if not isinstance(checklist, dict):
+        errors.append("checklist bukan mapping")
+        checklist = {}
 
-    target = block.get("target", {})
+    if checklist.get("id") != CHECKLIST_ID:
+        errors.append(f"checklist.id harus {CHECKLIST_ID}")
+
+    if checklist.get("status") != "completed":
+        errors.append("checklist.status bukan completed")
+
+    target = data.get("target", {})
     if not isinstance(target, dict):
         errors.append("target tidak valid")
         target = {}
 
-    if not target.get("value"):
-        errors.append("target.value kosong")
+    hostname = target.get("hostname")
+    if not hostname:
+        errors.append("target.hostname kosong")
 
-    method_set = block.get("method_set")
-    if method_set != METHODS:
-        errors.append(
-            "method_set tidak sesuai dengan GET/HEAD"
-        )
-
-    endpoint_source = block.get("endpoint_source", {})
-    if not isinstance(endpoint_source, dict):
-        errors.append("endpoint_source tidak valid")
-        endpoint_source = {}
-
-    if endpoint_source.get("type") != "recon-directory":
-        errors.append(
-            "endpoint source harus recon-directory"
-        )
-
-    recon_count = endpoint_source.get("recon_paths")
-    candidate_count = endpoint_source.get("selected_candidates")
-    generated_error_paths = endpoint_source.get(
-        "generated_error_paths"
-    )
-
-    error_paths = block.get("error_paths", [])
-    probes = block.get("probes", [])
-    summary = block.get("summary", {})
-    cves = block.get("cve_candidates", [])
-
-    if not isinstance(error_paths, list):
-        errors.append("error_paths bukan list")
-        error_paths = []
-
-    if not isinstance(probes, list):
-        errors.append("probes bukan list")
-        probes = []
-
-    if not isinstance(summary, dict):
-        errors.append("summary bukan mapping")
-        summary = {}
-
-    if not isinstance(cves, list):
-        errors.append("cve_candidates bukan list")
-        cves = []
-
-    if generated_error_paths != len(error_paths):
-        errors.append(
-            "jumlah generated_error_paths tidak sama dengan error_paths"
-        )
-
-    target_ports = target.get("ports", [])
-    if not isinstance(target_ports, list):
-        target_ports = []
+    authorized_ports = target.get("authorized_ports", [])
+    if not isinstance(authorized_ports, list):
+        errors.append("target.authorized_ports bukan list")
+        authorized_ports = []
 
     supported_ports = [
         int(port)
-        for port in target_ports
+        for port in authorized_ports
         if str(port).isdigit() and int(port) in {80, 443}
     ]
     supported_ports = list(dict.fromkeys(supported_ports))
+
+    methodology = data.get("methodology", {})
+    if not isinstance(methodology, dict):
+        errors.append("methodology bukan mapping")
+        methodology = {}
+
+    if methodology.get("endpoint_source") != "Recon directory.yaml":
+        errors.append("methodology endpoint source harus Recon directory.yaml")
+
+    if methodology.get("discovery") is not False:
+        errors.append("discovery harus False")
+
+    if methodology.get("brute_force") is not False:
+        errors.append("brute_force harus False")
+
+    if methodology.get("redirect_following") is not False:
+        errors.append("redirect_following harus False")
+
+    if methodology.get("mutation_payload") is not False:
+        errors.append("mutation_payload harus False")
+
+    if methodology.get("automatic_finding") is not False:
+        errors.append("automatic_finding harus False")
+
+    probe_config = data.get("probe", {})
+    if not isinstance(probe_config, dict):
+        errors.append("probe bukan mapping")
+        probe_config = {}
+
+    if probe_config.get("methods") != METHODS:
+        errors.append("probe.methods tidak sesuai GET/HEAD")
+
+    if probe_config.get("authorized_ports") != authorized_ports:
+        errors.append("probe.authorized_ports tidak sama dengan target.authorized_ports")
+
+    if probe_config.get("allow_redirects") is not False:
+        errors.append("probe.allow_redirects harus False")
+
+    if probe_config.get("verify_tls") is not True:
+        errors.append("probe.verify_tls harus True")
+
+    if probe_config.get("request_body_sent") is not False:
+        errors.append("probe.request_body_sent harus False")
+
+    baseline = data.get("baseline", {})
+    if not isinstance(baseline, dict):
+        errors.append("baseline bukan mapping")
+        baseline = {}
+
+    recon_count = baseline.get("recon_paths")
+    candidate_count = baseline.get("selected_candidates")
+    generated_error_paths = baseline.get("generated_error_paths")
+
+    results = data.get("results", {})
+    if not isinstance(results, dict):
+        errors.append("results bukan mapping")
+        results = {}
+
+    candidates = results.get("candidates", [])
+    error_paths = results.get("error_paths", [])
+    probes = results.get("probes", [])
+
+    if not isinstance(candidates, list):
+        errors.append("results.candidates bukan list")
+        candidates = []
+
+    if not isinstance(error_paths, list):
+        errors.append("results.error_paths bukan list")
+        error_paths = []
+
+    if not isinstance(probes, list):
+        errors.append("results.probes bukan list")
+        probes = []
+
+    if generated_error_paths != len(error_paths):
+        errors.append(
+            "baseline.generated_error_paths tidak sama dengan results.error_paths"
+        )
+
+    if candidate_count != len(candidates):
+        errors.append(
+            "baseline.selected_candidates tidak sama dengan results.candidates"
+        )
 
     expected_probe_count = (
         len(error_paths)
@@ -1369,26 +1610,25 @@ def verify() -> int:
 
         if item.get("method") not in METHODS:
             errors.append(
-                f"probe[{index}] method tidak valid: "
-                f"{item.get('method')}"
+                f"probe[{index}] method tidak valid: {item.get('method')}"
             )
 
         if item.get("port") not in {80, 443}:
             errors.append(
-                f"probe[{index}] port di luar checklist: "
-                f"{item.get('port')}"
+                f"probe[{index}] port di luar checklist: {item.get('port')}"
             )
 
-        if item.get("request_body_sent") not in {
-            False,
-            None,
-        }:
+        if item.get("request_body_sent") not in {False, None}:
             errors.append(
                 f"probe[{index}] request body seharusnya tidak dikirim"
             )
 
-    recalculated = summarize_probes(probes)
+    summary = data.get("summary", {})
+    if not isinstance(summary, dict):
+        errors.append("summary bukan mapping")
+        summary = {}
 
+    recalculated = summarize_probes(probes)
     for key, value in recalculated.items():
         if summary.get(key) != value:
             errors.append(
@@ -1396,7 +1636,20 @@ def verify() -> int:
                 f"berbeda dari hasil recalculation={value}"
             )
 
-    assessment = block.get("assessment", {})
+    cve_correlation = data.get("cve_correlation", {})
+    if not isinstance(cve_correlation, dict):
+        errors.append("cve_correlation bukan mapping")
+        cve_correlation = {}
+
+    cves = cve_correlation.get("candidates", [])
+    if not isinstance(cves, list):
+        errors.append("cve_correlation.candidates bukan list")
+        cves = []
+
+    if cve_correlation.get("candidate_count") != len(cves):
+        errors.append("cve_correlation.candidate_count tidak konsisten")
+
+    assessment = data.get("assessment", {})
     if not isinstance(assessment, dict):
         errors.append("assessment bukan mapping")
         assessment = {}
@@ -1417,22 +1670,32 @@ def verify() -> int:
             "assessment.requires_review tidak sesuai hasil probe"
         )
 
-    if len(cves) != int(
-        assessment.get("cve_candidate_count", len(cves))
+    if assessment.get("information_disclosure_count") != summary.get(
+        "information_disclosure"
     ):
         errors.append(
-            "cve_candidate_count tidak konsisten"
+            "assessment.information_disclosure_count tidak konsisten"
         )
+
+    if assessment.get("probe_error_count") != summary.get("probe_errors"):
+        errors.append("assessment.probe_error_count tidak konsisten")
+
+    if assessment.get("cve_candidate_count") != len(cves):
+        errors.append("assessment.cve_candidate_count tidak konsisten")
+
+    source_status = data.get("source_status", {})
+    if not isinstance(source_status, dict):
+        errors.append("source_status bukan mapping")
+        source_status = {}
+
+    if source_status.get("directory") in {None, ""}:
+        errors.append("source_status.directory kosong")
 
     if not isinstance(recon_count, int):
-        errors.append(
-            "endpoint_source.recon_paths bukan integer"
-        )
+        errors.append("baseline.recon_paths bukan integer")
 
     if not isinstance(candidate_count, int):
-        errors.append(
-            "endpoint_source.selected_candidates bukan integer"
-        )
+        errors.append("baseline.selected_candidates bukan integer")
 
     if errors:
         print("[FAIL] Error Information Disclosure gagal validasi.")
@@ -1442,8 +1705,9 @@ def verify() -> int:
 
     print("[PASS] Error Information Disclosure memenuhi validasi.")
     print(f"[PASS] Checklist : {CHECKLIST_ID} {CHECKLIST_NAME}")
-    print(f"[PASS] Status    : {block.get('status')}")
-    print(f"[PASS] Target    : {target.get('value')}")
+    print(f"[PASS] Version   : {APP_VERSION}")
+    print(f"[PASS] Status    : {checklist.get('status')}")
+    print(f"[PASS] Target    : {target.get('hostname')}")
     print(f"[PASS] Recon     : {recon_count} path(s)")
     print(f"[PASS] Candidates: {candidate_count}")
     print(f"[PASS] ErrorPaths: {len(error_paths)}")
