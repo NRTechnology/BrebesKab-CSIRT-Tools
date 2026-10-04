@@ -26,7 +26,6 @@ Commands:
     python backup.py analyze
     python backup.py analyze --discover
     python backup.py list
-    python backup.py show
     python backup.py verify
 
 Optional discovery:
@@ -68,7 +67,7 @@ except ImportError:
 
 
 APP_NAME = "BrebesKab-CSIRT-Tools"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.1"
 SCHEMA_VERSION = "1.0"
 CHECKLIST_ID = "4-004"
 CHECKLIST_NAME = "Backup File Exposure"
@@ -566,47 +565,16 @@ def build_initial_artifact(
     target: str,
     ports: List[int],
     scope_id: str,
-    scope_item: Dict[str, Any],
     recon_path: Path,
     recon_count: int,
     candidates: List[str],
     candidate_sources: Dict[str, str],
 ) -> Dict[str, Any]:
-    """
-    Build the canonical 4-004 artifact.
-
-    This function standardizes metadata/artifact structure only. Probe,
-    discovery, classification, and assessment behavior remain unchanged.
-    """
     errors_path = locate_errors_artifact(project_root)
     version_path = locate_version_artifact(project_root)
 
-    relative_errors = (
-        str(errors_path.relative_to(project_root)).replace("\\", "/")
-        if errors_path and errors_path.exists()
-        else None
-    )
-    relative_version = (
-        str(version_path.relative_to(project_root)).replace("\\", "/")
-        if version_path and version_path.exists()
-        else None
-    )
-
-    application = str(
-        scope_item.get("application")
-        or scope_item.get("name")
-        or ""
-    ).strip()
-    environment = str(scope_item.get("environment") or "").strip()
-    assessment_type = str(
-        scope_item.get("assessment_type")
-        or scope_item.get("assessment")
-        or ""
-    ).strip()
-
     return {
         "schema_version": SCHEMA_VERSION,
-        "project_id": project_root.name,
         "tool": {
             "name": APP_NAME,
             "script": "backup.py",
@@ -615,95 +583,41 @@ def build_initial_artifact(
         "checklist": {
             "id": CHECKLIST_ID,
             "name": CHECKLIST_NAME,
-            "phase": "04 Web Server Configuration",
-            "focus": "Controlled assessment of exposed backup, archive, "
-                     "configuration, and database artifacts",
-            "status": "initialized",
-        },
-        "target": {
-            "application": application,
-            "hostname": target,
-            "url": f"https://{target}/",
-            "environment": environment,
-            "assessment_type": assessment_type,
-            "authorized_ports": ports,
-            "probe_ports": [p for p in ports if p in (80, 443)],
-            "scope_id": scope_id,
-            "scope_reference": str(
-                locate_scope(project_root).relative_to(project_root)
-            ).replace("\\", "/"),
-        },
-        "methodology": {
-            "method": (
-                "Controlled GET/HEAD requests against bounded backup/configuration/"
-                "archive candidates and backup-style paths sourced from Recon."
-            ),
-            "candidate_sources": [
-                "bounded",
-                "recon",
-                "optional-discovery",
-            ],
-            "recon_directory": str(
-                recon_path.relative_to(project_root)
-            ).replace("\\", "/"),
-            "recon_path_count": recon_count,
-            "host_variants": ["authorized target hostname"],
             "methods": METHODS,
+            "automatic_finding": False,
             "redirect_following": False,
             "mutation": False,
-            "discovery_enabled_by_default": False,
-            "discovery_scope": (
-                "Optional ffuf/gobuster candidate generation only; "
-                "discovered candidates are re-probed and classified by Python."
-            ),
-            "bruteforce": False,
+            "discovery_bruteforce": False,
             "repository_clone": False,
             "archive_extraction": False,
-            "database_import": False,
-            "destructive_action": False,
             "max_capture_bytes": MAX_CAPTURE_BYTES,
-            "automatic_finding": False,
         },
-        "baseline": {
-            "recon_directory": str(
-                recon_path.relative_to(project_root)
-            ).replace("\\", "/"),
-            "version_4_001": relative_version,
-            "errors_4_010": relative_errors,
+        "project": project_root.name,
+        "target": {
+            "scope_id": scope_id,
+            "value": target,
+            "ports": ports,
+            "protocols": ["http", "https"],
         },
-        "toolchain": {
-            "required": [
-                "Python",
-                "requests",
-                "PyYAML",
-            ],
-            "optional": [
-                "ffuf",
-                "gobuster",
-            ],
-            "discovery_preference": "ffuf preferred, gobuster fallback",
-        },
-        "probe": {
-            "methods": METHODS,
-            "ports": [p for p in ports if p in (80, 443)],
-            "schemes": ["http", "https"],
-            "allow_redirects": False,
-            "timeout_seconds": DEFAULT_TIMEOUT,
-            "max_capture_bytes": MAX_CAPTURE_BYTES,
-            "request_body": None,
-        },
-        "source_status": {
-            "version": (
-                "completed" if relative_version else "unknown"
+        "recon": {
+            "source": str(recon_path.relative_to(project_root)).replace("\\", "/"),
+            "path_count": recon_count,
+            "candidate_source": (
+                "Bounded backup/configuration/archive paths; Recon used only "
+                "to retain discovered backup-style paths"
             ),
-            "errors": (
-                "completed" if relative_errors else "unknown"
-            ),
-            "recon_directory": "available",
         },
         "supporting_evidence": {
-            "errors_4_010": relative_errors,
-            "version_4_001": relative_version,
+            "errors_4_010": (
+                str(errors_path.relative_to(project_root)).replace("\\", "/")
+                if errors_path and errors_path.exists()
+                else None
+            ),
+            "version_4_001": (
+                str(version_path.relative_to(project_root)).replace("\\", "/")
+                if version_path and version_path.exists()
+                else None
+            ),
         },
         "discovery": {
             "enabled": False,
@@ -712,66 +626,22 @@ def build_initial_artifact(
             "command": None,
             "status": "not-run",
             "candidate_count": 0,
-            "runs": [],
         },
         "candidates": [
             {"path": path, "source": candidate_sources.get(path, "bounded")}
             for path in candidates
         ],
-        "results": [],
         "probes": [],
-        "summary": {
-            "candidates": len(candidates),
-            "methods": len(METHODS),
-            "probes": 0,
-            "backup_exposed": 0,
-            "archive_exposed": 0,
-            "config_exposed": 0,
-            "database_exposed": 0,
-            "candidate": 0,
-            "access_control": 0,
-            "redirected": 0,
-            "not_found": 0,
-            "application": 0,
-            "server_errors": 0,
-            "probe_errors": 0,
-        },
-        "cve_correlation": {
-            "source": relative_version,
-            "status": "not-run",
-            "candidate_count": 0,
-            "requires_validation": False,
-            "candidates": [],
-            "triage_note": (
-                "CVE candidates are inherited supporting evidence only; "
-                "no automatic vulnerability finding is created."
-            ),
-        },
         "assessment": {
-            "result": "initialized",
             "finding": False,
             "requires_review": False,
             "classification": "initialized",
         },
-        "evidence": {
-            "raw_probe_file": (
-                "04-web-server-configuration/backup/evidence/"
-                "backup-probes.json"
-            ),
-            "raw_evidence_retained": True,
-            "report_redaction": (
-                "separate report-generation layer; raw evidence is not redacted"
-            ),
+        "cve": {
+            "candidate_count": 0,
+            "candidates": [],
         },
-        "errors": [],
-        "notes": [
-            "Checklist 4-004 does not automatically create vulnerability findings.",
-            "Backup/archive/configuration indicators are assessment evidence for review.",
-            "Optional discovery is disabled by default and requires --discover.",
-            "Discovery engines generate candidates only; Python performs the authoritative re-probe and classification.",
-        ],
         "generated_at": utc_now(),
-        "updated_at": utc_now(),
     }
 
 
@@ -1349,70 +1219,36 @@ def update_cve_candidates(
     project_root: Path,
 ) -> None:
     version_path = locate_version_artifact(project_root)
-
     if not version_path:
-        artifact["cve_correlation"] = {
-            "source": None,
-            "status": "not-available",
+        artifact["cve"] = {
             "candidate_count": 0,
-            "requires_validation": False,
             "candidates": [],
-            "triage_note": (
-                "4-001 version/CPE artifact tidak tersedia; "
-                "tidak ada CVE candidate yang diwariskan."
-            ),
+            "source": None,
         }
         return
-
-    relative_version = str(
-        version_path.relative_to(project_root)
-    ).replace("\\", "/")
 
     try:
         version_data = load_yaml(version_path)
     except Exception:
-        artifact["cve_correlation"] = {
-            "source": relative_version,
-            "status": "read-error",
+        artifact["cve"] = {
             "candidate_count": 0,
-            "requires_validation": False,
             "candidates": [],
-            "triage_note": (
-                "4-001 version/CPE artifact gagal dibaca; "
-                "CVE correlation tidak dapat diwariskan."
-            ),
+            "source": str(version_path.relative_to(project_root)).replace("\\", "/"),
         }
         return
 
-    candidates: List[Dict[str, Any]] = []
+    candidates = version_data.get("cve", {}).get("candidates", [])
+    if not isinstance(candidates, list):
+        candidates = []
 
-    # Canonical 4-001 schema.
-    correlation = version_data.get("cve_correlation")
-    if isinstance(correlation, dict):
-        raw = correlation.get("candidates", [])
-        if isinstance(raw, list):
-            candidates = [item for item in raw if isinstance(item, dict)]
-
-    # Backward compatibility with the already-generated 4-001 artifact.
-    if not candidates:
-        legacy = version_data.get("cve", {})
-        if isinstance(legacy, dict):
-            raw = legacy.get("candidates", [])
-            if isinstance(raw, list):
-                candidates = [item for item in raw if isinstance(item, dict)]
-
-    requires_validation = bool(candidates)
-
-    artifact["cve_correlation"] = {
-        "source": relative_version,
-        "status": "completed",
+    # Preserve the candidate evidence but do not claim applicability.
+    artifact["cve"] = {
         "candidate_count": len(candidates),
-        "requires_validation": requires_validation,
         "candidates": candidates,
+        "source": str(version_path.relative_to(project_root)).replace("\\", "/"),
         "triage_note": (
             "CVE candidates are inherited supporting evidence only; "
-            "candidate presence does not establish applicability, "
-            "exploitability, or a vulnerability finding."
+            "no automatic vulnerability finding is created."
         ),
     }
 
@@ -1427,8 +1263,7 @@ def command_version() -> int:
     print("Endpoint source: Recon directory.yaml + bounded backup candidates")
     print("Optional discovery: ffuf preferred, gobuster fallback")
     print("Supporting evidence: 4-010 errors.yaml")
-    print("CVE source: 4-001 version.yaml / cve_correlation")
-    print("Artifact: canonical Web Server checklist schema")
+    print("CVE source: 4-001 version.yaml")
     print("Redirect following: disabled")
     print("Mutation payload: none")
     print("Discovery: optional, explicit --discover only")
@@ -1442,7 +1277,7 @@ def command_version() -> int:
 
 
 def command_init(project_root: Path) -> int:
-    target, ports, scope_id, scope_item = resolve_target(project_root)
+    target, ports, scope_id, _ = resolve_target(project_root)
     recon_path = locate_recon_directory(project_root)
     recon = load_yaml(recon_path)
     recon_paths = extract_recon_paths(recon)
@@ -1455,7 +1290,6 @@ def command_init(project_root: Path) -> int:
         target,
         ports,
         scope_id,
-        scope_item,
         recon_path,
         len(recon_paths),
         candidates,
@@ -1492,8 +1326,8 @@ def command_analyze(
         return 1
 
     artifact = load_yaml(artifact_path)
-    target = artifact["target"]["hostname"]
-    ports = [int(p) for p in artifact["target"]["authorized_ports"]]
+    target = artifact["target"]["value"]
+    ports = [int(p) for p in artifact["target"]["ports"]]
 
     candidates = artifact.get("candidates", [])
     normalized_candidates: Dict[str, Dict[str, Any]] = {}
@@ -1618,24 +1452,7 @@ def command_analyze(
 
     artifact["candidates"] = candidate_items
     artifact["probes"] = probes
-    artifact["results"] = probes
     artifact["discovery"] = discovery_info
-    artifact["summary"] = {
-        "candidates": len(candidate_items),
-        "methods": len(METHODS),
-        "probes": len(probes),
-        **counts,
-    }
-    artifact["probe"] = {
-        **artifact.get("probe", {}),
-        "methods": METHODS,
-        "ports": [p for p in ports if p in (80, 443)],
-        "schemes": ["http", "https"],
-        "allow_redirects": False,
-        "timeout_seconds": DEFAULT_TIMEOUT,
-        "max_capture_bytes": MAX_CAPTURE_BYTES,
-        "request_body": None,
-    }
     artifact["assessment"] = {
         "finding": False,
         "requires_review": (
@@ -1661,15 +1478,7 @@ def command_analyze(
     }
 
     update_cve_candidates(artifact, project_root)
-    artifact["source_status"] = {
-        "version": artifact.get("source_status", {}).get("version", "unknown"),
-        "errors": artifact.get("source_status", {}).get("errors", "unknown"),
-        "recon_directory": "available",
-    }
-    artifact["checklist"]["status"] = "completed"
-    artifact["assessment"]["result"] = artifact["assessment"]["classification"]
-    artifact["generated_at"] = artifact.get("generated_at", utc_now())
-    artifact["updated_at"] = utc_now()
+    artifact["generated_at"] = utc_now()
 
     save_yaml(artifact_path, artifact)
 
@@ -1690,7 +1499,7 @@ def command_analyze(
     print(f"APPLICATION      : {counts['application']}")
     print(f"SERVER ERRORS    : {counts['server_errors']}")
     print(f"PROBE ERRORS     : {counts['probe_errors']}")
-    print(f"CVE CANDIDATES   : {artifact.get("cve_correlation", {}).get("candidate_count", 0)}")
+    print(f"CVE CANDIDATES   : {artifact['cve']['candidate_count']}")
     print(f"REQUIRES REVIEW  : {artifact['assessment']['requires_review']}")
     print(f"STATUS           : {artifact['assessment']['classification']}")
     print(f"FILE             : {artifact_path}")
@@ -1718,7 +1527,7 @@ def command_list(project_root: Path) -> int:
         return 1
 
     artifact = load_yaml(artifact_path)
-    probes = artifact.get("results") or artifact.get("probes", [])
+    probes = artifact.get("probes", [])
 
     observations = [
         probe for probe in probes if isinstance(probe, dict) and is_observation(probe)
@@ -1756,164 +1565,6 @@ def command_list(project_root: Path) -> int:
     return 0
 
 
-
-def command_show(project_root: Path) -> int:
-    """
-    Display the canonical 4-004 artifact without performing any network probe.
-
-    This command is read-only. It intentionally exposes the stored artifact
-    metadata, source status, probe configuration, summary, CVE correlation
-    summary, assessment, and evidence references. Raw probe bodies are not
-    reprinted here; they remain available in the evidence artifact.
-    """
-    artifact_path, _ = resolve_artifact_paths(project_root)
-
-    if not artifact_path.exists():
-        print("[ERROR] Artifact belum ada. Jalankan 'init' terlebih dahulu.")
-        return 1
-
-    artifact = load_yaml(artifact_path)
-
-    checklist = artifact.get("checklist", {})
-    target = artifact.get("target", {})
-    methodology = artifact.get("methodology", {})
-    baseline = artifact.get("baseline", {})
-    toolchain = artifact.get("toolchain", {})
-    probe_config = artifact.get("probe", {})
-    source_status = artifact.get("source_status", {})
-    discovery = artifact.get("discovery", {})
-    summary = artifact.get("summary", {})
-    cve = artifact.get("cve_correlation", {})
-    assessment = artifact.get("assessment", {})
-    evidence = artifact.get("evidence", {})
-
-    print(f"FILE            : {artifact_path}")
-    print(f"PROJECT         : {artifact.get('project_id', project_root.name)}")
-    print(
-        f"CHECKLIST       : "
-        f"{checklist.get('id', CHECKLIST_ID)} "
-        f"{checklist.get('name', CHECKLIST_NAME)}"
-    )
-    print(f"SCHEMA          : {artifact.get('schema_version', SCHEMA_VERSION)}")
-    print(f"STATUS          : {checklist.get('status', '-')}")
-    print()
-    print("TARGET")
-    print(f"  Application   : {target.get('application', '-')}")
-    print(f"  Hostname      : {target.get('hostname', '-')}")
-    print(f"  URL           : {target.get('url', '-')}")
-    print(f"  Environment   : {target.get('environment', '-')}")
-    print(f"  Assessment    : {target.get('assessment_type', '-')}")
-    print(f"  Scope ID      : {target.get('scope_id', '-')}")
-    print(
-        "  Authorized    : "
-        + ", ".join(str(p) for p in target.get("authorized_ports", []))
-    )
-    print(
-        "  Probe ports   : "
-        + ", ".join(str(p) for p in target.get("probe_ports", []))
-    )
-    print()
-    print("METHODOLOGY")
-    print(f"  Method        : {methodology.get('method', '-')}")
-    print(
-        "  Sources       : "
-        + ", ".join(str(x) for x in methodology.get("candidate_sources", []))
-    )
-    print(f"  Recon paths   : {methodology.get('recon_path_count', '-')}")
-    print(
-        "  Methods       : "
-        + ", ".join(str(x) for x in methodology.get("methods", []))
-    )
-    print(f"  Redirects     : {methodology.get('redirect_following', '-')}")
-    print(f"  Mutation      : {methodology.get('mutation', '-')}")
-    print(f"  Discovery     : {methodology.get('discovery_enabled_by_default', '-')}")
-    print(f"  Bruteforce    : {methodology.get('bruteforce', '-')}")
-    print()
-    print("BASELINE")
-    print(f"  Recon         : {baseline.get('recon_directory', '-')}")
-    print(f"  4-001 Version : {baseline.get('version_4_001', '-')}")
-    print(f"  4-010 Errors  : {baseline.get('errors_4_010', '-')}")
-    print()
-    print("TOOLCHAIN")
-    print(
-        "  Required      : "
-        + ", ".join(str(x) for x in toolchain.get("required", []))
-    )
-    print(
-        "  Optional      : "
-        + ", ".join(str(x) for x in toolchain.get("optional", []))
-    )
-    print()
-    print("SOURCE STATUS")
-    print(f"  Version       : {source_status.get('version', '-')}")
-    print(f"  Errors        : {source_status.get('errors', '-')}")
-    print(f"  Recon         : {source_status.get('recon_directory', '-')}")
-    print()
-    print("PROBE")
-    print(
-        "  Methods       : "
-        + ", ".join(str(x) for x in probe_config.get("methods", []))
-    )
-    print(
-        "  Ports         : "
-        + ", ".join(str(x) for x in probe_config.get("ports", []))
-    )
-    print(
-        "  Schemes       : "
-        + ", ".join(str(x) for x in probe_config.get("schemes", []))
-    )
-    print(f"  Redirects     : {probe_config.get('allow_redirects', '-')}")
-    print(f"  Timeout       : {probe_config.get('timeout_seconds', '-')} seconds")
-    print(
-        f"  Max capture   : "
-        f"{probe_config.get('max_capture_bytes', '-')} bytes"
-    )
-    print()
-    print("DISCOVERY")
-    print(f"  Enabled       : {discovery.get('enabled', '-')}")
-    print(f"  Engine        : {discovery.get('engine', '-')}")
-    print(f"  Wordlist      : {discovery.get('wordlist', '-')}")
-    print(f"  Status        : {discovery.get('status', '-')}")
-    print(f"  Candidates    : {discovery.get('candidate_count', 0)}")
-    print()
-    print("SUMMARY")
-    print(f"  Candidates    : {summary.get('candidates', 0)}")
-    print(f"  Methods       : {summary.get('methods', 0)}")
-    print(f"  Probes        : {summary.get('probes', 0)}")
-    print(f"  Backup        : {summary.get('backup_exposed', 0)}")
-    print(f"  Archive       : {summary.get('archive_exposed', 0)}")
-    print(f"  Config        : {summary.get('config_exposed', 0)}")
-    print(f"  Database      : {summary.get('database_exposed', 0)}")
-    print(f"  Candidate     : {summary.get('candidate', 0)}")
-    print(f"  Access control: {summary.get('access_control', 0)}")
-    print(f"  Redirected    : {summary.get('redirected', 0)}")
-    print(f"  Not found     : {summary.get('not_found', 0)}")
-    print(f"  Application   : {summary.get('application', 0)}")
-    print(f"  Server errors : {summary.get('server_errors', 0)}")
-    print(f"  Probe errors  : {summary.get('probe_errors', 0)}")
-    print()
-    print("CVE CORRELATION")
-    print(f"  Source        : {cve.get('source', '-')}")
-    print(f"  Status        : {cve.get('status', '-')}")
-    print(f"  Candidates    : {cve.get('candidate_count', 0)}")
-    print(f"  Validation    : {cve.get('requires_validation', False)}")
-    print()
-    print("ASSESSMENT")
-    print(f"  Result        : {assessment.get('result', '-')}")
-    print(f"  Classification : {assessment.get('classification', '-')}")
-    print(f"  Finding       : {assessment.get('finding', '-')}")
-    print(f"  Review        : {assessment.get('requires_review', '-')}")
-    print()
-    print("EVIDENCE")
-    print(f"  Raw probes    : {evidence.get('raw_probe_file', '-')}")
-    print(f"  Retained      : {evidence.get('raw_evidence_retained', '-')}")
-    print(f"  Redaction     : {evidence.get('report_redaction', '-')}")
-    print()
-    print(f"GENERATED       : {artifact.get('generated_at', '-')}")
-    print(f"UPDATED         : {artifact.get('updated_at', '-')}")
-    return 0
-
-
 def command_verify(project_root: Path) -> int:
     artifact_path, evidence_dir = resolve_artifact_paths(project_root)
 
@@ -1922,89 +1573,31 @@ def command_verify(project_root: Path) -> int:
         return 1
 
     artifact = load_yaml(artifact_path)
-    probes = artifact.get("results") or artifact.get("probes", [])
+    probes = artifact.get("probes", [])
     candidates = artifact.get("candidates", [])
+
     errors: List[str] = []
 
     if artifact.get("schema_version") != SCHEMA_VERSION:
         errors.append("schema_version tidak sesuai.")
 
-    if artifact.get("project_id") != project_root.name:
-        errors.append("project_id tidak konsisten dengan active project.")
-
-    checklist = artifact.get("checklist", {})
-    if checklist.get("id") != CHECKLIST_ID:
+    if artifact.get("checklist", {}).get("id") != CHECKLIST_ID:
         errors.append("checklist.id tidak sesuai.")
 
-    if checklist.get("name") != CHECKLIST_NAME:
-        errors.append("checklist.name tidak sesuai.")
+    if artifact.get("checklist", {}).get("automatic_finding") is not False:
+        errors.append("automatic_finding harus false.")
 
-    if checklist.get("phase") != "04 Web Server Configuration":
-        errors.append("checklist.phase tidak sesuai.")
+    if artifact.get("checklist", {}).get("redirect_following") is not False:
+        errors.append("redirect_following harus false.")
 
-    if checklist.get("status") != "completed":
-        errors.append(
-            f"checklist.status harus completed, saat ini {checklist.get('status')!r}."
-        )
+    if artifact.get("checklist", {}).get("mutation") is not False:
+        errors.append("mutation harus false.")
 
-    target = artifact.get("target", {})
-    hostname = str(target.get("hostname", "")).strip()
-    if not hostname:
-        errors.append("target.hostname kosong.")
+    if artifact.get("checklist", {}).get("repository_clone") is not False:
+        errors.append("repository_clone harus false.")
 
-    if not target.get("scope_id"):
-        errors.append("target.scope_id kosong.")
-
-    authorized_ports = target.get("authorized_ports", [])
-    probe_ports = target.get("probe_ports", [])
-    if not isinstance(authorized_ports, list):
-        errors.append("target.authorized_ports harus list.")
-        authorized_ports = []
-    if not isinstance(probe_ports, list):
-        errors.append("target.probe_ports harus list.")
-        probe_ports = []
-
-    if any(int(p) not in (80, 443) for p in probe_ports):
-        errors.append("target.probe_ports mengandung port di luar HTTP/HTTPS.")
-
-    methodology = artifact.get("methodology", {})
-    if methodology.get("methods") != METHODS:
-        errors.append("methodology.methods tidak sesuai.")
-
-    if methodology.get("redirect_following") is not False:
-        errors.append("methodology.redirect_following harus false.")
-
-    if methodology.get("mutation") is not False:
-        errors.append("methodology.mutation harus false.")
-
-    if methodology.get("bruteforce") is not False:
-        errors.append("methodology.bruteforce harus false.")
-
-    if methodology.get("repository_clone") is not False:
-        errors.append("methodology.repository_clone harus false.")
-
-    if methodology.get("archive_extraction") is not False:
-        errors.append("methodology.archive_extraction harus false.")
-
-    if methodology.get("automatic_finding") is not False:
-        errors.append("methodology.automatic_finding harus false.")
-
-    source_status = artifact.get("source_status", {})
-    if source_status.get("recon_directory") != "available":
-        errors.append("source_status.recon_directory harus available.")
-
-    if source_status.get("version") not in {"completed", "unknown"}:
-        errors.append("source_status.version tidak valid.")
-
-    if source_status.get("errors") not in {"completed", "unknown"}:
-        errors.append("source_status.errors tidak valid.")
-
-    probe_config = artifact.get("probe", {})
-    if probe_config.get("allow_redirects") is not False:
-        errors.append("probe.allow_redirects harus false.")
-
-    if probe_config.get("methods") != METHODS:
-        errors.append("probe.methods tidak sesuai.")
+    if artifact.get("checklist", {}).get("archive_extraction") is not False:
+        errors.append("archive_extraction harus false.")
 
     expected_probe_count = len(candidates) * len(METHODS) * 2
     # Only HTTP/HTTPS are in the active web-server scope.
@@ -2027,12 +1620,6 @@ def command_verify(project_root: Path) -> int:
         if probe.get("method") not in METHODS:
             errors.append(f"method tidak valid: {probe.get('method')}")
 
-        if probe.get("scheme") not in {"http", "https"}:
-            errors.append(f"scheme tidak valid: {probe.get('scheme')}")
-
-        if probe.get("port") not in {80, 443}:
-            errors.append(f"port probe tidak valid: {probe.get('port')}")
-
         if probe.get("classification") in {
             "backup-file-exposed",
             "backup-archive-exposed",
@@ -2044,59 +1631,6 @@ def command_verify(project_root: Path) -> int:
                 f"backup classification pada non-backup path: {path}"
             )
 
-    summary = artifact.get("summary", {})
-    counts = summarize_probes(probes)
-    expected_summary = {
-        "candidates": len(candidates),
-        "methods": len(METHODS),
-        "probes": len(probes),
-        **counts,
-    }
-    for key, expected in expected_summary.items():
-        if summary.get(key) != expected:
-            errors.append(
-                f"summary.{key}={summary.get(key)!r} tidak sesuai expected {expected}."
-            )
-
-    assessment = artifact.get("assessment", {})
-    if assessment.get("finding") is not False:
-        errors.append("assessment.finding harus false.")
-
-    expected_review = bool(
-        counts["backup_exposed"]
-        or counts["archive_exposed"]
-        or counts["config_exposed"]
-        or counts["database_exposed"]
-        or counts["candidate"]
-        or counts["probe_errors"]
-    )
-    if assessment.get("requires_review") is not expected_review:
-        errors.append("assessment.requires_review tidak konsisten dengan hasil probes.")
-
-    expected_classification = (
-        "backup-exposure-review"
-        if expected_review
-        else "no-backup-exposure-observed"
-    )
-    if assessment.get("classification") != expected_classification:
-        errors.append(
-            "assessment.classification tidak konsisten dengan hasil probes."
-        )
-
-    if assessment.get("result") != assessment.get("classification"):
-        errors.append("assessment.result harus sama dengan assessment.classification.")
-
-    cve = artifact.get("cve_correlation", {})
-    if not isinstance(cve, dict):
-        errors.append("cve_correlation harus berupa mapping.")
-        cve = {}
-
-    if cve.get("candidate_count") != len(cve.get("candidates", [])):
-        errors.append("cve_correlation.candidate_count tidak konsisten.")
-
-    if cve.get("candidate_count", 0) > 0 and cve.get("status") != "completed":
-        errors.append("cve_correlation.status harus completed saat ada candidate.")
-
     evidence_file = evidence_dir / "backup-probes.json"
     if probes and not evidence_file.exists():
         errors.append("raw evidence backup-probes.json tidak ditemukan.")
@@ -2107,11 +1641,12 @@ def command_verify(project_root: Path) -> int:
             print(f"[FAIL] {error}")
         return 1
 
+    counts = summarize_probes(probes)
+
     print("[PASS] Backup File Exposure memenuhi validasi.")
     print(f"[PASS] Checklist : {CHECKLIST_ID} {CHECKLIST_NAME}")
-    print(f"[PASS] Version   : {APP_VERSION}")
     print("[PASS] Status    : completed")
-    print(f"[PASS] Target    : {hostname}")
+    print(f"[PASS] Target    : {artifact.get('target', {}).get('value')}")
     print(f"[PASS] Candidates: {len(candidates)}")
     print(f"[PASS] Methods   : {len(METHODS)}")
     print(f"[PASS] Probes    : {len(probes)}")
@@ -2120,13 +1655,10 @@ def command_verify(project_root: Path) -> int:
     print(f"[PASS] Config    : {counts['config_exposed']}")
     print(f"[PASS] Database  : {counts['database_exposed']}")
     print(f"[PASS] Candidate : {counts['candidate']}")
-    print(
-        f"[PASS] CVE       : "
-        f"{cve.get('candidate_count', 0)} candidate(s)"
-    )
+    print(f"[PASS] CVE       : {artifact.get('cve', {}).get('candidate_count', 0)} candidate(s)")
     print(
         f"[PASS] Review    : "
-        f"{1 if assessment.get('requires_review') else 0}"
+        f"{1 if artifact.get('assessment', {}).get('requires_review') else 0}"
     )
     print(
         "[PASS] CVE Triage: backup exposure is not automatically mapped to a CVE; "
@@ -2136,6 +1668,7 @@ def command_verify(project_root: Path) -> int:
         "[PASS] Assessment: backup indicators are review evidence; "
         "no automatic vulnerability finding."
     )
+
     return 0
 
 
@@ -2149,7 +1682,6 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("version")
     subparsers.add_parser("init")
     subparsers.add_parser("list")
-    subparsers.add_parser("show")
     subparsers.add_parser("verify")
 
     analyze = subparsers.add_parser("analyze")
@@ -2198,9 +1730,6 @@ def main() -> int:
 
         if args.command == "list":
             return command_list(project_root)
-
-        if args.command == "show":
-            return command_show(project_root)
 
         if args.command == "verify":
             return command_verify(project_root)
