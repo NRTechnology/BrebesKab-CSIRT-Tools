@@ -66,7 +66,7 @@ except ImportError:
     sys.exit(1)
 
 
-SCRIPT_VERSION = "1.1.5"
+SCRIPT_VERSION = "1.1.8"
 SCHEMA_VERSION = "1.0"
 CHECKLIST_ID = "5-002"
 CHECKLIST_NAME = "Session Management"
@@ -278,6 +278,12 @@ def canonical_empty_artifact(context: ProjectContext) -> dict[str, Any]:
             "captcha_turnstile_bypass": False,
             "mass_session_testing": False,
             "redirect_following": False,
+            "authentication_outcome_engine": True,
+            "authentication_outcomes": [
+                "SUCCESS",
+                "FAILED",
+                "UNCONFIRMED",
+            ],
             "automatic_finding": False,
             "debug_login_persist_session": False,
         },
@@ -1078,6 +1084,257 @@ def find_login_form_with_requests(
     return session, response, form
 
 
+
+AUTH_OUTCOME_SUCCESS = "SUCCESS"
+AUTH_OUTCOME_FAILED = "FAILED"
+AUTH_OUTCOME_UNCONFIRMED = "UNCONFIRMED"
+
+AUTH_REJECTION_STATUSES = {400, 401, 403, 422, 429}
+AUTH_FAILURE_MARKERS = (
+    "invalid username",
+    "invalid password",
+    "invalid credentials",
+    "incorrect password",
+    "incorrect username",
+    "wrong password",
+    "wrong username",
+    "authentication failed",
+    "login failed",
+    "login gagal",
+    "username atau password",
+    "username or password",
+    "password salah",
+    "akun tidak ditemukan",
+    "account not found",
+    "credentials are incorrect",
+    "credential is incorrect",
+    "unauthorized",
+)
+AUTHENTICATED_STATE_MARKERS = (
+    "logout",
+    "log out",
+    "sign out",
+    "signout",
+    "dashboard",
+    "my account",
+    "profile",
+    "welcome",
+)
+
+def _normalized_path(value: str) -> str:
+    parsed = urlparse(str(value or ""))
+    path = parsed.path or "/"
+    if not path.startswith("/"):
+        path = "/" + path
+    return path.rstrip("/").lower() or "/"
+
+def _auth_url(value: str, base: str = "") -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        return urljoin(base, raw) if base else raw
+    except Exception:
+        return raw
+
+def _auth_login_paths(login_url: str, login_action_url: str = "") -> set[str]:
+    paths = {
+        _normalized_path(login_url),
+        _normalized_path(login_action_url),
+        "/login",
+    }
+    return {item for item in paths if item}
+
+def _body_has_login_form(html: str) -> bool:
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(str(html or ""), "html.parser")
+        password = soup.find(
+            "input",
+            attrs={"type": re.compile("^password$", re.I)},
+        )
+        return password is not None
+    except Exception:
+        return False
+
+def _authentication_failure_reasons(html: str) -> list[str]:
+    lower = re.sub(r"\s+", " ", str(html or "").lower())
+    return [marker for marker in AUTH_FAILURE_MARKERS if marker in lower]
+
+def _authenticated_state_signals(html: str) -> list[str]:
+    lower = re.sub(r"\s+", " ", str(html or "").lower())
+    return [marker for marker in AUTHENTICATED_STATE_MARKERS if marker in lower]
+
+def authentication_outcome_engine(
+    *,
+    login_url: str,
+    login_action_url: str = "",
+    post_captured: bool,
+    post_status: Optional[int],
+    location: str = "",
+    current_url: str = "",
+    session_cookie_present: bool,
+    response_body: str = "",
+) -> dict[str, Any]:
+    """
+    Decide authentication outcome from multiple independent signals.
+
+    Rules:
+      - HTTP rejection or explicit login failure -> FAILED.
+      - Missing POST capture -> UNCONFIRMED.
+      - Redirect/navigation back to a login endpoint -> FAILED.
+      - A pre-existing session cookie is never sufficient evidence.
+      - SUCCESS requires: captured POST, non-rejection response, navigation
+        away from login, a usable session cookie, no login form/failure
+        indicators on the resulting page.
+      - If evidence is insufficient -> UNCONFIRMED.
+    """
+    reasons: list[str] = []
+    normalized_login_paths = _auth_login_paths(
+        login_url,
+        login_action_url,
+    )
+    resolved_location = _auth_url(location, login_url)
+    resolved_current = _auth_url(current_url, login_url)
+
+    destination = resolved_location or resolved_current
+    destination_path = _normalized_path(destination)
+    failure_markers = _authentication_failure_reasons(response_body)
+    login_form_present = _body_has_login_form(response_body)
+    state_signals = _authenticated_state_signals(response_body)
+
+    if post_status in AUTH_REJECTION_STATUSES:
+        reasons.append(f"authentication response HTTP {post_status} indicates rejection")
+
+    if failure_markers:
+        reasons.append(
+            "explicit login failure indicator: " + ", ".join(failure_markers[:5])
+        )
+
+    destination_is_login = (
+        destination_path in normalized_login_paths
+        or destination_path == "/login"
+    )
+
+    if destination_is_login:
+        reasons.append("redirect/navigation kembali ke login endpoint")
+
+    if not post_captured:
+        reasons.append("authentication POST tidak tertangkap")
+
+    if not session_cookie_present:
+        reasons.append("usable session cookie tidak tersedia")
+
+    if login_form_present:
+        reasons.append("halaman hasil masih memiliki login form")
+
+    if (
+        post_captured
+        and post_status not in AUTH_REJECTION_STATUSES
+        and not destination_is_login
+        and session_cookie_present
+        and not failure_markers
+        and not login_form_present
+        and destination_path not in {"", "/"}
+    ):
+        # A login-form-free page reached through the authentication flow,
+        # together with the authenticated session cookie, is the automatic
+        # authenticated-state confirmation. Explicit markers strengthen the
+        # evidence but are not mandatory because applications vary.
+        outcome = AUTH_OUTCOME_SUCCESS
+        reasons.append("post-login page reached without login form/failure indicators")
+    elif (
+        post_captured
+        and (
+            destination_is_login
+            or post_status in AUTH_REJECTION_STATUSES
+            or failure_markers
+            or login_form_present
+        )
+    ):
+        outcome = AUTH_OUTCOME_FAILED
+    else:
+        outcome = AUTH_OUTCOME_UNCONFIRMED
+
+    return {
+        "outcome": outcome,
+        "success": outcome == AUTH_OUTCOME_SUCCESS,
+        "authentication_outcome": outcome,
+        "destination_url": destination,
+        "destination_path": destination_path,
+        "redirect_away_from_login": bool(
+            destination_path and destination_path not in normalized_login_paths
+        ),
+        "login_form_present": login_form_present,
+        "failure_markers": failure_markers,
+        "authenticated_state_signals": state_signals,
+        "session_cookie_present": session_cookie_present,
+        "post_captured": post_captured,
+        "post_status": post_status,
+        "location": location,
+        "reasons": reasons,
+        "requires_review": outcome == AUTH_OUTCOME_UNCONFIRMED,
+    }
+
+def _post_login_http_verification(
+    session: requests.Session,
+    destination_url: str,
+    login_url: str,
+    timeout: int,
+) -> dict[str, Any]:
+    if not destination_url:
+        return {
+            "verified": False,
+            "status": None,
+            "url": "",
+            "body": "",
+            "reason": "Tidak ada destination URL untuk post-login verification.",
+        }
+
+    try:
+        response = session.get(
+            destination_url,
+            timeout=timeout,
+            allow_redirects=False,
+        )
+    except requests.RequestException as exc:
+        return {
+            "verified": False,
+            "status": None,
+            "url": destination_url,
+            "body": "",
+            "reason": f"Post-login verification request gagal: {exc}",
+        }
+
+    body = response.text[:DEFAULT_MAX_BODY_BYTES]
+    final_path = _normalized_path(response.url or destination_url)
+    login_path = _normalized_path(login_url)
+
+    verified = (
+        response.status_code < 400
+        and final_path != login_path
+        and not _body_has_login_form(body)
+        and not _authentication_failure_reasons(body)
+    )
+
+    return {
+        "verified": verified,
+        "status": response.status_code,
+        "url": response.url or destination_url,
+        "body": body,
+        "body_info": response_body_info(response),
+        "headers": safe_headers(response),
+        "login_form_present": _body_has_login_form(body),
+        "failure_markers": _authentication_failure_reasons(body),
+        "authenticated_state_signals": _authenticated_state_signals(body),
+        "reason": (
+            "Post-login page tidak kembali ke login dan tidak menunjukkan "
+            "login form/failure indicator."
+            if verified
+            else "Post-login page belum memberikan bukti authenticated state yang cukup."
+        ),
+    }
+
 def automatic_http_authentication(
     login_url: str,
     username: str,
@@ -1085,13 +1342,14 @@ def automatic_http_authentication(
     preferred_cookie_name: str,
     timeout: int,
 ) -> dict[str, Any]:
-    """Perform one bounded authorized login attempt without browser automation."""
+    """Perform one bounded authorized login attempt with outcome verification."""
     session, response, form = find_login_form_with_requests(login_url, timeout)
 
     challenge = form.get("human_interaction") or {}
     if challenge.get("detected"):
         return {
             "success": False,
+            "authentication_outcome": AUTH_OUTCOME_UNCONFIRMED,
             "mode": "browser-required",
             "human_interaction_required": True,
             "human_interaction": challenge,
@@ -1106,6 +1364,7 @@ def automatic_http_authentication(
     if method != "POST":
         return {
             "success": False,
+            "authentication_outcome": AUTH_OUTCOME_UNCONFIRMED,
             "mode": "http",
             "human_interaction_required": False,
             "reason": f"Login form method {method} tidak didukung untuk automatic POST.",
@@ -1122,6 +1381,7 @@ def automatic_http_authentication(
     except requests.RequestException as exc:
         return {
             "success": False,
+            "authentication_outcome": AUTH_OUTCOME_UNCONFIRMED,
             "mode": "http",
             "human_interaction_required": False,
             "reason": f"HTTP authentication request gagal: {exc}",
@@ -1131,6 +1391,7 @@ def automatic_http_authentication(
     if post_challenge.get("detected"):
         return {
             "success": False,
+            "authentication_outcome": AUTH_OUTCOME_UNCONFIRMED,
             "mode": "browser-required",
             "human_interaction_required": True,
             "human_interaction": post_challenge,
@@ -1138,7 +1399,7 @@ def automatic_http_authentication(
             "login_status": login_response.status_code,
         }
 
-    cookies = []
+    cookies: list[dict[str, Any]] = []
     for cookie in session.cookies:
         cookies.append({
             "name": cookie.name,
@@ -1151,26 +1412,76 @@ def automatic_http_authentication(
         })
 
     selected = session_cookie_from_cookies(cookies, preferred_cookie_name)
-    authenticated_indication = bool(selected) and login_response.status_code not in {
-        401, 403, 429
+    location = str(login_response.headers.get("Location") or "")
+    destination = urljoin(
+        str(response.url or login_url),
+        location,
+    ) if location else ""
+
+    verification = _post_login_http_verification(
+        session,
+        destination,
+        login_url,
+        timeout,
+    ) if destination and _normalized_path(destination) not in _auth_login_paths(
+        login_url,
+        str(form.get("action") or ""),
+    ) else {
+        "verified": False,
+        "status": None,
+        "url": destination,
+        "body": "",
+        "reason": "Authentication redirect kembali ke login; post-login verification tidak dilakukan.",
     }
 
+    body = str(verification.get("body") or "")
+    engine = authentication_outcome_engine(
+        login_url=login_url,
+        login_action_url=str(form.get("action") or ""),
+        post_captured=True,
+        post_status=login_response.status_code,
+        location=location,
+        current_url=str(verification.get("url") or destination),
+        session_cookie_present=bool(selected),
+        response_body=body,
+    )
+
+    if engine["outcome"] == AUTH_OUTCOME_SUCCESS and not verification.get("verified"):
+        engine["outcome"] = AUTH_OUTCOME_UNCONFIRMED
+        engine["success"] = False
+        engine["authentication_outcome"] = AUTH_OUTCOME_UNCONFIRMED
+        engine["requires_review"] = True
+        engine["reasons"].append(
+            "post-login verification tidak mengonfirmasi authenticated state"
+        )
+
     return {
-        "success": authenticated_indication,
+        "success": bool(engine["success"]),
+        "authentication_outcome": engine["outcome"],
         "mode": "http",
         "human_interaction_required": False,
         "login_get_status": response.status_code,
         "login_status": login_response.status_code,
-        "location": login_response.headers.get("Location", ""),
+        "location": location,
+        "post_login_url": str(verification.get("url") or destination or ""),
         "cookies": normalized_cookie_metadata(cookies),
         "selected_cookie": (
             {**selected, "value": "[REDACTED]"} if selected else None
         ),
         "session_value": selected.get("value") if selected else "",
+        "post_login_verification": {
+            key: value for key, value in verification.items() if key != "body"
+        },
+        "authentication_engine": engine,
+        "requires_review": bool(engine["requires_review"]),
         "reason": (
-            "Authorized HTTP login completed and session cookie captured."
-            if authenticated_indication
-            else "Login did not produce a usable authenticated session cookie."
+            "Authorized HTTP login berhasil dan post-login authenticated state "
+            "terverifikasi."
+            if engine["success"]
+            else "Authentication outcome "
+            + str(engine["outcome"])
+            + ": "
+            + "; ".join(engine["reasons"])
         ),
     }
 
@@ -1183,7 +1494,24 @@ def browser_authentication(
     timeout: int,
     browser_wait: int,
 ) -> dict[str, Any]:
-    """Use a visible Playwright browser when human interaction is required."""
+    """
+    Use a visible Playwright browser when human interaction is required.
+
+    Normal browser authentication uses the same capture baseline as
+    --debug-login:
+      - discover the rendered login form action before authentication;
+      - capture cookies before login;
+      - capture the actual authentication POST;
+      - capture the POST response and navigation/redirect;
+      - capture cookies after login;
+      - compare the preferred session cookie before/after authentication;
+      - return the authenticated session value for encrypted persistence.
+
+    Unlike --debug-login, normal mode:
+      - never prints plaintext cookie/session values;
+      - keeps the existing automatic-submit behavior when no challenge exists;
+      - persists the selected authenticated session through cmd_add().
+    """
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
@@ -1201,14 +1529,99 @@ def browser_authentication(
         page = context.new_page()
         page.set_default_timeout(timeout_ms)
 
+        login_post_request: Optional[Any] = None
+        login_post_response: Optional[Any] = None
+        post_data: str = ""
+        navigation_urls: list[str] = []
+        login_action_url = ""
+        login_method = ""
+
+        def on_request(request: Any) -> None:
+            nonlocal login_post_request, post_data
+
+            try:
+                if request.method.upper() != "POST":
+                    return
+
+                if login_post_request is not None:
+                    return
+
+                request_url = str(request.url)
+                normalized_request = request_url.rstrip("/")
+                normalized_action = login_action_url.rstrip("/")
+
+                # Match the actual rendered form action. Do not assume that
+                # /login is also the authentication POST endpoint.
+                if normalized_action and normalized_request == normalized_action:
+                    login_post_request = request
+                    try:
+                        post_data = request.post_data or ""
+                    except Exception:
+                        post_data = ""
+            except Exception:
+                return
+
+        def on_response(response: Any) -> None:
+            nonlocal login_post_response
+
+            try:
+                request = response.request
+                if (
+                    login_post_request is not None
+                    and request is login_post_request
+                ):
+                    login_post_response = response
+            except Exception:
+                return
+
+        def on_navigation(frame: Any) -> None:
+            try:
+                if frame == page.main_frame:
+                    current = str(frame.url)
+                    if current and (
+                        not navigation_urls or navigation_urls[-1] != current
+                    ):
+                        navigation_urls.append(current)
+            except Exception:
+                return
+
+        page.on("request", on_request)
+        page.on("response", on_response)
+        page.on("framenavigated", on_navigation)
+
         try:
-            page.goto(login_url, wait_until="domcontentloaded", timeout=timeout_ms)
-            html = page.content()
-            challenge = html_human_interaction_info(html)
+            page.goto(
+                login_url,
+                wait_until="domcontentloaded",
+                timeout=timeout_ms,
+            )
+            navigation_urls.append(page.url)
+
+            page_html = page.content()
+            before_cookies = context.cookies()
+            challenge = html_human_interaction_info(page_html)
+
+            # Synchronize normal mode with the debug baseline: discover the
+            # actual POST action from the rendered login form before the user
+            # can submit the form.
+            try:
+                browser_form = parse_login_form(page_html, page.url)
+                login_action_url = str(
+                    browser_form.get("action") or ""
+                ).strip()
+                login_method = str(
+                    browser_form.get("method") or "post"
+                ).upper()
+            except SessionError as exc:
+                raise SessionError(
+                    f"Browser: form login tidak dapat dianalisis: {exc}"
+                ) from exc
 
             password_locator = page.locator('input[type="password"]').first
             if password_locator.count() == 0:
-                raise SessionError("Browser: input password tidak ditemukan.")
+                raise SessionError(
+                    "Browser: input password tidak ditemukan."
+                )
 
             username_locator = None
             for selector in (
@@ -1225,10 +1638,31 @@ def browser_authentication(
                     break
 
             if username_locator is None:
-                raise SessionError("Browser: input username/email tidak ditemukan.")
+                raise SessionError(
+                    "Browser: input username/email tidak ditemukan."
+                )
 
             username_locator.fill(username)
             password_locator.fill(password)
+
+            print(f"[STEP] Login page      : {page.url}")
+            print(f"[STEP] Login method    : {login_method}")
+            print(
+                f"[STEP] Login POST URL  : "
+                f"{login_action_url or '-'}"
+            )
+            print(
+                f"[STEP] HTTP challenge  : "
+                f"{challenge.get('classification')}"
+            )
+
+            if challenge.get("markers"):
+                print(
+                    "[INFO] Challenge markers: "
+                    + ", ".join(
+                        str(x) for x in challenge["markers"]
+                    )
+                )
 
             if challenge.get("detected"):
                 print(
@@ -1236,67 +1670,390 @@ def browser_authentication(
                     "Selesaikan challenge/login pada browser yang dibuka."
                 )
                 print(
-                    f"[INFO] Browser akan menunggu maksimal {wait_seconds} detik."
+                    f"[INFO] Browser akan menunggu maksimal "
+                    f"{wait_seconds} detik."
                 )
             else:
-                # No challenge: submit automatically.
+                # Preserve the existing normal-mode behavior:
+                # if there is no human challenge, submit automatically.
                 submit = page.locator(
                     'button[type="submit"], input[type="submit"]'
                 ).first
+
                 if submit.count() > 0:
                     submit.click()
                 else:
                     password_locator.press("Enter")
 
+            # Baseline debug waits for the actual authentication POST.
             deadline = __import__("time").monotonic() + wait_seconds
-            selected: Optional[dict[str, Any]] = None
-            while __import__("time").monotonic() < deadline:
-                cookies = context.cookies()
+            while (
+                __import__("time").monotonic() < deadline
+                and login_post_request is None
+            ):
+                page.wait_for_timeout(250)
+
+            # Preserve a useful authenticated-cookie fallback if an
+            # application submits through an endpoint that Playwright cannot
+            # associate with the discovered form action. However, when the
+            # actual POST is captured, the captured POST remains authoritative.
+            if login_post_request is None:
+                after_timeout = context.cookies()
                 selected = session_cookie_from_cookies(
-                    cookies,
+                    after_timeout,
                     preferred_cookie_name,
                 )
-                if selected:
-                    break
-                page.wait_for_timeout(1000)
+                engine = authentication_outcome_engine(
+                    login_url=login_url,
+                    login_action_url=login_action_url,
+                    post_captured=False,
+                    post_status=None,
+                    location="",
+                    current_url=page.url,
+                    session_cookie_present=bool(selected),
+                    response_body=page.content(),
+                )
+                return {
+                    "success": False,
+                    "authentication_outcome": engine["outcome"],
+                    "mode": "browser",
+                    "human_interaction_required": bool(
+                        challenge.get("detected")
+                    ),
+                    "human_interaction": challenge,
+                    "post_captured": False,
+                    "login_method": login_method,
+                    "login_action_url": login_action_url,
+                    "login_status": None,
+                    "location": "",
+                    "post_login_url": page.url,
+                    "navigation_urls": navigation_urls,
+                    "url_after_login": page.url,
+                    "cookie_before": normalized_cookie_metadata(
+                        before_cookies
+                    ),
+                    "cookie_after": normalized_cookie_metadata(
+                        after_timeout
+                    ),
+                    "cookie_comparison": _debug_print_cookie_comparison(
+                        before_cookies,
+                        after_timeout,
+                        preferred_cookie_name,
+                    ),
+                    "reason": (
+                        "Browser login selesai/timeout tetapi POST login "
+                        "yang sesuai dengan form action tidak tertangkap."
+                    ),
+                    "cookies": normalized_cookie_metadata(after_timeout),
+                    "selected_cookie": (
+                        {**selected, "value": "[REDACTED]"}
+                        if selected
+                        else None
+                    ),
+                    "session_value": (
+                        str(selected.get("value") or "")
+                        if selected
+                        else ""
+                    ),
+                }
 
-            cookies = context.cookies()
+            # Wait briefly for the response/navigation associated with the
+            # captured authentication POST. The response may already be
+            # available immediately for 303/302 authentication flows.
+            response_deadline = __import__("time").monotonic() + min(
+                10,
+                max(2, int(browser_wait)),
+            )
+            while (
+                __import__("time").monotonic() < response_deadline
+                and login_post_response is None
+            ):
+                page.wait_for_timeout(100)
+
+            after_cookies = context.cookies()
+
             selected = session_cookie_from_cookies(
-                cookies,
+                after_cookies,
                 preferred_cookie_name,
             )
 
-            if not selected:
-                return {
-                    "success": False,
-                    "mode": "browser",
-                    "human_interaction_required": bool(challenge.get("detected")),
-                    "human_interaction": challenge,
-                    "reason": (
-                        "Browser login selesai/timeout tetapi session cookie "
-                        "tidak ditemukan."
-                    ),
-                    "url_after_login": page.url,
-                    "cookies": normalized_cookie_metadata(cookies),
-                }
+            comparison = _debug_print_cookie_comparison(
+                before_cookies,
+                after_cookies,
+                preferred_cookie_name,
+            )
+
+            login_status: Optional[int] = None
+            location = ""
+            if login_post_response is not None:
+                try:
+                    login_status = int(login_post_response.status)
+                except Exception:
+                    login_status = None
+
+                try:
+                    location = str(
+                        login_post_response.headers.get("location") or ""
+                    )
+                except Exception:
+                    location = ""
+
+            response_body = ""
+            try:
+                response_body = page.content()
+            except Exception:
+                response_body = ""
+
+            engine = authentication_outcome_engine(
+                login_url=login_url,
+                login_action_url=login_action_url,
+                post_captured=login_post_request is not None,
+                post_status=login_status,
+                location=location,
+                current_url=page.url,
+                session_cookie_present=bool(selected),
+                response_body=response_body,
+            )
+
+            authenticated_indication = bool(engine["success"])
+            preferred_changed = bool(comparison.get("preferred_changed"))
+            potential_session_hijacking = bool(
+                authenticated_indication
+                and preferred_cookie_name
+                and not preferred_changed
+                and comparison.get("preferred_before") is not None
+                and comparison.get("preferred_after") is not None
+            )
+
+            if login_post_request is not None:
+                print()
+                print("=" * 72)
+                print(" LOGIN POST REQUEST")
+                print("=" * 72)
+                print(f"Method       : {login_post_request.method}")
+                print(f"URL          : {login_post_request.url}")
+
+                request_headers: dict[str, str] = {}
+                try:
+                    for key, value in (
+                        login_post_request.all_headers().items()
+                    ):
+                        lower = key.lower()
+                        if lower in {
+                            "cookie",
+                            "authorization",
+                            "proxy-authorization",
+                        }:
+                            request_headers[key] = "[REDACTED]"
+                        else:
+                            request_headers[key] = str(value)
+                except Exception:
+                    request_headers = {}
+
+                if request_headers:
+                    print("Headers:")
+                    for key, value in sorted(request_headers.items()):
+                        print(f"  {key}: {value}")
+
+                print("POST fields:")
+                safe_fields = _debug_safe_post_fields(post_data)
+                if safe_fields:
+                    for field in safe_fields:
+                        print(
+                            f"  {field['name']} = "
+                            f"{field['value']}"
+                        )
+                else:
+                    print(
+                        "  [body tidak dapat diparse "
+                        "sebagai form-urlencoded]"
+                    )
+
+            print()
+            print("=" * 72)
+            print(" LOGIN POST RESPONSE")
+            print("=" * 72)
+
+            if login_post_response is not None:
+                print(f"Status       : {login_status}")
+                print(
+                    f"Location     : "
+                    f"{location or '-'}"
+                )
+            else:
+                print("Status       : [NOT CAPTURED]")
+                print("Location     : -")
+
+            print()
+            print("=" * 72)
+            print(" NAVIGATION")
+            print("=" * 72)
+            if navigation_urls:
+                for item in navigation_urls:
+                    print(f"  {item}")
+            else:
+                print("  [none]")
+
+            # Do not print cookie values in normal mode. The comparison helper
+            # intentionally prints names/status only; its returned before/after
+            # records contain raw values, so they must never be persisted.
+            print()
+            print("=" * 72)
+            print(" COOKIE / SESSION COMPARISON")
+            print("=" * 72)
+            print(f"Cookies sebelum : {len(before_cookies)}")
+            print(f"Cookies sesudah : {len(after_cookies)}")
+            print(
+                "Cookie baru     : "
+                + (
+                    ", ".join(comparison.get("added") or [])
+                    or "-"
+                )
+            )
+            print(
+                "Cookie hilang   : "
+                + (
+                    ", ".join(comparison.get("removed") or [])
+                    or "-"
+                )
+            )
+            print(
+                "Cookie berubah  : "
+                + (
+                    ", ".join(comparison.get("changed") or [])
+                    or "-"
+                )
+            )
+            print(
+                "Cookie tetap    : "
+                + (
+                    ", ".join(comparison.get("unchanged") or [])
+                    or "-"
+                )
+            )
+
+            if preferred_cookie_name:
+                print()
+                print(
+                    f"Preferred cookie: "
+                    f"{preferred_cookie_name}"
+                )
+                print(
+                    "Status          : "
+                    + (
+                        "BERUBAH/DITERBITKAN ULANG"
+                        if preferred_changed
+                        else "TIDAK BERUBAH"
+                    )
+                )
+
+            print()
+            print("BROWSER LOGIN ASSESSMENT")
+            print(
+                f"POST captured          : "
+                f"{'YES' if login_post_request is not None else 'NO'}"
+            )
+            print(
+                f"POST response          : "
+                f"{login_status if login_status is not None else '-'}"
+            )
+            print(
+                f"Redirect/navigation    : "
+                f"{'YES' if len(navigation_urls) > 1 else 'NO'}"
+            )
+            print(
+                f"Preferred cookie change: "
+                f"{'YES' if preferred_changed else 'NO'}"
+            )
+            print(
+                f"Authentication outcome : {engine['outcome']}"
+            )
+            print(
+                f"Post-login verification: "
+                f"{'PASS' if engine['success'] else 'REVIEW/FAIL'}"
+            )
+            if engine.get("authenticated_state_signals"):
+                print(
+                    "Authenticated signals : "
+                    + ", ".join(engine["authenticated_state_signals"])
+                )
+            if engine.get("failure_markers"):
+                print(
+                    "Failure indicators    : "
+                    + ", ".join(engine["failure_markers"])
+                )
+
+
+            if potential_session_hijacking:
+                print(
+                    "Potential session hijacking: "
+                    "REVIEW - session identifier tidak berubah "
+                    "setelah login"
+                )
+                print(
+                    "[REVIEW] Session/cookie yang sama sebelum dan "
+                    "sesudah authentication berpotensi dapat direplay "
+                    "jika diperoleh pihak lain. Lakukan controlled "
+                    "session-replay test untuk mengonfirmasi; ini "
+                    "BUKAN finding otomatis."
+                )
 
             return {
-                "success": True,
+                "success": authenticated_indication,
+                "authentication_outcome": engine["outcome"],
                 "mode": "browser",
-                "human_interaction_required": bool(challenge.get("detected")),
+                "human_interaction_required": bool(
+                    challenge.get("detected")
+                ),
                 "human_interaction": challenge,
-                "reason": "Authenticated session cookie captured from browser context.",
+                "post_captured": login_post_request is not None,
+                "login_method": login_method,
+                "login_action_url": login_action_url,
+                "login_status": login_status,
+                "location": location,
+                "post_login_url": (
+                    urljoin(login_action_url or login_url, location)
+                    if location
+                    else str(page.url or "")
+                ),
+                "navigation_urls": navigation_urls,
                 "url_after_login": page.url,
-                "cookies": normalized_cookie_metadata(cookies),
-                "selected_cookie": {
-                    **selected,
-                    "value": "[REDACTED]",
-                },
-                "session_value": str(selected.get("value") or ""),
+                "cookie_before": normalized_cookie_metadata(
+                    before_cookies
+                ),
+                "cookie_after": normalized_cookie_metadata(
+                    after_cookies
+                ),
+                "cookie_comparison": comparison,
+                "preferred_cookie_changed": preferred_changed,
+                "potential_session_hijacking": potential_session_hijacking,
+                "authentication_engine": engine,
+                "requires_review": bool(engine.get("requires_review")),
+                "reason": (
+                    "Authorized browser login completed and authenticated "
+                    "state verified."
+                    if authenticated_indication
+                    else (
+                        "Authentication outcome "
+                        + str(engine.get("outcome"))
+                        + ": "
+                        + "; ".join(engine.get("reasons") or [])
+                    )
+                ),
+                "cookies": normalized_cookie_metadata(after_cookies),
+                "selected_cookie": (
+                    {**selected, "value": "[REDACTED]"}
+                    if selected
+                    else None
+                ),
+                "session_value": (
+                    str(selected.get("value") or "")
+                    if selected
+                    else ""
+                ),
             }
         finally:
             browser.close()
-
 
 def _debug_cookie_key(cookie: dict[str, Any]) -> tuple[str, str, str]:
     return (
@@ -1777,26 +2534,30 @@ def debug_login_browser(
                 else ""
             )
 
-            current_path = urlparse(page.url).path.lower()
-            login_path = urlparse(login_url).path.lower()
+            debug_body = ""
+            try:
+                debug_body = page.content()
+            except Exception:
+                debug_body = ""
 
-            redirect_away_from_login = bool(
-                current_path and current_path != login_path
+            debug_engine = authentication_outcome_engine(
+                login_url=login_url,
+                login_action_url=login_action_url,
+                post_captured=login_post_response is not None,
+                post_status=post_status,
+                location=location,
+                current_url=page.url,
+                session_cookie_present=bool(
+                    session_cookie_from_cookies(
+                        after_cookies,
+                        preferred_cookie_name,
+                    )
+                ),
+                response_body=debug_body,
             )
-            response_not_auth_error = post_status not in {
-                401,
-                403,
-                429,
-            } if post_status is not None else False
-
-            apparent_success = bool(
-                login_post_response is not None
-                and response_not_auth_error
-                and (
-                    redirect_away_from_login
-                    or bool(location)
-                    or bool(comparison["preferred_changed"])
-                )
+            apparent_success = bool(debug_engine["success"])
+            redirect_away_from_login = bool(
+                debug_engine["redirect_away_from_login"]
             )
 
             # A session identifier that remains identical across the
@@ -1830,9 +2591,18 @@ def debug_login_browser(
                 )
             )
             print(
-                "Apparent login success : "
-                + ("YES" if apparent_success else "NO/UNCONFIRMED")
+                "Authentication outcome : "
+                + str(debug_engine["outcome"])
             )
+            print(
+                "Post-login verification: "
+                + ("PASS" if debug_engine["success"] else "FAIL/REVIEW")
+            )
+            if debug_engine.get("failure_markers"):
+                print(
+                    "Failure indicators      : "
+                    + ", ".join(debug_engine["failure_markers"])
+                )
             print(
                 "Potential session hijacking: "
                 + (
@@ -1854,8 +2624,8 @@ def debug_login_browser(
                 "oleh aplikasi; bukan asumsi endpoint /login."
             )
             print(
-                "[INFO] 'Apparent login success' adalah indikasi debug, "
-                "bukan finding dan bukan bukti final authenticated state."
+                "[INFO] Authentication outcome berasal dari outcome engine "
+                "multi-signal; mode debug tidak membuat session record."
             )
             print(
                 "[INFO] Tidak ada session yang disimpan ke session.yaml "
@@ -1864,11 +2634,15 @@ def debug_login_browser(
 
             return {
                 "success": apparent_success,
+                "authentication_outcome": debug_engine["outcome"],
                 "mode": "debug-browser",
                 "debug_only": True,
                 "post_captured": True,
                 "potential_session_hijacking": potential_session_hijacking,
-                "requires_review": potential_session_hijacking,
+                "requires_review": bool(
+                    potential_session_hijacking or debug_engine.get("requires_review")
+                ),
+                "authentication_engine": debug_engine,
                 "human_interaction_required": bool(challenge.get("detected")),
                 "human_interaction": challenge,
                 "login_post": {
@@ -1889,11 +2663,15 @@ def debug_login_browser(
                 "cookie_after": after_cookies,
                 "cookie_comparison": comparison,
                 "reason": (
-                    "POST login tertangkap dan terdapat indikasi "
-                    "redirect/cookie change."
+                    "Authentication outcome SUCCESS dan post-login state "
+                    "terverifikasi."
                     if apparent_success
-                    else "POST login tertangkap tetapi authenticated state "
-                    "belum dapat dikonfirmasi."
+                    else (
+                        "Authentication outcome "
+                        + str(debug_engine.get("outcome"))
+                        + ": "
+                        + "; ".join(debug_engine.get("reasons") or [])
+                    )
                 ),
             }
         finally:
@@ -1923,7 +2701,10 @@ def capture_authorized_session(
     )
 
     if result.get("success"):
-        print("[PASS] Login otomatis berhasil melalui HTTP.")
+        print(
+            "[PASS] Login otomatis berhasil; "
+            "authentication outcome = SUCCESS."
+        )
         return result
 
     if result.get("human_interaction_required"):
@@ -1977,8 +2758,8 @@ def cmd_version(_: argparse.Namespace) -> int:
     print(f"Checklist: {CHECKLIST_ID} {CHECKLIST_NAME}")
     print(f"Schema   : {SCHEMA_VERSION}")
     print(
-        "Method   : authorized session + cookie/security attribute + "
-        "bounded reuse/invalidation assessment"
+        "Method   : authentication outcome engine + authorized session + "
+        "cookie/security attribute + bounded reuse/invalidation assessment"
     )
     print(
         "Storage  : encrypted session value using project Fernet key"
@@ -2313,20 +3094,37 @@ def cmd_add(args: argparse.Namespace) -> int:
     if not result.get("success"):
         data["source_status"]["account"] = "completed"
         data["checklist"]["status"] = "completed"
+        outcome = str(
+            result.get("authentication_outcome")
+            or (result.get("authentication_engine") or {}).get("outcome")
+            or AUTH_OUTCOME_UNCONFIRMED
+        )
+        requires_review = outcome == AUTH_OUTCOME_UNCONFIRMED
         data["assessment"] = {
-            "result": "not-tested",
+            "result": "review" if requires_review else "not-tested",
             "finding": False,
-            "requires_review": False,
+            "requires_review": requires_review,
             "note": (
-                "Authenticated session tidak berhasil diperoleh. "
+                f"Authentication outcome: {outcome}. "
+                "Authenticated session tidak disimpan. "
                 "Ini bukan bukti authentication/session vulnerability."
             ),
         }
+        data["summary"]["requires_review"] = requires_review
+        data["summary"]["finding"] = False
         save_artifact(data)
 
         print("[WARN] Authenticated session belum berhasil diperoleh.")
+        print(
+            "Authentication outcome : "
+            + str(
+                result.get("authentication_outcome")
+                or (result.get("authentication_engine") or {}).get("outcome")
+                or AUTH_OUTCOME_UNCONFIRMED
+            )
+        )
         print(f"[INFO] Reason   : {result.get('reason', '-')}")
-        print("[PASS] Checklist tetap dapat diverifikasi sebagai not-tested.")
+        print("[INFO] Session record tidak dibuat.")
         print(f"FILE       : {session_file()}")
         return 0
 
@@ -2377,7 +3175,19 @@ def cmd_add(args: argparse.Namespace) -> int:
             "hostname": hostname,
             "url": base_url,
         },
-        "authentication": auth,
+        "authentication": {
+            **auth,
+            "outcome": str(
+                result.get("authentication_outcome")
+                or (result.get("authentication_engine") or {}).get("outcome")
+                or AUTH_OUTCOME_SUCCESS
+            ),
+            "post_login_url": str(
+                result.get("post_login_url")
+                or result.get("url_after_login")
+                or ""
+            ),
+        },
         "source": {
             "method": (
                 "authorized-browser"
@@ -2403,15 +3213,31 @@ def cmd_add(args: argparse.Namespace) -> int:
     data["source_status"]["account"] = "completed"
     data["source_status"]["encryption_key"] = "completed"
     data["checklist"]["status"] = "completed"
+    potential_session_hijacking = bool(
+        result.get("potential_session_hijacking")
+    )
+    requires_review = bool(
+        result.get("requires_review")
+        or potential_session_hijacking
+    )
+
     data["assessment"] = {
-        "result": "pass",
+        "result": "review" if requires_review else "pass",
         "finding": False,
-        "requires_review": False,
+        "requires_review": requires_review,
         "note": (
             "Authorized authenticated session captured successfully. "
             "Session value is encrypted at rest."
+            + (
+                " Session identifier tidak berubah setelah authentication; "
+                "controlled session-replay diperlukan untuk konfirmasi."
+                if potential_session_hijacking
+                else ""
+            )
         ),
     }
+    data["summary"]["requires_review"] = requires_review
+    data["summary"]["finding"] = False
     data["summary"]["sessions_selected"] = len(records)
     save_artifact(data)
 
