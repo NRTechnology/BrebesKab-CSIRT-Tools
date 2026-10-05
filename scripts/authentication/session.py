@@ -66,7 +66,7 @@ except ImportError:
     sys.exit(1)
 
 
-SCRIPT_VERSION = "1.1.4"
+SCRIPT_VERSION = "1.1.5"
 SCHEMA_VERSION = "1.0"
 CHECKLIST_ID = "5-002"
 CHECKLIST_NAME = "Session Management"
@@ -1448,7 +1448,10 @@ def _debug_print_cookie_comparison(
         "removed": removed,
         "changed": sorted(set(changed)),
         "unchanged": sorted(set(unchanged)),
+        "preferred_name": preferred_name,
         "preferred_changed": preferred_changed,
+        "preferred_before": preferred_before,
+        "preferred_after": preferred_after,
     }
 
 
