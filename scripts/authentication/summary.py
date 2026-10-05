@@ -42,7 +42,7 @@ except ImportError:
     sys.exit(1)
 
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 SCHEMA_VERSION = "1.0"
 CHECKLIST_ID = "5-008"
 CHECKLIST_NAME = "Authentication Summary"
@@ -588,6 +588,10 @@ def build_initial_document(
                 "karena aplikasi tidak memiliki MFA."
             ),
             (
+                "Counts skipped dan not_applicable bersifat mutually exclusive; "
+                "not_applicable tidak dihitung sebagai skipped."
+            ),
+            (
                 "Raw evidence tidak diubah; report redaction "
                 "dilakukan pada report-generation layer."
             ),
@@ -851,10 +855,11 @@ def aggregate(
             if selected_status == "deferred":
                 counts["deferred"] += 1
                 assessment_state = "deferred"
-            elif selected_status in {"skipped", "not_applicable"}:
+            elif selected_status == "skipped":
                 counts["skipped"] += 1
-                if selected_status == "not_applicable":
-                    counts["not_applicable"] += 1
+                assessment_state = "skipped"
+            elif selected_status == "not_applicable":
+                counts["not_applicable"] += 1
                 assessment_state = "not_applicable"
             else:
                 counts["incomplete"] += 1
@@ -968,8 +973,10 @@ def aggregate(
 
             if actual_status == "deferred":
                 counts["deferred"] += 1
-            else:
+            elif actual_status == "skipped":
                 counts["skipped"] += 1
+            elif actual_status in {"not_applicable", "not-applicable"}:
+                counts["not_applicable"] += 1
         else:
             source_status[
                 item["id"]
