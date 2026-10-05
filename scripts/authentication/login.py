@@ -60,7 +60,7 @@ except ImportError:  # pragma: no cover
     PlaywrightTimeoutError = Exception
 
 
-SCRIPT_VERSION = "1.0.4"
+SCRIPT_VERSION = "1.0.5"
 SCHEMA_VERSION = "1.0"
 CHECKLIST_ID = "5-001"
 CHECKLIST_NAME = "Authentication Login"
@@ -144,10 +144,13 @@ def runtime_context(repo_root: Path) -> dict[str, Any]:
 
     project_id = str(data.get("project_id") or data.get("id") or "").strip()
     raw_path = str(data.get("project_path") or "").strip()
+    assessment_type = str(data.get("assessment_type") or "").strip()
     if not project_id:
         raise LoginError("project_id tidak ditemukan pada active-project.yaml.")
     if not raw_path:
         raise LoginError("project_path tidak ditemukan pada active-project.yaml.")
+    if not assessment_type:
+        raise LoginError("assessment_type tidak ditemukan pada active-project.yaml.")
 
     project_path = Path(raw_path)
     if not project_path.is_absolute():
@@ -177,6 +180,7 @@ def runtime_context(repo_root: Path) -> dict[str, Any]:
     return {
         "project_id": project_id,
         "project_path": project_path,
+        "assessment_type": assessment_type,
         "active_context": active,
         "assessment": assessment,
         "assessment_data": assessment_data,
@@ -1021,7 +1025,7 @@ def initial_artifact(context: dict[str, Any], target: dict[str, Any]) -> dict[st
             "hostname": target["hostname"],
             "url": target["url"],
             "environment": "Production",
-            "assessment_type": "Grey Box",
+            "assessment_type": context["assessment_type"],
             "scope_id": target["scope_id"],
             "scope_reference": "01-preparation/scope/scope.yaml",
             "authorized_ports": target["authorized_ports"],
@@ -1427,6 +1431,7 @@ def cmd_analyze(account_id_value: str | None, failed_attempts: int, timeout: int
         artifact["cve_correlation"] = correlate_cves(project)
         artifact["target"]["url"] = target["url"]
         artifact["target"]["hostname"] = target["hostname"]
+        artifact["target"]["assessment_type"] = context["assessment_type"]
         artifact["target"]["login_path"] = DEFAULT_LOGIN_PATH
         artifact["source_status"] = {
             "scope": "completed",
@@ -1577,6 +1582,7 @@ def cmd_analyze(account_id_value: str | None, failed_attempts: int, timeout: int
     artifact["cve_correlation"] = correlate_cves(project)
     artifact["target"]["url"] = target["url"]
     artifact["target"]["hostname"] = target["hostname"]
+    artifact["target"]["assessment_type"] = context["assessment_type"]
     artifact["target"]["login_path"] = DEFAULT_LOGIN_PATH
     artifact["source_status"] = {
         "scope": "completed",
