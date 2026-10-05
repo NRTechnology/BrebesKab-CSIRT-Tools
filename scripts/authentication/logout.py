@@ -61,7 +61,7 @@ except ImportError:
     raise SystemExit(1)
 
 
-SCRIPT_VERSION = "1.0.2"
+SCRIPT_VERSION = "1.0.4"
 SCHEMA_VERSION = "1.0"
 CHECKLIST_ID = "5-003"
 CHECKLIST_NAME = "Logout / Session Invalidation"
@@ -374,6 +374,120 @@ def empty_artifact() -> dict[str, Any]:
 
 def load_artifact() -> dict[str, Any]:
     return load_yaml(logout_file())
+
+
+def ensure_artifact_metadata(
+    data: dict[str, Any],
+    *,
+    persist: bool = False,
+) -> tuple[dict[str, Any], bool]:
+    """
+    Ensure metadata and security-policy fields introduced by the link_action authentication-state strategy
+    exists on artifacts created by older logout.py versions.
+
+    This is a metadata/schema migration only. It never changes assessment
+    results, session evidence, probe results, or CVE data.
+
+    Returns:
+        (data, changed)
+    """
+    changed = False
+
+    methodology = data.setdefault("methodology", {})
+    if not isinstance(methodology, dict):
+        raise LogoutError("methodology pada logout.yaml harus berupa mapping.")
+
+    if methodology.get("authentication_state_strategy") != "link_action":
+        methodology["authentication_state_strategy"] = "link_action"
+        changed = True
+
+    rules = {
+        "authenticated": "logout link/action present and login link/action absent",
+        "unauthenticated": "login link/action present and logout link/action absent",
+        "ambiguous": "login and logout link/action both present",
+        "unconfirmed": "neither login nor logout link/action present",
+    }
+    if methodology.get("authentication_state_rules") != rules:
+        methodology["authentication_state_rules"] = rules
+        changed = True
+
+    probe = data.setdefault("probe", {})
+    if not isinstance(probe, dict):
+        raise LogoutError("probe pada logout.yaml harus berupa mapping.")
+
+    if probe.get("authentication_state_strategy") != "link_action":
+        probe["authentication_state_strategy"] = "link_action"
+        changed = True
+
+    if probe.get("authentication_state_strategy_version") != "1.0":
+        probe["authentication_state_strategy_version"] = "1.0"
+        changed = True
+
+    # Keep the canonical tool metadata synchronized with this script version.
+    tool = data.setdefault("tool", {})
+    if not isinstance(tool, dict):
+        raise LogoutError("tool pada logout.yaml harus berupa mapping.")
+
+    if tool.get("script") != "logout.py":
+        raise LogoutError("tool.script harus logout.py.")
+
+    if tool.get("version") != SCRIPT_VERSION:
+        tool["version"] = SCRIPT_VERSION
+        changed = True
+
+    # Migrate legacy toolchain metadata without changing assessment results.
+    toolchain = data.setdefault("toolchain", {})
+    if not isinstance(toolchain, dict):
+        raise LogoutError("toolchain pada logout.yaml harus berupa mapping.")
+
+    mandatory = toolchain.setdefault("mandatory", [])
+    if not isinstance(mandatory, list):
+        raise LogoutError("toolchain.mandatory pada logout.yaml harus berupa list.")
+
+    # Older artifacts used preparation.context. The canonical project context
+    # module is scripts.context. Keep the migration metadata-only.
+    if "preparation.context" in mandatory:
+        mandatory[:] = [
+            "scripts.context" if item == "preparation.context" else item
+            for item in mandatory
+        ]
+        changed = True
+
+    if "scripts.context" not in mandatory:
+        mandatory.append("scripts.context")
+        changed = True
+
+    if "scripts.secrets" not in mandatory:
+        mandatory.append("scripts.secrets")
+        changed = True
+
+    # Migrate legacy post_logout_reuse records so the artifact explicitly
+    # records that plaintext session material was neither logged nor persisted.
+    # This is metadata/policy normalization only; it never changes the
+    # authentication result, HTTP evidence, or assessment outcome.
+    results = data.setdefault("results", {})
+    if not isinstance(results, dict):
+        raise LogoutError("results pada logout.yaml harus berupa mapping.")
+
+    post_logout_reuse = results.setdefault("post_logout_reuse", [])
+    if not isinstance(post_logout_reuse, list):
+        raise LogoutError("results.post_logout_reuse pada logout.yaml harus berupa list.")
+
+    for item in post_logout_reuse:
+        if not isinstance(item, dict):
+            raise LogoutError("Setiap results.post_logout_reuse harus berupa mapping.")
+        if item.get("session_value_logged") is not False:
+            item["session_value_logged"] = False
+            changed = True
+        if item.get("plaintext_session_persisted") is not False:
+            item["plaintext_session_persisted"] = False
+            changed = True
+
+    if persist and changed:
+        data["updated_at"] = utc_now()
+        save_yaml(logout_file(), data)
+
+    return data, changed
 
 
 def ensure_project_match(data: dict[str, Any]) -> ProjectContext:
@@ -804,6 +918,8 @@ def test_old_session_reuse(
             "result": "ERROR",
             "reason": f"Post-logout old-session request gagal: {exc}",
             "authenticated": False,
+            "session_value_logged": False,
+            "plaintext_session_persisted": False,
         }
 
     if state["authenticated"]:
@@ -814,6 +930,8 @@ def test_old_session_reuse(
                 "evidence: Logout link/action ditemukan tanpa Login link/action."
             ),
             **state,
+            "session_value_logged": False,
+            "plaintext_session_persisted": False,
         }
 
     if (
@@ -828,6 +946,8 @@ def test_old_session_reuse(
                 "state; Login link/action ditemukan atau akses ditolak."
             ),
             **state,
+            "session_value_logged": False,
+            "plaintext_session_persisted": False,
         }
 
     return {
@@ -837,6 +957,8 @@ def test_old_session_reuse(
             "cukup untuk memastikan authenticated state."
         ),
         **state,
+        "session_value_logged": False,
+        "plaintext_session_persisted": False,
     }
 
 
@@ -847,6 +969,7 @@ def cmd_version(_: argparse.Namespace) -> int:
     print("Method   : authorized logout + link/action auth-state detection + bounded old-session reuse")
     print("Storage  : logout.yaml + logout-probes.json; session value never persisted plaintext")
     print("Client   : requests.Session; one bounded logout and one old-session validation")
+    print("Schema   : backward-compatible metadata migration for older logout.yaml artifacts")
     print("CVE      : secondary correlation only; version match != vulnerability")
     return 0
 
@@ -881,6 +1004,9 @@ def cmd_show(_: argparse.Namespace) -> int:
 def cmd_run(args: argparse.Namespace) -> int:
     data = load_artifact()
     ensure_project_match(data)
+    data, migrated = ensure_artifact_metadata(data, persist=True)
+    if migrated:
+        print("[INFO] Metadata artifact logout dimigrasikan ke schema metadata v1.0.4 tanpa mengubah evidence/assessment.")
     session_data = load_session_artifact()
     record = find_session(session_data, args.session_id)
     validate_session_record(record)
@@ -1081,6 +1207,14 @@ def cmd_run(args: argparse.Namespace) -> int:
 def cmd_verify(_: argparse.Namespace) -> int:
     data = load_artifact()
     ensure_project_match(data)
+
+    # Backward-compatible metadata repair for artifacts generated by v1.0.2
+    # or earlier. Only canonical metadata fields are added/updated; assessment
+    # results and raw evidence remain untouched.
+    data, migrated = ensure_artifact_metadata(data, persist=True)
+    if migrated:
+        print("[INFO] Metadata artifact lama diperbarui untuk verify; evidence dan hasil assessment tidak diubah.")
+
     if data.get("schema_version") != SCHEMA_VERSION:
         raise LogoutError("schema_version tidak sesuai.")
     tool = data.get("tool") or {}
