@@ -20,6 +20,8 @@ Security model:
     - Only explicitly authorized test accounts/sessions are supported.
     - No session brute force, hijacking of third-party sessions, CAPTCHA/
       Turnstile bypass, or mass session testing is performed.
+    - Session replay is limited to an explicitly authorized SUCCESS session
+      and one bounded GET request to an in-scope protected URL.
 
 Typical workflow:
     python scripts/authentication/session.py version
@@ -29,6 +31,8 @@ Typical workflow:
     python scripts/authentication/session.py list
     python scripts/authentication/session.py show S-001
     python scripts/authentication/session.py analyze --session-id S-001 --url /dashboard
+    python scripts/authentication/session.py replay --session-id S-006
+    python scripts/authentication/session.py replay --session-id S-006 --url /webapp
     python scripts/authentication/session.py verify
 
 The "add" command obtains an authorized authenticated session automatically
@@ -66,7 +70,7 @@ except ImportError:
     sys.exit(1)
 
 
-SCRIPT_VERSION = "1.1.8"
+SCRIPT_VERSION = "1.1.9"
 SCHEMA_VERSION = "1.0"
 CHECKLIST_ID = "5-002"
 CHECKLIST_NAME = "Session Management"
@@ -278,6 +282,7 @@ def canonical_empty_artifact(context: ProjectContext) -> dict[str, Any]:
             "captcha_turnstile_bypass": False,
             "mass_session_testing": False,
             "redirect_following": False,
+            "controlled_session_replay": True,
             "authentication_outcome_engine": True,
             "authentication_outcomes": [
                 "SUCCESS",
@@ -336,6 +341,7 @@ def canonical_empty_artifact(context: ProjectContext) -> dict[str, Any]:
             "rotation": [],
             "reuse": [],
             "invalidation": [],
+            "replay": [],
         },
         "summary": {
             "sessions_selected": 0,
@@ -343,6 +349,7 @@ def canonical_empty_artifact(context: ProjectContext) -> dict[str, Any]:
             "rotation_tested": 0,
             "reuse_tested": 0,
             "invalidation_tested": 0,
+            "replay_tested": 0,
             "authenticated_access_observed": 0,
             "authentication_attempted": False,
             "authentication_mode": "not-tested",
@@ -386,6 +393,7 @@ def canonical_empty_artifact(context: ProjectContext) -> dict[str, Any]:
             "Missing/invalid test credentials do not make canonical verify fail; "
             "the authentication assessment remains not-tested.",
             "Session brute force and third-party session hijacking are not performed.",
+            "Session replay is limited to an explicitly authorized SUCCESS session and a bounded GET request.",
             "Raw evidence is retained; report-layer redaction remains separate.",
         ],
         "generated_at": utc_now(),
@@ -2759,7 +2767,7 @@ def cmd_version(_: argparse.Namespace) -> int:
     print(f"Schema   : {SCHEMA_VERSION}")
     print(
         "Method   : authentication outcome engine + authorized session + "
-        "cookie/security attribute + bounded reuse/invalidation assessment"
+        "cookie/security attribute + bounded reuse/invalidation/replay assessment"
     )
     print(
         "Storage  : encrypted session value using project Fernet key"
@@ -2809,6 +2817,13 @@ def cmd_init(_: argparse.Namespace) -> int:
         summary.setdefault("authentication_mode", "not-tested")
         summary.setdefault("human_interaction_required", False)
         summary.setdefault("valid_credentials_available", None)
+        summary.setdefault("replay_tested", 0)
+
+        results = data.setdefault("results", {})
+        results.setdefault("replay", [])
+
+        methodology = data.setdefault("methodology", {})
+        methodology.setdefault("controlled_session_replay", True)
 
         save_artifact(data)
 
@@ -3419,6 +3434,474 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     return 0
 
 
+
+# ---------------------------------------------------------------------------
+# Controlled session replay verification
+# ---------------------------------------------------------------------------
+
+REPLAY_RESULT_CONFIRMED = "CONFIRMED"
+REPLAY_RESULT_REJECTED = "REJECTED"
+REPLAY_RESULT_REVIEW = "REVIEW"
+REPLAY_RESULT_ERROR = "ERROR"
+
+REPLAY_LOGIN_PATHS = {"/login", "/loginuser", "/signin", "/sign-in"}
+REPLAY_AUTHENTICATED_MARKERS = (
+    "logout",
+    "log out",
+    "sign out",
+    "signout",
+    "dashboard",
+    "my account",
+    "profile",
+    "welcome",
+)
+REPLAY_FAILURE_MARKERS = (
+    "invalid username",
+    "invalid password",
+    "invalid credentials",
+    "login failed",
+    "login gagal",
+    "unauthorized",
+    "please login",
+    "please log in",
+)
+
+
+def replay_authenticated_state(
+    *,
+    response: requests.Response,
+    target_url: str,
+) -> dict[str, Any]:
+    """Classify whether a replay response demonstrates authenticated state.
+
+    HTTP 200 alone is never considered sufficient evidence. A redirect to a
+    login endpoint or a visible login form rejects the replay. A non-login
+    response containing authenticated-state markers is confirmed. Ambiguous
+    responses remain REVIEW.
+    """
+    body = response.text[:DEFAULT_MAX_BODY_BYTES]
+    normalized_body = re.sub(r"\s+", " ", body.lower())
+
+    final_url = str(response.url or target_url)
+    location = str(response.headers.get("Location") or "")
+    resolved_location = urljoin(final_url, location) if location else ""
+    destination = resolved_location or final_url
+    destination_path = _normalized_path(destination)
+
+    login_redirect = (
+        destination_path in REPLAY_LOGIN_PATHS
+        or any(
+            destination_path.startswith(path.rstrip("/") + "/")
+            for path in REPLAY_LOGIN_PATHS
+        )
+    )
+
+    login_form_present = _body_has_login_form(body)
+    failure_markers = [
+        marker
+        for marker in REPLAY_FAILURE_MARKERS
+        if marker in normalized_body
+    ]
+    authenticated_markers = [
+        marker
+        for marker in REPLAY_AUTHENTICATED_MARKERS
+        if marker in normalized_body
+    ]
+
+    if login_redirect or login_form_present or failure_markers:
+        result = REPLAY_RESULT_REJECTED
+        reason = (
+            "Replay ditolak: response kembali ke login endpoint, "
+            "menampilkan login form, atau memiliki failure indicator."
+        )
+    elif response.status_code in {401, 403}:
+        result = REPLAY_RESULT_REJECTED
+        reason = (
+            f"Replay ditolak oleh HTTP {response.status_code}; "
+            "authenticated access tidak diberikan."
+        )
+    elif response.status_code >= 500:
+        result = REPLAY_RESULT_ERROR
+        reason = (
+            f"Replay menghasilkan HTTP {response.status_code}; "
+            "hasil security assessment tidak dapat ditentukan."
+        )
+    elif response.status_code < 400 and authenticated_markers:
+        result = REPLAY_RESULT_CONFIRMED
+        reason = (
+            "Replay response tidak kembali ke login dan mengandung "
+            "authenticated-state marker."
+        )
+    else:
+        result = REPLAY_RESULT_REVIEW
+        reason = (
+            "Replay response tidak menunjukkan login rejection, tetapi "
+            "belum memberikan authenticated-state evidence yang cukup."
+        )
+
+    return {
+        "result": result,
+        "reason": reason,
+        "status_code": response.status_code,
+        "url": final_url,
+        "location": location,
+        "destination_url": destination,
+        "destination_path": destination_path,
+        "login_redirect": login_redirect,
+        "login_form_present": login_form_present,
+        "failure_markers": failure_markers,
+        "authenticated_state_markers": authenticated_markers,
+        "body_info": response_body_info(response),
+        "headers": safe_headers(response),
+    }
+
+
+def replay_target_from_session(
+    record: dict[str, Any],
+    explicit_url: str,
+) -> str:
+    """Resolve replay target from --url or successful authentication metadata."""
+    if explicit_url:
+        return validate_target_url(explicit_url)
+
+    auth = record.get("authentication") or {}
+    post_login_url = str(auth.get("post_login_url") or "").strip()
+    if not post_login_url:
+        raise SessionError(
+            "Session tidak memiliki authentication.post_login_url. "
+            "Gunakan --url untuk menentukan protected endpoint."
+        )
+
+    return validate_target_url(post_login_url)
+
+
+def load_replay_evidence() -> dict[str, Any]:
+    path = evidence_file()
+    if not path.exists():
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "project_id": active_context().project_id,
+            "checklist": CHECKLIST_ID,
+            "generated_at": utc_now(),
+            "session_replay": [],
+            "errors": [],
+        }
+
+    try:
+        raw = path.read_bytes()
+        if raw.startswith(b"\xef\xbb\xbf"):
+            raise SessionError(
+                "session-probes.json menggunakan UTF-8 BOM."
+            )
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SessionError(
+            f"Evidence JSON tidak dapat dibaca: {path}"
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise SessionError("Root session-probes.json harus berupa object.")
+
+    if str(data.get("project_id", "")).strip() not in {
+        "",
+        active_context().project_id,
+    }:
+        raise SessionError(
+            "project_id pada session-probes.json tidak sesuai active project."
+        )
+
+    data.setdefault("schema_version", SCHEMA_VERSION)
+    data.setdefault("project_id", active_context().project_id)
+    data.setdefault("checklist", CHECKLIST_ID)
+    data.setdefault("session_replay", [])
+    data.setdefault("errors", [])
+
+    if not isinstance(data["session_replay"], list):
+        raise SessionError(
+            "Field session_replay pada session-probes.json harus berupa list."
+        )
+
+    return data
+
+
+def cmd_replay(args: argparse.Namespace) -> int:
+    """Perform one bounded independent-client session replay."""
+    data = load_artifact()
+    ensure_project_match(data)
+
+    record = find_session(data, args.session_id)
+    auth = record.get("authentication") or {}
+
+    session_id = str(record.get("session_id") or "").upper()
+    account_id = str(record.get("account_id") or "")
+    status = str(record.get("status") or "").lower()
+    outcome = str(auth.get("outcome") or "").upper()
+
+    # Replay is deliberately limited to a session that was actually confirmed
+    # by the authentication outcome engine. Historical sessions without an
+    # explicit SUCCESS outcome must not be replayed implicitly.
+    if outcome != AUTH_OUTCOME_SUCCESS:
+        raise SessionError(
+            f"Session {session_id} tidak dapat direplay: "
+            f"authentication.outcome harus SUCCESS, found {outcome or '-'}."
+        )
+
+    if status != "active":
+        raise SessionError(
+            f"Session {session_id} tidak active; controlled replay dibatalkan."
+        )
+
+    if not auth.get("value_encrypted"):
+        raise SessionError(
+            f"Session {session_id} tidak memiliki encrypted session value."
+        )
+
+    if str(auth.get("type", "cookie")).lower() != "cookie":
+        raise SessionError(
+            "Controlled session replay v1.1.9 saat ini hanya mendukung "
+            "session type cookie."
+        )
+
+    target_url = replay_target_from_session(record, args.url)
+    timeout = max(1, int(args.timeout))
+
+    # Confirm encryption key before decrypting. Plaintext exists only inside
+    # build_cookie_session()/requests.Session memory and is never serialized.
+    verify_encryption_key()
+
+    print("=" * 72)
+    print(" Controlled Session Replay Verification")
+    print("=" * 72)
+    print(f"Project ID : {active_context().project_id}")
+    print(f"Session ID : {session_id}")
+    print(f"Account ID : {account_id}")
+    print(f"Target     : {target_url}")
+    print("Method     : GET")
+    print("Client     : independent requests.Session")
+    print()
+
+    print("[PASS] Session record ditemukan.")
+    print("[PASS] Authentication outcome : SUCCESS")
+    print("[PASS] Session status          : active")
+    print("[PASS] Session type            : cookie")
+    print("[PASS] Target berada dalam scope.")
+    print()
+    print("[STEP] Decrypting session value in memory...")
+
+    session = build_cookie_session(record)
+    print("[PASS] Session value decrypted in memory.")
+    print()
+
+    replay_started = utc_now()
+    try:
+        response = session.get(
+            target_url,
+            timeout=timeout,
+            allow_redirects=False,
+        )
+        replay_assessment = replay_authenticated_state(
+            response=response,
+            target_url=target_url,
+        )
+    except requests.RequestException as exc:
+        replay_started = replay_started
+        replay_assessment = {
+            "result": REPLAY_RESULT_ERROR,
+            "reason": f"Replay request gagal: {exc}",
+            "status_code": None,
+            "url": target_url,
+            "location": "",
+            "destination_url": target_url,
+            "destination_path": _normalized_path(target_url),
+            "login_redirect": False,
+            "login_form_present": False,
+            "failure_markers": [],
+            "authenticated_state_markers": [],
+        }
+        response = None
+
+    print("[STEP] Sending controlled replay request...")
+    print()
+    print("REPLAY REQUEST")
+    print(f"Method       : GET")
+    print(f"URL          : {target_url}")
+    print(f"Cookie       : {auth.get('name', 'ci_session')}=[REDACTED]")
+    print()
+
+    print("REPLAY RESPONSE")
+    print(f"Status       : {replay_assessment.get('status_code') or '-'}")
+    print(f"Final URL    : {replay_assessment.get('url') or '-'}")
+    print(
+        "Location     : "
+        f"{replay_assessment.get('location') or '-'}"
+    )
+    if response is not None:
+        print(
+            "Content-Type : "
+            f"{response.headers.get('Content-Type', '-')}"
+        )
+    print()
+
+    print("AUTHENTICATED STATE")
+    print(
+        "Login redirect       : "
+        f"{'YES' if replay_assessment.get('login_redirect') else 'NO'}"
+    )
+    print(
+        "Login form           : "
+        f"{'YES' if replay_assessment.get('login_form_present') else 'NO'}"
+    )
+    print(
+        "Authenticated marker : "
+        f"{'DETECTED' if replay_assessment.get('authenticated_state_markers') else 'NOT DETECTED'}"
+    )
+    print(
+        "Session replay       : "
+        f"{replay_assessment['result']}"
+    )
+    print()
+    print("SESSION REPLAY ASSESSMENT")
+    print(f"Result               : {replay_assessment['result']}")
+    print(
+        "Session replay       : "
+        f"{'YES' if replay_assessment['result'] == REPLAY_RESULT_CONFIRMED else 'NO/UNCONFIRMED'}"
+    )
+    print(
+        "Finding              : "
+        f"{'REVIEW' if replay_assessment['result'] == REPLAY_RESULT_CONFIRMED else 'FALSE'}"
+    )
+    print(f"Reason               : {replay_assessment['reason']}")
+
+    replay_record = {
+        "session_id": session_id,
+        "account_id": account_id,
+        "target_url": target_url,
+        "method": "GET",
+        "client": "independent-requests-session",
+        "result": replay_assessment["result"],
+        "reason": replay_assessment["reason"],
+        "request": {
+            "cookie_name": str(auth.get("name") or ""),
+            "cookie_value": "[REDACTED]",
+        },
+        "response": {
+            "status_code": replay_assessment.get("status_code"),
+            "url": replay_assessment.get("url"),
+            "location": replay_assessment.get("location"),
+            "destination_url": replay_assessment.get("destination_url"),
+            "destination_path": replay_assessment.get("destination_path"),
+            "login_redirect": replay_assessment.get("login_redirect"),
+            "login_form_present": replay_assessment.get("login_form_present"),
+            "failure_markers": replay_assessment.get("failure_markers", []),
+            "authenticated_state_markers": replay_assessment.get(
+                "authenticated_state_markers", []
+            ),
+            "headers": replay_assessment.get("headers", {}),
+            "body_info": replay_assessment.get("body_info", {}),
+        },
+        "session_value_logged": False,
+        "plaintext_session_persisted": False,
+        "timestamp": replay_started,
+    }
+
+    results = data.setdefault("results", {})
+    replay_results = results.setdefault("replay", [])
+    if not isinstance(replay_results, list):
+        replay_results = []
+        results["replay"] = replay_results
+    replay_results.append(replay_record)
+
+    summary = data.setdefault("summary", {})
+    summary["sessions_selected"] = 1
+    summary["replay_tested"] = int(summary.get("replay_tested", 0) or 0) + 1
+    if replay_assessment["result"] == REPLAY_RESULT_CONFIRMED:
+        summary["authenticated_access_observed"] = max(
+            int(summary.get("authenticated_access_observed", 0) or 0),
+            1,
+        )
+
+    # A replay confirmation is evidence that the session can be reused by an
+    # independent client. It is intentionally REVIEW, not an automatic
+    # vulnerability finding. REJECTED is PASS from the replay-control point of
+    # view but does not prove every authorization/invalidation control is sound.
+    if replay_assessment["result"] == REPLAY_RESULT_CONFIRMED:
+        assessment_result = "review"
+        requires_review = True
+        finding = False
+        note = (
+            "Controlled replay menggunakan authorized SUCCESS session berhasil "
+            "mencapai authenticated-state evidence. Session replay confirmed; "
+            "session fixation/rotation impact requires security assessment. "
+            "Ini bukan finding otomatis."
+        )
+    elif replay_assessment["result"] == REPLAY_RESULT_REJECTED:
+        assessment_result = "pass"
+        requires_review = False
+        finding = False
+        note = (
+            "Controlled replay menggunakan authorized SUCCESS session ditolak "
+            "oleh target atau kembali ke login. Session replay tidak terkonfirmasi."
+        )
+    elif replay_assessment["result"] == REPLAY_RESULT_REVIEW:
+        assessment_result = "review"
+        requires_review = True
+        finding = False
+        note = (
+            "Controlled replay menghasilkan response yang ambigu; "
+            "authenticated state belum dapat dikonfirmasi secara otomatis."
+        )
+    else:
+        assessment_result = "error"
+        requires_review = True
+        finding = False
+        note = (
+            "Controlled replay gagal dijalankan sehingga assessment "
+            "belum dapat ditentukan."
+        )
+
+    data["summary"]["requires_review"] = requires_review
+    data["summary"]["finding"] = finding
+    data["assessment"] = {
+        "result": assessment_result,
+        "finding": finding,
+        "requires_review": requires_review,
+        "note": note,
+    }
+    data["checklist"]["status"] = "completed"
+    data["target"]["hostname"] = (
+        urlparse(target_url).hostname
+        or (data.get("target") or {}).get("hostname", "")
+    )
+    data["target"]["url"] = target_url
+
+    evidence = load_replay_evidence()
+    evidence["generated_at"] = utc_now()
+    evidence["session_replay"].append(replay_record)
+    save_json(evidence_file(), evidence)
+    save_artifact(data)
+
+    print()
+    if replay_assessment["result"] == REPLAY_RESULT_CONFIRMED:
+        print(
+            "[REVIEW] Session replay CONFIRMED. "
+            "Lakukan assessment session fixation/rotation; "
+            "finding tidak dibuat otomatis."
+        )
+    elif replay_assessment["result"] == REPLAY_RESULT_REJECTED:
+        print("[PASS] Controlled session replay ditolak oleh target.")
+    elif replay_assessment["result"] == REPLAY_RESULT_REVIEW:
+        print(
+            "[REVIEW] Controlled session replay belum memberikan "
+            "authenticated-state evidence yang cukup."
+        )
+    else:
+        print("[REVIEW] Controlled session replay mengalami error.")
+
+    print(f"FILE     : {session_file()}")
+    print(f"EVIDENCE : {evidence_file()}")
+    return 0
+
+
 def cmd_status(_: argparse.Namespace) -> int:
     data = load_artifact()
     ensure_project_match(data)
@@ -3493,6 +3976,11 @@ def cmd_verify(_: argparse.Namespace) -> int:
     ):
         raise SessionError("Metode enkripsi session tidak canonical.")
 
+    if methodology.get("controlled_session_replay", True) is not True:
+        raise SessionError(
+            "methodology.controlled_session_replay harus true."
+        )
+
     baseline = data.get("baseline") or {}
     if not baseline.get("account_source"):
         raise SessionError("baseline.account_source wajib ada.")
@@ -3524,6 +4012,26 @@ def cmd_verify(_: argparse.Namespace) -> int:
             "source_status.authentication harus not-tested atau completed."
         )
 
+    results = data.get("results") or {}
+    replay_results = results.get("replay", [])
+    if replay_results is not None and not isinstance(replay_results, list):
+        raise SessionError("results.replay harus berupa list jika tersedia.")
+    for replay in replay_results:
+        if not isinstance(replay, dict):
+            raise SessionError("Setiap results.replay item harus berupa mapping.")
+        if not SESSION_ID_RE.match(str(replay.get("session_id", ""))):
+            raise SessionError(
+                f"Replay session_id tidak valid: {replay.get('session_id', '-')}"
+            )
+        if replay.get("request", {}).get("cookie_value") != "[REDACTED]":
+            raise SessionError(
+                "Replay request cookie_value wajib [REDACTED]."
+            )
+        if replay.get("plaintext_session_persisted") is not False:
+            raise SessionError(
+                "Replay plaintext_session_persisted harus false."
+            )
+
     records = session_records(data)
     if authentication_status == "not-tested" and not records:
         # No valid credential/session is an allowed not-tested state. This is
@@ -3550,6 +4058,16 @@ def cmd_verify(_: argparse.Namespace) -> int:
 
         if not auth.get("name"):
             raise SessionError(f"{sid}: authentication.name wajib ada.")
+
+        outcome = str(auth.get("outcome") or "").upper()
+        if outcome and outcome not in {
+            AUTH_OUTCOME_SUCCESS,
+            AUTH_OUTCOME_FAILED,
+            AUTH_OUTCOME_UNCONFIRMED,
+        }:
+            raise SessionError(
+                f"{sid}: authentication.outcome tidak valid: {outcome}"
+            )
 
         encrypted = auth.get("value_encrypted")
         if not isinstance(encrypted, str) or not encrypted:
@@ -3728,6 +4246,26 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_TIMEOUT,
     )
 
+    replay = sub.add_parser(
+        "replay",
+        help="Lakukan controlled session-replay verification dengan authorized SUCCESS session.",
+    )
+    replay.add_argument("--session-id", required=True)
+    replay.add_argument(
+        "--url",
+        default="",
+        help=(
+            "Protected URL dalam scope. Jika tidak diberikan, gunakan "
+            "authentication.post_login_url dari session SUCCESS."
+        ),
+    )
+    replay.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_TIMEOUT,
+        help="Timeout request replay dalam detik.",
+    )
+
     sub.add_parser("status", help="Tampilkan status session.")
 
     sub.add_parser(
@@ -3766,6 +4304,8 @@ def main() -> int:
             return cmd_show(args)
         if command == "analyze":
             return cmd_analyze(args)
+        if command == "replay":
+            return cmd_replay(args)
         if command == "status":
             return cmd_status(args)
         if command == "verify":
