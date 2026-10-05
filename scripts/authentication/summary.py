@@ -19,7 +19,8 @@ Design:
     - Reads authentication checklist artifacts from the active project.
     - Does not create or infer new findings.
     - Preserves source assessment states.
-    - Distinguishes completed, deferred, and skipped/not-applicable items.
+    - Distinguishes artifact availability from assessment status.
+    - Prompts for an explicit status and reason when a checklist artifact is missing.
     - Deduplicates CVE IDs from source artifacts.
     - Raw evidence remains untouched.
     - Report redaction belongs to the report-generation layer.
@@ -41,7 +42,7 @@ except ImportError:
     sys.exit(1)
 
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 SCHEMA_VERSION = "1.0"
 CHECKLIST_ID = "5-008"
 CHECKLIST_NAME = "Authentication Summary"
@@ -596,10 +597,155 @@ def build_initial_document(
     }
 
 
+
+MISSING_STATUS_OPTIONS = {
+    "1": "deferred",
+    "2": "skipped",
+    "3": "not_applicable",
+    "4": "pending",
+}
+
+
+def existing_missing_decision(
+    data: dict[str, Any],
+    checklist_id: str,
+) -> tuple[str, str]:
+    authentication = data.get("authentication", {})
+    if not isinstance(authentication, dict):
+        return "", ""
+
+    records = authentication.get("checklists", [])
+    if not isinstance(records, list):
+        return "", ""
+
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        if str(record.get("id", "")).strip() != checklist_id:
+            continue
+
+        status = str(record.get("status", "")).strip().lower()
+        reason = str(record.get("reason", "")).strip()
+
+        if status in MISSING_STATUS_OPTIONS.values() and reason:
+            return status, reason
+
+    return "", ""
+
+
+def prompt_missing_checklist(
+    item: dict[str, str],
+    relative_path: str,
+    previous_status: str = "",
+    previous_reason: str = "",
+) -> tuple[str, str]:
+    print()
+    print("=" * 72)
+    print("[INPUT REQUIRED] Checklist artifact tidak ditemukan.")
+    print(f"Checklist : {item['id']} - {item['name']}")
+    print(f"Artifact  : {relative_path}")
+    print()
+    print("Mengapa checklist ini belum dikerjakan?")
+    print("Pilih status assessment:")
+    print("  1. Deferred")
+    print("  2. Skipped")
+    print("  3. Not Applicable")
+    print("  4. Pending / belum dikerjakan")
+    print()
+
+    if previous_status and previous_reason:
+        print(
+            f"[INFO] Keputusan sebelumnya: "
+            f"{previous_status} - {previous_reason}"
+        )
+        print(
+            "[INFO] Tekan Enter pada pilihan dan alasan untuk "
+            "mempertahankan keputusan sebelumnya."
+        )
+
+    while True:
+        raw_choice = input("Status [1-4]: ").strip()
+
+        if not raw_choice and previous_status:
+            status = previous_status
+            break
+
+        status = MISSING_STATUS_OPTIONS.get(raw_choice)
+        if status:
+            break
+
+        print("[WARN] Pilihan tidak valid. Masukkan 1, 2, 3, atau 4.")
+
+    while True:
+        if previous_reason:
+            reason = input(
+                "Alasan (Enter = pertahankan alasan sebelumnya): "
+            ).strip()
+        else:
+            reason = input("Alasan: ").strip()
+
+        if not reason and previous_reason:
+            reason = previous_reason
+
+        if reason:
+            break
+
+        print("[WARN] Alasan wajib diisi.")
+
+    print()
+    print(f"[PASS] Keputusan {item['id']}: {status}")
+    print(f"[PASS] Alasan    : {reason}")
+    print("=" * 72)
+    print()
+
+    return status, reason
+
+
+def collect_missing_decisions(
+    data: dict[str, Any],
+    project_path: Path,
+) -> dict[str, dict[str, str]]:
+    """
+    Collect explicit operator decisions for checklist artifacts that do not
+    exist.
+
+    The artifact remains `missing`; the operator-selected status and reason
+    explain why the checklist was not completed.
+    """
+    decisions: dict[str, dict[str, str]] = {}
+
+    for item in CHECKLISTS:
+        path = checklist_file(project_path, item)
+        if path.exists():
+            continue
+
+        relative_path = path.relative_to(repo_root()).as_posix()
+
+        previous_status, previous_reason = existing_missing_decision(
+            data,
+            item["id"],
+        )
+
+        status, reason = prompt_missing_checklist(
+            item,
+            relative_path,
+            previous_status,
+            previous_reason,
+        )
+
+        decisions[item["id"]] = {
+            "status": status,
+            "reason": reason,
+        }
+
+    return decisions
+
+
 def aggregate(
     data: dict[str, Any],
     active_project: dict[str, Any],
     project_path: Path,
+    missing_decisions: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     project_id = str(
         active_project["project_id"]
@@ -672,91 +818,69 @@ def aggregate(
         expected = item["expected_state"]
 
         if not path.exists():
-            source_status[
-                item["id"]
-            ] = "missing"
-
+            source_status[item["id"]] = "missing"
             counts["missing"] += 1
 
-            if expected == "deferred":
+            decision = (missing_decisions or {}).get(item["id"], {})
+            selected_status = str(
+                decision.get("status", "")
+            ).strip().lower()
+            reason = str(
+                decision.get("reason", "")
+            ).strip()
+
+            if selected_status not in {
+                "deferred",
+                "skipped",
+                "not_applicable",
+                "pending",
+            }:
+                raise ValueError(
+                    f"{item['id']} membutuhkan keputusan status "
+                    "karena source artifact tidak ditemukan."
+                )
+
+            if not reason:
+                raise ValueError(
+                    f"{item['id']} membutuhkan alasan karena "
+                    "source artifact tidak ditemukan."
+                )
+
+            source_status[item["id"]] = selected_status
+
+            if selected_status == "deferred":
                 counts["deferred"] += 1
-                source_status[
-                    item["id"]
-                ] = "deferred"
-
-                checklist_records.append(
-                    {
-                        "id": item["id"],
-                        "name": item["name"],
-                        "status": "deferred",
-                        "source": relative_path,
-                        "source_exists": False,
-                        "expected_state": "deferred",
-                        "assessment_result": "deferred",
-                        "finding": False,
-                        "requires_review": False,
-                        "cve_candidate_count": 0,
-                        "cves": [],
-                        "note": (
-                            "Checklist deferred by assessment plan; "
-                            "source artifact is not required."
-                        ),
-                    }
-                )
-                continue
-
-            if expected == "skipped":
+                assessment_state = "deferred"
+            elif selected_status in {"skipped", "not_applicable"}:
                 counts["skipped"] += 1
-                source_status[
-                    item["id"]
-                ] = "skipped"
-
-                checklist_records.append(
-                    {
-                        "id": item["id"],
-                        "name": item["name"],
-                        "status": "skipped",
-                        "source": relative_path,
-                        "source_exists": False,
-                        "expected_state": "skipped",
-                        "assessment_result": "not_applicable",
-                        "finding": False,
-                        "requires_review": False,
-                        "cve_candidate_count": 0,
-                        "cves": [],
-                        "note": (
-                            "Checklist skipped/not applicable; "
-                            "MFA tidak tersedia pada aplikasi."
-                        ),
-                    }
-                )
-                continue
-
-            errors.append(
-                f"{item['id']} source artifact missing: "
-                f"{relative_path}"
-            )
+                if selected_status == "not_applicable":
+                    counts["not_applicable"] += 1
+                assessment_state = "not_applicable"
+            else:
+                counts["incomplete"] += 1
+                assessment_state = "pending"
 
             checklist_records.append(
                 {
                     "id": item["id"],
                     "name": item["name"],
-                    "status": "missing",
+                    "status": selected_status,
                     "source": relative_path,
                     "source_exists": False,
                     "expected_state": expected,
-                    "assessment_result": "missing",
+                    "assessment_result": assessment_state,
                     "finding": False,
-                    "requires_review": True,
+                    "requires_review": False,
                     "cve_candidate_count": 0,
                     "cves": [],
+                    "reason": reason,
                     "note": (
-                        "Required checklist artifact tidak ditemukan."
+                        "Checklist artifact tidak tersedia; "
+                        "status dan alasan ditetapkan secara eksplisit "
+                        "oleh operator saat generate summary."
                     ),
                 }
             )
-
-            counts["incomplete"] += 1
             continue
 
         try:
@@ -900,7 +1024,7 @@ def aggregate(
 
     if counts["completed"] == len(CHECKLISTS):
         overall_result = "pass"
-    elif errors:
+    elif errors or counts["incomplete"] > 0:
         overall_result = "incomplete"
     else:
         overall_result = "completed_with_deferred_or_skipped"
@@ -1192,10 +1316,16 @@ def cmd_generate() -> int:
             active_project
         )
 
+    missing_decisions = collect_missing_decisions(
+        data,
+        project_path,
+    )
+
     data = aggregate(
         data,
         active_project,
         project_path,
+        missing_decisions,
     )
 
     save_yaml(path, data)
@@ -1247,6 +1377,14 @@ def cmd_generate() -> int:
     print(
         f"[INFO] Review req.  : "
         f"{data['assessment']['requires_review']}"
+    )
+    print(
+        "[INFO] Missing      : "
+        f"{counts['missing']}"
+    )
+    print(
+        "[INFO] Incomplete   : "
+        f"{counts['incomplete']}"
     )
 
     if data.get("errors"):
@@ -1482,7 +1620,9 @@ State handling:
   completed
   deferred
   skipped / not_applicable
+  pending
   missing / incomplete
+  missing artifact => explicit operator status + reason required
 
 Boundary:
   Aggregation only.
@@ -1520,6 +1660,9 @@ def main() -> int:
         )
         print(
             "Boundary : aggregation only; no active probing"
+        )
+        print(
+            "Missing  : explicit status + reason required"
         )
         return 0
 
