@@ -6,7 +6,7 @@ BrebesKab-CSIRT-Tools
 Path Traversal / Directory Traversal Assessment
 
 Script  : traversal.py
-Version : 1.0.0
+Version : 1.0.3
 Checklist: 7-004 Path Traversal
 
 Lifecycle:
@@ -63,7 +63,7 @@ import yaml
 
 
 SCRIPT_NAME = "traversal.py"
-SCRIPT_VERSION = "1.0.1"
+SCRIPT_VERSION = "1.0.3"
 
 CHECKLIST_ID = "7-004"
 CHECKLIST_NAME = "Path Traversal"
@@ -1074,6 +1074,93 @@ def response_indicates_file_content(
     return indicators
 
 
+def detect_challenge(
+    response,
+    text,
+    baseline,
+):
+    """
+    Detect a likely upstream challenge/block without treating generic
+    marker words as proof.
+
+    Important v1.0.3 behavior:
+      - captcha/recaptcha/turnstile text alone is NOT a challenge stop.
+      - markers already present in the baseline are NOT a challenge stop.
+      - HTTP 500 alone is NOT a challenge stop.
+      - a strong status/header signal may establish a challenge/block.
+      - all marker evidence is still preserved separately for forensics.
+    """
+
+    marker_list = find_markers(
+        text,
+        CHALLENGE_MARKERS,
+    )
+
+    baseline_text = ""
+    if isinstance(baseline, dict):
+        snapshot = baseline.get("snapshot") or {}
+        baseline_text = snapshot.get("body_sample") or ""
+
+    baseline_markers = find_markers(
+        baseline_text,
+        CHALLENGE_MARKERS,
+    )
+
+    new_markers = [
+        item
+        for item in marker_list
+        if item not in baseline_markers
+    ]
+
+    status = safe_int(
+        response.get("status"),
+        0,
+    )
+
+    headers = response.get("headers") or {}
+    normalized_headers = {
+        str(key).lower(): str(value).lower()
+        for key, value in headers.items()
+    }
+
+    # Strong provider/header-level challenge signal.
+    header_challenge = (
+        "cf-mitigated" in normalized_headers
+        and "challenge"
+        in normalized_headers["cf-mitigated"]
+    )
+
+    # A 403/429 combined with a challenge marker is materially stronger
+    # than merely finding the word "captcha" in application HTML.
+    status_challenge = (
+        status in {403, 429}
+        and bool(marker_list)
+    )
+
+    # A newly introduced challenge page marker is useful only when the
+    # response is an explicit block/challenge status. This prevents an
+    # application debug page containing "captcha" from stopping probes.
+    new_marker_block = (
+        status in {403, 429}
+        and bool(new_markers)
+    )
+
+    detected = bool(
+        header_challenge
+        or status_challenge
+        or new_marker_block
+    )
+
+    return {
+        "detected": detected,
+        "markers": marker_list,
+        "baseline_markers": baseline_markers,
+        "new_markers": new_markers,
+        "header_signal": header_challenge,
+        "status_signal": status_challenge,
+    }
+
+
 def assess_probe(
     candidate,
     payload,
@@ -1082,10 +1169,14 @@ def assess_probe(
     text,
     contexts,
 ):
-    challenge_markers = find_markers(
+    challenge = detect_challenge(
+        response,
         text,
-        CHALLENGE_MARKERS,
+        baseline,
     )
+
+    challenge_markers = challenge["markers"]
+    challenge_detected = challenge["detected"]
 
     error_signatures = find_error_signatures(text)
 
@@ -1108,25 +1199,25 @@ def assess_probe(
 
     status_changed = (
         response["status"]
-        != baseline["response"]["status"]
+        != baseline["snapshot"]["status"]
     )
 
     body_changed = (
         response["body_sha256"]
-        != baseline["response"]["body_sha256"]
+        != baseline["snapshot"]["body_sha256"]
     )
 
     # Strong evidence is intentionally narrow.
     strong_file_read = bool(target_indicators)
 
-    # A reflected payload, HTTP 500, changed response, or generic
-    # path error is NOT enough.
+    # A reflected payload, HTTP 500, changed response, generic path error,
+    # or generic challenge marker is NOT enough.
     finding = False
 
     if strong_file_read:
         finding = True
 
-    if challenge_markers:
+    if challenge_detected:
         result = "requires_review"
     elif strong_file_read:
         result = "potential_finding"
@@ -1149,7 +1240,20 @@ def assess_probe(
         "payload_reflected": payload_reflected,
         "traversal_string_reflected": traversal_strings_reflected,
         "file_content_indicators": target_indicators,
+        "challenge_detected": challenge_detected,
         "challenge_markers": challenge_markers,
+        "baseline_challenge_markers": challenge[
+            "baseline_markers"
+        ],
+        "new_challenge_markers": challenge[
+            "new_markers"
+        ],
+        "challenge_header_signal": challenge[
+            "header_signal"
+        ],
+        "challenge_status_signal": challenge[
+            "status_signal"
+        ],
         "error_signatures": error_signatures,
         "status_changed": status_changed,
         "body_changed": body_changed,
@@ -1236,6 +1340,8 @@ def make_artifact(target):
                 "traversal_context": True,
                 "file_content_indicator": True,
                 "challenge_detail": True,
+                "challenge_requires_strong_signal": True,
+                "challenge_marker_alone_is_not_stop": True,
                 "error_response": True,
                 "body_hash": True,
             },
@@ -1345,6 +1451,14 @@ def make_artifact(target):
             ),
             (
                 "Raw forensic evidence is preserved."
+            ),
+            (
+                "Generic challenge markers alone do not stop probing; "
+                "strong status/header signals are required."
+            ),
+            (
+                "HTTP 500 responses remain forensic evidence and do not "
+                "stop the remaining traversal payloads."
             ),
         ],
         "generated_at": utc_now(),
@@ -1906,7 +2020,7 @@ def cmd_analyze():
                 error_probes += 1
 
             if assessment[
-                "challenge_markers"
+                "challenge_detected"
             ]:
                 challenge_stops += 1
 
@@ -1954,8 +2068,23 @@ def cmd_analyze():
                     "file_content_indicators": assessment[
                         "file_content_indicators"
                     ],
+                    "challenge_detected": assessment[
+                        "challenge_detected"
+                    ],
                     "challenge_markers": assessment[
                         "challenge_markers"
+                    ],
+                    "baseline_challenge_markers": assessment[
+                        "baseline_challenge_markers"
+                    ],
+                    "new_challenge_markers": assessment[
+                        "new_challenge_markers"
+                    ],
+                    "challenge_header_signal": assessment[
+                        "challenge_header_signal"
+                    ],
+                    "challenge_status_signal": assessment[
+                        "challenge_status_signal"
                     ],
                     "error_signatures": assessment[
                         "error_signatures"
@@ -2000,10 +2129,11 @@ def cmd_analyze():
                 probe_record
             )
 
-            # Stop additional probes for this candidate
-            # if a challenge/block is clearly detected.
+            # Stop additional probes only for a clearly detected
+            # upstream challenge/block. Generic marker words and HTTP 500
+            # responses deliberately do not stop payload coverage.
             if assessment[
-                "challenge_markers"
+                "challenge_detected"
             ]:
                 break
 
@@ -2021,7 +2151,7 @@ def cmd_analyze():
 
         candidate_challenge = any(
             item.get("signals", {}).get(
-                "challenge_markers"
+                "challenge_detected"
             )
             for item in candidate_results
         )
@@ -2203,6 +2333,13 @@ def cmd_analyze():
             ),
             (
                 "Sensitive files are intentionally excluded."
+            ),
+            (
+                "Generic challenge markers are preserved but are not "
+                "treated as challenge stops without stronger evidence."
+            ),
+            (
+                "HTTP 500 responses do not stop traversal payload coverage."
             ),
         ],
     }
