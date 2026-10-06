@@ -74,7 +74,7 @@ except ImportError:
     print("[ERROR] PyYAML belum terinstall.")
     raise SystemExit(1)
 
-SCRIPT_VERSION = "1.0.1"
+SCRIPT_VERSION = "1.0.2"
 SCHEMA_VERSION = "1.0"
 CHECKLIST_ID = "7-002"
 CHECKLIST_NAME = "Cross-Site Scripting (XSS)"
@@ -1486,6 +1486,21 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         except ImportError:
             browser_available = False
 
+        print("[STEP] Browser verification")
+        print("[INFO] Engine     : Playwright / Chromium")
+        print("[INFO] Mode       : Headless")
+        print("[INFO] Purpose    : Verify reflected HTML rendering and JavaScript execution")
+        print(f"[INFO] Candidates : {len(candidates)}")
+        print(
+            "[INFO] Payloads   : "
+            "html-tag-marker, html-bold-render, html-link-render, "
+            "attribute-break-execution, svg-execution"
+        )
+        print(f"[INFO] Available  : {'YES' if browser_available else 'NO'}")
+        if not browser_available:
+            print("[WARN] Playwright tidak tersedia; browser verification dilewati.")
+        print()
+
     for index, candidate in enumerate(candidates, start=1):
         try:
             baseline = baseline_for_candidate(session, candidate, args.timeout)
@@ -1547,6 +1562,44 @@ def cmd_analyze(args: argparse.Namespace) -> int:
                     )
                     probe["browser_verification"] = browser
 
+                if browser_requested:
+                    response = probe.get("response") or {}
+                    signals = probe.get("signals") or {}
+                    payload_name = str((probe.get("payload") or {}).get("name") or "")
+                    status = response.get("status", "-")
+                    reflected = "YES" if signals.get("payload_reflected") else "NO"
+                    browser_result = probe.get("browser_verification") or {}
+                    available = bool(browser_result.get("available"))
+
+                    if not available:
+                        browser_state = "SKIPPED"
+                    elif bool(browser_result.get("executed")):
+                        browser_state = "EXECUTED"
+                    elif bool(browser_result.get("html_rendered")):
+                        browser_state = "REVIEW"
+                    else:
+                        browser_state = "PASS"
+
+                    print(f"[TEST] [{index}/{len(candidates)}] {candidate.get('url')}")
+                    print(f"       Parameter: {candidate.get('parameter')}")
+                    print(f"       Payload  : {payload_name}")
+                    print(f"       Status   : HTTP {status}")
+                    print(f"       Reflected: {reflected}")
+
+                    if payload_name in html_render_payload_names():
+                        if bool(browser_result.get("html_rendered")):
+                            rendered_tag = str(browser_result.get("rendered_tag") or "?")
+                            html_state = f"RENDERED <{rendered_tag}>"
+                        else:
+                            html_state = "NOT RENDERED"
+                        print(f"       HTML     : {html_state}")
+                        print(f"       Browser  : {browser_state}")
+                    else:
+                        js_state = "EXECUTED" if bool(browser_result.get("executed")) else "NOT EXECUTED"
+                        print(f"       JavaScript: {js_state}")
+                        print(f"       Browser   : {browser_state}")
+                    print()
+
         assessment = assess_candidate(candidate, baseline, probes)
         candidate_record = {
             **candidate,
@@ -1596,6 +1649,18 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     print(f"[INFO] Probes    : {len(all_probes)}")
     print(f"[INFO] Finding   : {summary['finding']}")
     print(f"[INFO] Review    : {summary['requires_review']}")
+    if browser_requested:
+        browser_rendered = sum(
+            1 for p in all_probes
+            if (p.get("browser_verification") or {}).get("html_rendered")
+        )
+        browser_executed = sum(
+            1 for p in all_probes
+            if (p.get("browser_verification") or {}).get("executed")
+        )
+        print("[RESULT] Browser verification completed")
+        print(f"[INFO] HTML rendered : {browser_rendered}")
+        print(f"[INFO] JS executed   : {browser_executed}")
     print(f"[PASS] Artifact  : {artifact_path()}")
     print(f"[PASS] Evidence  : {evidence_path()}")
     return 0
