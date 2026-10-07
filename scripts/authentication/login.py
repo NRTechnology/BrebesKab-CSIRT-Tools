@@ -2,7 +2,7 @@
 """
 BrebesKab-CSIRT-Tools - Authentication Login
 
-Checklist: 7-001 Authentication Login
+Checklist: 7-002 Authentication Login
 
 Purpose
 -------
@@ -60,9 +60,9 @@ except ImportError:  # pragma: no cover
     PlaywrightTimeoutError = Exception
 
 
-SCRIPT_VERSION = "1.0.6"
+SCRIPT_VERSION = "1.0.7"
 SCHEMA_VERSION = "1.0"
-CHECKLIST_ID = "7-001"
+CHECKLIST_ID = "7-002"
 CHECKLIST_NAME = "Authentication Login"
 PHASE = "07 Authentication"
 DEFAULT_LOGIN_PATH = "/login"
@@ -71,7 +71,7 @@ DEFAULT_TIMEOUT = 15
 MAX_FAILED_ATTEMPTS = 5
 MAX_BODY_BYTES = 262144
 BODY_SAMPLE_CHARS = 4000
-USER_AGENT = "BrebesKab-CSIRT-Tools/7-001"
+USER_AGENT = "BrebesKab-CSIRT-Tools/7-002"
 
 # Preparation account.py is the authoritative owner of the test-account
 # registry and credential decryption. Do not duplicate its YAML/encryption
@@ -1063,7 +1063,7 @@ def initial_artifact(context: dict[str, Any], target: dict[str, Any]) -> dict[st
             "allow_redirects": False,
             "max_body_bytes": MAX_BODY_BYTES,
             "body_sample_chars": BODY_SAMPLE_CHARS,
-            "browser": "Playwright only for human-interaction detection/corroboration",
+            "browser": "Playwright for human-interaction detection and browser-emulator handoff",
         },
         "source_status": {
             "scope": "pending",
@@ -1127,7 +1127,7 @@ def cmd_version() -> int:
     print(f"Checklist: {CHECKLIST_ID} {CHECKLIST_NAME}")
     print(f"Schema   : {SCHEMA_VERSION}")
     print("Method   : authorized test account + bounded failed-login attempts")
-    print("Browser  : Playwright optional; no Cloudflare/CAPTCHA bypass")
+    print("Browser  : Playwright Chromium emulator handoff on human interaction; no bypass")
     print("Limit    : maximum 5 failed attempts per account")
     print("Debug    : --debug-request shows safe prepared request mapping; secrets redacted")
     print("Audit    : --request-audit-only prepares request without sending authentication")
@@ -1210,13 +1210,24 @@ def get_login_page(session: requests.Session, login_url: str, timeout: int) -> d
     }
 
 
-def playwright_human_interaction(login_url: str, timeout: int) -> dict[str, Any]:
-    """Detect challenge state without solving/bypassing it."""
+def playwright_human_interaction(
+    login_url: str,
+    timeout: int,
+    interactive: bool = False,
+) -> dict[str, Any]:
+    """Detect/render human interaction without solving or bypassing it.
+
+    When interactive=True, Chromium is launched in headed/emulated-browser mode
+    so an assessor can inspect or manually complete the legitimate human
+    interaction challenge. The script never attempts to solve/bypass the
+    challenge programmatically.
+    """
     if sync_playwright is None:
         return {
             "available": False,
             "human_interaction_required": None,
             "classification": "playwright-unavailable",
+            "browser_mode": "unavailable",
             "error": "Playwright tidak tersedia.",
         }
 
@@ -1227,15 +1238,25 @@ def playwright_human_interaction(login_url: str, timeout: int) -> dict[str, Any]
         "captcha_detected": False,
         "challenge_visible": False,
         "classification": "no-human-challenge-observed",
+        "browser_mode": "headless-detection",
+        "manual_interaction": False,
         "error": "",
     }
 
+    browser = None
     try:
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            page = browser.new_page()
+            launch_kwargs: dict[str, Any] = {
+                "headless": not interactive,
+            }
+            browser = pw.chromium.launch(**launch_kwargs)
+            page = browser.new_page(
+                viewport={"width": 1366, "height": 900},
+                user_agent=USER_AGENT,
+            )
             page.goto(login_url, wait_until="domcontentloaded", timeout=timeout * 1000)
             page.wait_for_timeout(1000)
+
             html = page.content()
             detected = detect_turnstile_html(html)
             result.update(
@@ -1251,6 +1272,7 @@ def playwright_human_interaction(login_url: str, timeout: int) -> dict[str, Any]
                 'iframe[src*="turnstile"]',
                 '[name="cf-turnstile-response"]',
                 '.cf-turnstile',
+                '[data-sitekey]',
             ]
             visible = False
             for selector in selectors:
@@ -1261,14 +1283,39 @@ def playwright_human_interaction(login_url: str, timeout: int) -> dict[str, Any]
                         break
                 except Exception:
                     continue
+
             result["challenge_visible"] = visible
             if result["human_interaction_required"] or visible:
                 result["human_interaction_required"] = True
                 result["classification"] = "human-interaction-required"
+
+                if interactive:
+                    result["browser_mode"] = "headed-browser-emulator"
+                    result["manual_interaction"] = True
+                    print("[INFO] Human interaction terdeteksi.")
+                    print("[INFO] Berpindah ke browser emulator Chromium.")
+                    print("[INFO] Challenge tidak dibypass atau diselesaikan secara otomatis.")
+                    print("[INFO] Silakan lakukan interaksi yang diperlukan secara manual.")
+                    print("[INFO] Setelah selesai, kembali ke terminal lalu tekan ENTER.")
+                    try:
+                        input()
+                    except EOFError:
+                        pass
+                    result["manual_interaction_completed"] = True
+                else:
+                    result["browser_mode"] = "headless-detection"
+
             browser.close()
+            browser = None
+
     except Exception as exc:
         result["classification"] = "browser-probe-error"
         result["error"] = f"{type(exc).__name__}: {exc}"
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
 
     return result
 
@@ -1364,7 +1411,13 @@ def cmd_analyze(account_id_value: str | None, failed_attempts: int, timeout: int
 
     session = build_session()
     login_page = get_login_page(session, login_url, timeout)
-    browser = playwright_human_interaction(login_url, timeout)
+    browser = playwright_human_interaction(
+        login_url,
+        timeout,
+        interactive=bool(
+            login_page.get("human_interaction", {}).get("human_interaction_detected")
+        ),
+    )
 
     evidence: list[dict[str, Any]] = [
         {
@@ -1809,7 +1862,7 @@ def print_help() -> None:
         "BrebesKab-CSIRT-Tools - Authentication Login\n"
         "\n"
         "Checklist:\n"
-        "  7-001 Authentication Login\n"
+        "  7-002 Authentication Login\n"
         "\n"
         "Usage:\n"
         "  python scripts/authentication/login.py version\n"
@@ -1830,7 +1883,7 @@ def print_help() -> None:
         "  - Valid password is resolved through preparation/account.py and never stored.\n"
         "  - Failed-login testing uses one generated wrong password and max 5 attempts/account.\n"
         "  - No password wordlist, password spraying, username enumeration, or unrestricted brute force.\n"
-        "  - Cloudflare Turnstile/CAPTCHA is detected but never bypassed.\n"
+        "  - Cloudflare Turnstile/CAPTCHA is detected but never bypassed; when detected, Chromium browser emulator is opened for manual interaction.\n"
         "  - Human interaction requirement stops automated login testing and is PASS for anti-automation.\n"
         "  - --request-audit-only prepares the login request but never sends the authentication request.\n"
         "  - Raw evidence is retained without passwords; report redaction remains a separate layer.\n"
