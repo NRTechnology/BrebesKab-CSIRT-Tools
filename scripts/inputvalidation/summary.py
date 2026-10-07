@@ -4,13 +4,13 @@ BrebesKab-CSIRT-Tools
 Input Validation Summary
 
 Checklist:
-    7-001 SQL Injection
-    7-002 Cross-Site Scripting (XSS)
-    7-003 Command Injection
-    7-004 Path Traversal
-    7-005 Expression / Template / Parser Injection
-    7-006 HTTP Parameter Pollution
-    7-007 Input Validation Summary
+    9-001 SQL Injection
+    9-002 Cross-Site Scripting (XSS)
+    9-003 Command Injection
+    9-004 Path Traversal
+    9-005 Expression / Template / Parser Injection
+    9-006 HTTP Parameter Pollution
+    9-007 Input Validation Summary
 
 Design:
     - Aggregation only.
@@ -43,50 +43,50 @@ except ImportError:
     sys.exit(1)
 
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 SCHEMA_VERSION = "1.0"
-CHECKLIST_ID = "7-007"
+CHECKLIST_ID = "9-007"
 CHECKLIST_NAME = "Input Validation Summary"
-PHASE = "07 Input Validation"
+PHASE = "09 Input Validation"
 
 CHECKLISTS = [
     {
-        "id": "7-001",
+        "id": "9-001",
         "name": "SQL Injection",
         "directory": "sqli",
         "filename": "sqli.yaml",
         "expected_state": "completed",
     },
     {
-        "id": "7-002",
+        "id": "9-002",
         "name": "Cross-Site Scripting (XSS)",
         "directory": "xss",
         "filename": "xss.yaml",
         "expected_state": "completed",
     },
     {
-        "id": "7-003",
+        "id": "9-003",
         "name": "Command Injection",
         "directory": "command",
         "filename": "command.yaml",
         "expected_state": "completed",
     },
     {
-        "id": "7-004",
+        "id": "9-004",
         "name": "Path Traversal",
         "directory": "traversal",
         "filename": "traversal.yaml",
         "expected_state": "completed",
     },
     {
-        "id": "7-005",
+        "id": "9-005",
         "name": "Expression / Template / Parser Injection",
         "directory": "injection",
         "filename": "injection.yaml",
         "expected_state": "completed",
     },
     {
-        "id": "7-006",
+        "id": "9-006",
         "name": "HTTP Parameter Pollution",
         "directory": "parameter",
         "filename": "parameter.yaml",
@@ -159,11 +159,11 @@ def active_project_path(active_project: dict[str, Any]) -> Path:
 
 def summary_file() -> Path:
     active_project = load_active_project()
-    return active_project_path(active_project) / "07-input-validation" / "summary" / "summary.yaml"
+    return active_project_path(active_project) / "09-input-validation" / "summary" / "summary.yaml"
 
 
 def checklist_file(project_path: Path, item: dict[str, str]) -> Path:
-    return project_path / "07-input-validation" / item["directory"] / item["filename"]
+    return project_path / "09-input-validation" / item["directory"] / item["filename"]
 
 
 def as_dict(value: Any) -> dict[str, Any]:
@@ -185,10 +185,10 @@ def normalize_bool(value: Any) -> bool:
 
 
 def normalize_status(data: dict[str, Any]) -> str:
-    """Read completion state across the two artifact schemas used in phase 07.
+    """Read completion state across the two artifact schemas used in input validation.
 
-    Older 7-001/7-002/7-003/7-004 artifacts keep status in
-    checklist.status, while newer 7-005/7-006 artifacts keep it in
+    Older 9-001/9-002/9-003/9-004 artifacts keep status in
+    checklist.status, while newer 9-005/9-006 artifacts keep it in
     results.status.  The summary must treat both as authoritative source
     states rather than marking the latter as incomplete.
     """
@@ -222,7 +222,7 @@ def assessment_result(data: dict[str, Any]) -> str:
     if result:
         return result
 
-    # Newer phase-07 artifacts may omit a top-level assessment/summary and
+    # Newer input-validation artifacts may omit a top-level assessment/summary and
     # expose only results.findings + results.requires_review.
     results = as_dict(data.get("results"))
     finding = results.get("findings")
@@ -441,7 +441,7 @@ def build_initial_document(active_project: dict[str, Any]) -> dict[str, Any]:
             "assessment_type": str(active_project.get("assessment_type", "")).strip(),
         },
         "methodology": {
-            "description": "Aggregation-only summary of Input Validation checklists 7-001 through 7-006.",
+            "description": "Aggregation-only summary of Input Validation checklists 9-001 through 9-006.",
             "active_project_source": ".runtime/active-project.yaml",
             "source_artifacts_authoritative": True,
             "network_requests": False,
@@ -559,7 +559,7 @@ def cmd_version() -> int:
     print(f"Checklist : {CHECKLIST_ID} {CHECKLIST_NAME}")
     print(f"Phase     : {PHASE}")
     print(f"Schema    : {SCHEMA_VERSION}")
-    print("Sources   : 7-001 through 7-006")
+    print("Sources   : 9-001 through 9-006")
     print("Boundary  : aggregation only; no active probing")
     return 0
 
@@ -695,7 +695,7 @@ def cmd_verify() -> int:
     expected_ids = [item["id"] for item in CHECKLISTS]
     actual_ids = [str(as_dict(item).get("id", "")) for item in entries]
     if actual_ids != expected_ids:
-        errors.append("Urutan/ID checklist tidak sesuai 7-001 sampai 7-006.")
+        errors.append("Urutan/ID checklist tidak sesuai 9-001 sampai 9-006.")
 
     for item in entries:
         entry = as_dict(item)
@@ -776,7 +776,7 @@ Usage:
 
 Commands:
   init      Create summary.yaml.
-  generate  Aggregate 7-001 through 7-006 artifacts.
+  generate  Aggregate 9-001 through 9-006 artifacts.
   show      Show the complete summary document.
   verify    Validate the summary and mark completed.
   status    Show lifecycle and aggregate assessment status.
@@ -784,12 +784,12 @@ Commands:
   version   Show script version.
 
 Aggregation:
-  7-001  SQL Injection
-  7-002  Cross-Site Scripting (XSS)
-  7-003  Command Injection
-  7-004  Path Traversal
-  7-005  Expression / Template / Parser Injection
-  7-006  HTTP Parameter Pollution
+  9-001  SQL Injection
+  9-002  Cross-Site Scripting (XSS)
+  9-003  Command Injection
+  9-004  Path Traversal
+  9-005  Expression / Template / Parser Injection
+  9-006  HTTP Parameter Pollution
 
 Boundary:
   Aggregation only.

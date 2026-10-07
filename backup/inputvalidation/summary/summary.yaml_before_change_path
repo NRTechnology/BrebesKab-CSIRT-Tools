@@ -1,0 +1,284 @@
+schema_version: '1.0'
+project_id: PENTEST-2026-002
+tool:
+  name: BrebesKab-CSIRT-Tools
+  script: summary.py
+  version: 1.0.1
+checklist:
+  id: 7-007
+  name: Input Validation Summary
+  phase: 07 Input Validation
+  focus: Aggregation of Input Validation assessment checklists without active probing.
+  status: completed
+target:
+  application: Bangsaku
+  target: https://bangsaku.devappkita.my.id/
+  environment: Production
+  assessment_type: Black Box
+methodology:
+  description: Aggregation-only summary of Input Validation checklists 7-001 through
+    7-006.
+  active_project_source: .runtime/active-project.yaml
+  source_artifacts_authoritative: true
+  network_requests: false
+  active_probing: false
+  automatic_finding: false
+  finding_inference: false
+  preserve_source_assessment_state: true
+  preserve_forensic_signals: true
+  cve_correlation: Source-artifact aggregation only; version match != vulnerability.
+  raw_evidence_modified: false
+  report_redaction_separate: true
+toolchain:
+  mandatory:
+  - Python
+  - PyYAML
+  - scripts.context
+  - active project artifacts
+  optional: []
+  not_required:
+  - requests
+  - Playwright
+  - Nmap
+  - ffuf
+  - Gobuster
+  - Nuclei
+  - sqlmap
+  - commix
+  - ZAP
+  - Hydra
+source_status:
+  active_project: completed
+  checklists:
+    active_project: completed
+    7-001: completed
+    7-002: completed
+    7-003: completed
+    7-004: completed
+    7-005: completed
+    7-006: completed
+  7-001: completed
+  7-002: completed
+  7-003: completed
+  7-004: completed
+  7-005: completed
+  7-006: completed
+input_validation:
+  checklists:
+  - id: 7-001
+    name: SQL Injection
+    source: projects/PENTEST-2026-002/07-input-validation/sqli/sqli.yaml
+    source_exists: true
+    expected_state: completed
+    status: completed
+    assessment_result: requires_review
+    finding: false
+    requires_review: true
+    cve_candidate_count: 0
+    cves: []
+    source_identity:
+      script: sqli.py
+      version: 1.0.2
+      checklist_id: 7-001
+      checklist_name: SQL Injection
+      assessment_type: Black Box
+    metrics:
+      links: 35
+      query_candidates: 16
+      get_forms: 0
+      candidates: 0
+      tested: 16
+      probes: 20
+      findings: 0
+      requires_review: 1
+      request_errors: 0
+      http_errors: 0
+    methodology_flags:
+      same_origin_only: true
+      redirect_following: false
+      get_only_probe_engine: true
+      non_destructive_payloads_only: true
+      automatic_finding: false
+  - id: 7-002
+    name: Cross-Site Scripting (XSS)
+    source: projects/PENTEST-2026-002/07-input-validation/xss/xss.yaml
+    source_exists: true
+    expected_state: completed
+    status: completed
+    assessment_result: requires_review
+    finding: false
+    requires_review: true
+    cve_candidate_count: 0
+    cves: []
+    source_identity:
+      script: xss.py
+      version: 1.0.2
+      checklist_id: 7-002
+      checklist_name: Cross-Site Scripting (XSS)
+      assessment_type: Black Box
+    metrics:
+      links: 35
+      query_candidates: 14
+      get_forms: 2
+      candidates: 0
+      tested: 16
+      probes: 96
+      findings: 0
+      requires_review: 1
+      request_errors: 0
+      http_errors: 0
+    methodology_flags:
+      same_origin_only: true
+      redirect_following: false
+      get_only_probe_engine: true
+      non_destructive_payloads_only: true
+      automatic_finding: false
+  - id: 7-003
+    name: Command Injection
+    source: projects/PENTEST-2026-002/07-input-validation/command/command.yaml
+    source_exists: true
+    expected_state: completed
+    status: completed
+    assessment_result: requires_review
+    finding: false
+    requires_review: true
+    cve_candidate_count: 0
+    cves: []
+    source_identity:
+      script: command.py
+      version: 1.0.0
+      checklist_id: 7-003
+      checklist_name: Command Injection
+      assessment_type: Black Box
+    metrics:
+      links: 35
+      query_candidates: 14
+      get_forms: 2
+      candidates: 0
+      tested: 16
+      probes: 26
+      findings: 0
+      requires_review: 1
+      request_errors: 0
+      http_errors: 0
+    methodology_flags:
+      same_origin_only: true
+      redirect_following: false
+      get_only_probe_engine: true
+      non_destructive_payloads_only: true
+      automatic_finding: false
+  - id: 7-004
+    name: Path Traversal
+    source: projects/PENTEST-2026-002/07-input-validation/traversal/traversal.yaml
+    source_exists: true
+    expected_state: completed
+    status: completed
+    assessment_result: requires_review
+    finding: false
+    requires_review: true
+    cve_candidate_count: 0
+    cves: []
+    source_identity:
+      script: traversal.py
+      version: 1.0.3
+      checklist_id: 7-004
+      checklist_name: Path Traversal
+      assessment_type: Black Box
+    metrics:
+      links: 151
+      query_candidates: 18
+      get_forms: 2
+      candidates: 0
+      tested: 20
+      probes: 120
+      findings: 0
+      requires_review: 114
+      request_errors: 0
+      http_errors: 0
+    methodology_flags:
+      same_origin_only: true
+      redirect_following: false
+      get_only_probe_engine: true
+      non_destructive_payloads_only: true
+      automatic_finding: false
+  - id: 7-005
+    name: Expression / Template / Parser Injection
+    source: projects/PENTEST-2026-002/07-input-validation/injection/injection.yaml
+    source_exists: true
+    expected_state: completed
+    status: completed
+    assessment_result: requires_review
+    finding: false
+    requires_review: true
+    cve_candidate_count: 0
+    cves: []
+    source_identity:
+      script: ''
+      version: 1.0.7
+      checklist_id: ''
+      checklist_name: ''
+      assessment_type: Black Box
+    metrics:
+      links: 35
+      query_candidates: 9
+      get_forms: 1
+      candidates: 11
+      tested: 11
+      probes: 66
+      findings: 0
+      requires_review: 66
+      request_errors: 0
+      http_errors: 54
+    methodology_flags:
+      same_origin_only: true
+      redirect_following: false
+      automatic_finding: true
+      forensic_evidence_preserved: true
+  - id: 7-006
+    name: HTTP Parameter Pollution
+    source: projects/PENTEST-2026-002/07-input-validation/parameter/parameter.yaml
+    source_exists: true
+    expected_state: completed
+    status: completed
+    assessment_result: requires_review
+    finding: false
+    requires_review: true
+    cve_candidate_count: 0
+    cves: []
+    source_identity:
+      script: ''
+      version: 1.0.1
+      checklist_id: ''
+      checklist_name: ''
+      assessment_type: Black Box
+    metrics:
+      links: 63
+      query_candidates: 15
+      get_forms: 1
+      candidates: 17
+      tested: 17
+      probes: 51
+      findings: 0
+      requires_review: 17
+      request_errors: 0
+      http_errors: 15
+    methodology_flags:
+      same_origin_only: true
+      redirect_following: false
+      automatic_finding: true
+      order_sensitivity_requires_manual_review: true
+      security_impact_required_for_finding: true
+      forensic_evidence_preserved: true
+assessment:
+  result: review
+  finding: false
+  finding_count: 0
+  requires_review: true
+  review_count: 6
+  missing_count: 0
+  incomplete_count: 0
+  completed_count: 6
+  total_checklists: 6
+  cve_count: 0
+  cves: []
+generated_at: '2026-10-07T12:02:52+07:00'
