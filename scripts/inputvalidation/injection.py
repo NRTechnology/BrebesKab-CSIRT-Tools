@@ -3,12 +3,13 @@
 """
 BrebesKab-CSIRT-Tools
 Checklist 7-005 - Expression / Template / Parser Injection
-Version 1.0.0
+Version 1.0.3
 
 GET-only, same-origin, authenticated, non-destructive.
 Does NOT test SQLi, XSS, command injection, or path traversal.
 Reflection/HTTP 500/parser errors are forensic signals, not automatic findings.
 Automatic finding requires strong evidence of server-side expression evaluation.
+Newly observed arithmetic signals that are not strong enough remain manual-review notes.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 import requests
 import yaml
 
-SCRIPT_VERSION = "1.0.2"
+SCRIPT_VERSION = "1.0.3"
 SCHEMA_VERSION = "1.0"
 CHECKLIST_ID = "7-005"
 CHECKLIST_NAME = "Expression / Template / Parser Injection"
@@ -402,6 +403,39 @@ def contexts(body: str, token: str) -> List[str]:
     return result
 
 
+def evaluation_contexts(body: str, expected: str | None) -> List[str]:
+    """Return bounded contexts around the expected evaluation marker."""
+    if not expected:
+        return []
+    return contexts(body, expected)
+
+
+def suspicious_evaluation_context(context: str) -> bool:
+    """
+    Detect contexts that are commonly unrelated to application evaluation.
+
+    This is intentionally conservative. A suspicious context does NOT delete
+    the signal; it only prevents that signal from becoming an automatic
+    finding and keeps it available for manual verification.
+    """
+    c = (context or "").lower()
+
+    # CodeIgniter/debugbar/Kint and browser-side dynamic instrumentation can
+    # contain arbitrary numeric values, timestamps, counters, etc.
+    suspicious = (
+        "debugbar" in c
+        or "kint" in c
+        or "debug-view" in c
+        or "debug_view" in c
+        or "data-time=" in c
+        or "microtime" in c
+        or "window.kint" in c
+        or "kintrich" in c
+        or "debugbar_loader" in c
+    )
+    return suspicious
+
+
 def strong_expression_evidence(
     body: str,
     baseline_body: str,
@@ -412,37 +446,72 @@ def strong_expression_evidence(
     """
     Conservative automatic-evaluation detector.
 
-    The mere presence of the expected arithmetic result (e.g. "49")
-    is not evidence of evaluation because debug/error pages may contain
-    the same value for unrelated reasons.
+    IMPORTANT:
+    A newly introduced arithmetic result such as "49" is preserved as a
+    forensic signal, but it is not automatically promoted to a finding when
+    the result may originate from debugbar/Kint/dynamic page content.
 
-    Strong evidence requires ALL of:
-      1. arithmetic payload is known and expected result exists;
-      2. exact payload is absent from the response;
-      3. expected result was not already present in the baseline;
-      4. response is not an HTTP 4xx/5xx error;
-      5. the expected result is present in the response.
+    The detector therefore separates:
+      - evaluation_signal: expected result is newly observed;
+      - strong_evaluation_evidence: enough evidence remains after excluding
+        clearly unrelated debug/dynamic contexts;
+      - manual_review: the signal should be checked manually.
 
-    This intentionally favors false negatives over false positives.
+    Existing payloads, crawl behavior, request behavior, and evidence are
+    intentionally preserved. This function only changes the assessment of
+    arithmetic evaluation signals.
     """
     expected_present = bool(expected and expected in body)
     baseline_has_expected = bool(expected and expected in (baseline_body or ""))
     payload_present = bool(payload and payload in body)
     non_error_status = status < 400
 
-    strong = bool(
+    contexts_found = evaluation_contexts(body, expected)
+    suspicious_contexts = [
+        ctx for ctx in contexts_found if suspicious_evaluation_context(ctx)
+    ]
+    clean_contexts = [
+        ctx for ctx in contexts_found if not suspicious_evaluation_context(ctx)
+    ]
+
+    # A result newly introduced in a successful response remains a useful
+    # forensic signal even when it is not strong enough for a finding.
+    evaluation_signal = bool(
         expected_present
         and not baseline_has_expected
         and not payload_present
         and non_error_status
     )
 
+    # v1.0.3 deliberately does NOT call a bare "49" a vulnerability.
+    # Arithmetic output must have a non-debug/non-dynamic context before it
+    # can be promoted. If no such context exists, manual verification remains
+    # mandatory.
+    strong = bool(
+        evaluation_signal
+        and clean_contexts
+        and not suspicious_contexts
+    )
+
+    manual_review = bool(evaluation_signal and not strong)
+
     return {
         "strong_evaluation_evidence": strong,
+        "evaluation_signal": evaluation_signal,
         "expected_result_present": expected_present,
         "expected_result_in_baseline": baseline_has_expected,
         "payload_absent_in_response": not payload_present,
         "non_error_status": non_error_status,
+        "evaluation_contexts": contexts_found,
+        "suspicious_evaluation_contexts": suspicious_contexts,
+        "clean_evaluation_contexts": clean_contexts,
+        "evaluation_requires_manual_review": manual_review,
+        "manual_review_reason": (
+            "Expected arithmetic result is newly introduced, but the "
+            "response context is not sufficient to prove server-side "
+            "evaluation; inspect the exact response location manually."
+            if manual_review else None
+        ),
     }
 
 
@@ -499,6 +568,7 @@ def assess(r: requests.Response, elapsed: float, p: Dict[str, Any], b: Dict[str,
         or body_changed
         or ch["challenge_detected"]
         or r.status_code >= 500
+        or evaluation["evaluation_requires_manual_review"]
     )
 
     return {
@@ -508,7 +578,7 @@ def assess(r: requests.Response, elapsed: float, p: Dict[str, Any], b: Dict[str,
         "signals": {
             "payload_reflected": reflected,
             "expression_evaluated": evaluated,
-            "evaluation_marker": expected if evaluated else None,
+            "evaluation_marker": expected if evaluation["evaluation_signal"] else None,
             **evaluation,
             "parser_error": bool(errors),
             "parser_error_signatures": errors,
@@ -519,6 +589,9 @@ def assess(r: requests.Response, elapsed: float, p: Dict[str, Any], b: Dict[str,
         },
         "evidence": {
             "reflection_contexts": contexts(body, p["payload"]),
+            "evaluation_contexts": evaluation["evaluation_contexts"],
+            "suspicious_evaluation_contexts": evaluation["suspicious_evaluation_contexts"],
+            "clean_evaluation_contexts": evaluation["clean_evaluation_contexts"],
             "baseline_status": br.get("status"),
             "baseline_body_hash": br.get("body_hash"),
             "baseline_body_sample": sample(br.get("body_sample", "")),
@@ -532,10 +605,16 @@ def assess(r: requests.Response, elapsed: float, p: Dict[str, Any], b: Dict[str,
             "reason": (
                 "Strong evidence of server-side expression evaluation."
                 if finding else
+                evaluation["manual_review_reason"]
+                if evaluation["evaluation_requires_manual_review"] else
                 "Forensic signal preserved for manual review."
                 if review else
                 "No relevant injection signal."
             ),
+            "manual_review": {
+                "required": bool(evaluation["evaluation_requires_manual_review"]),
+                "reason": evaluation["manual_review_reason"],
+            },
         },
     }
 
@@ -617,6 +696,8 @@ def artifact(project: str, sc: Dict[str, Any]) -> Dict[str, Any]:
             "parser_error_is_finding": False,
             "challenge_requires_strong_signal": True,
             "challenge_marker_alone_is_not_stop": True,
+            "arithmetic_result_context_required": True,
+            "arithmetic_signal_preserved_for_manual_review": True,
             "no_command_execution": True, "no_sql_injection": True,
             "no_xss": True, "no_path_traversal": True,
             "no_file_read_write_delete": True, "no_upload": True,
@@ -642,7 +723,7 @@ def artifact(project: str, sc: Dict[str, Any]) -> Dict[str, Any]:
             "status": "initialized", "started_at": None, "completed_at": None,
             "links": 0, "query_candidates": 0, "get_forms": 0,
             "candidates": 0, "tested": 0, "probes": 0, "reflected": 0,
-            "evaluation_signals": 0, "parser_errors": 0, "challenge": 0,
+            "evaluation_signals": 0, "evaluation_manual_review": 0, "parser_errors": 0, "challenge": 0,
             "http_errors": 0, "request_errors": 0, "findings": 0,
             "requires_review": 0,
         },
@@ -656,6 +737,9 @@ def artifact(project: str, sc: Dict[str, Any]) -> Dict[str, Any]:
             "A reflected arithmetic payload is not evidence of evaluation.",
             "HTTP 4xx/5xx responses cannot confirm automatic expression evaluation.",
             "Evaluation requires the expected result to be newly introduced, the payload to be absent, and a non-error response.",
+            "A newly introduced arithmetic result is preserved as an evaluation signal even when it is downgraded from finding to manual review.",
+            "Arithmetic results found only in Debugbar/Kint/dynamic instrumentation contexts are not automatic findings.",
+            "When an arithmetic evaluation signal is downgraded, its response contexts and manual-review reason remain in evidence.",
             "The detector intentionally favors false negatives over false positives.",
             "Generic CAPTCHA/reCAPTCHA/Turnstile markers alone do not stop probing.",
             "Only non-destructive expression/template/parser probes are used.",
@@ -738,6 +822,8 @@ def cmd_analyze(a):
             "arithmetic_result_alone_is_not_evidence": True,
             "reflected_arithmetic_payload_is_not_evidence": True,
             "http_error_cannot_confirm_evaluation": True,
+            "arithmetic_result_context_required": True,
+            "arithmetic_signal_preserved_for_manual_review": True,
         },
         "payloads": [{k: v for k, v in p.items() if k != "expected"} for p in PAYLOADS],
         "probe_records": records, "generated_at": now(),
@@ -750,6 +836,7 @@ def cmd_analyze(a):
         "tested": len(records), "probes": len(probes),
         "reflected": sum(p["signals"].get("payload_reflected", False) for p in probes),
         "evaluation_signals": sum(p["signals"].get("expression_evaluated", False) for p in probes),
+        "evaluation_manual_review": sum(p["signals"].get("evaluation_requires_manual_review", False) for p in probes),
         "parser_errors": sum(p["signals"].get("parser_error", False) for p in probes),
         "challenge": sum(p["signals"].get("challenge_detected", False) for p in probes),
         "http_errors": sum(p["signals"].get("http_error", False) for p in probes),
@@ -767,6 +854,7 @@ def cmd_analyze(a):
     print(f"[PASS] Probes    : {art['results']['probes']}")
     print(f"[PASS] Reflected : {art['results']['reflected']}")
     print(f"[PASS] Evaluated : {art['results']['evaluation_signals']}")
+    print(f"[PASS] Eval review: {art['results']['evaluation_manual_review']}")
     print(f"[PASS] Parser err: {art['results']['parser_errors']}")
     print(f"[PASS] Challenge : {art['results']['challenge']}")
     print(f"[PASS] HTTP error: {art['results']['http_errors']}")
@@ -848,6 +936,10 @@ def cmd_verify(a):
                 errors.append("Payload arithmetic yang ter-reflect tidak boleh menjadi evidence.")
             if m.get("http_error_cannot_confirm_evaluation") is not True:
                 errors.append("HTTP error tidak boleh mengonfirmasi evaluasi.")
+            if m.get("arithmetic_result_context_required") is not True:
+                errors.append("Konteks hasil aritmetika harus diwajibkan.")
+            if m.get("arithmetic_signal_preserved_for_manual_review") is not True:
+                errors.append("Signal aritmetika harus tetap dipertahankan untuk review manual.")
 
             candidates = art.get("candidates", [])
             if art.get("results", {}).get("candidates") != len(candidates):
