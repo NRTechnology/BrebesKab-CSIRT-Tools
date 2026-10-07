@@ -47,7 +47,7 @@ import yaml
 
 
 SCRIPT_NAME = "BrebesKab-CSIRT-Tools HTTP Parameter Pollution"
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.0.1"
 SCHEMA_VERSION = "1.0"
 CHECKLIST_ID = "7-006"
 CHECKLIST_NAME = "HTTP Parameter Pollution"
@@ -367,6 +367,7 @@ def request_snapshot(
     url: str,
     parameter: Optional[str] = None,
     value: Optional[str] = None,
+    include_body: bool = False,
 ) -> Dict[str, Any]:
     started = time.perf_counter()
     request_error = None
@@ -419,6 +420,7 @@ def request_snapshot(
         },
         "elapsed_ms": elapsed,
         "request_error": None,
+        **({"_body": body} if include_body else {}),
     }
 
 
@@ -521,12 +523,12 @@ def crawl_application(
 
         visited.add(current)
 
-        snapshot = request_snapshot(session, "GET", current)
+        snapshot = request_snapshot(session, "GET", current, include_body=True)
         if snapshot.get("request_error"):
             continue
 
         response = snapshot.get("response") or {}
-        body = response.get("body_sample", "")
+        body = snapshot.get("_body", response.get("body_sample", ""))
 
         links.append(current)
 
