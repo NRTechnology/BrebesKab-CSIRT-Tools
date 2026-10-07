@@ -2,7 +2,7 @@
 """
 BrebesKab-CSIRT-Tools - Authentication Brute-Force Protection
 
-Checklist: 7-001 Brute-Force / Rate-Limit Protection
+Checklist: 5-006 Brute-Force / Rate-Limit Protection
 
 Purpose
 -------
@@ -63,9 +63,9 @@ except ImportError as exc:  # pragma: no cover
 
 SCRIPT_VERSION = "1.0.0"
 SCHEMA_VERSION = "1.0"
-CHECKLIST_ID = "7-001"
+CHECKLIST_ID = "5-006"
 CHECKLIST_NAME = "Brute-Force / Rate-Limit Protection"
-PHASE = "07 Authentication"
+PHASE = "05 Authentication"
 DEFAULT_LOGIN_PATH = "/login"
 DEFAULT_TIMEOUT = 15
 DEFAULT_FAILED_ATTEMPTS = 5
@@ -74,7 +74,7 @@ DEFAULT_DELAY_SECONDS = 1.0
 MAX_DELAY_SECONDS = 10.0
 MAX_BODY_BYTES = 262144
 BODY_SAMPLE_CHARS = 4000
-USER_AGENT = "BrebesKab-CSIRT-Tools/7-001"
+USER_AGENT = "BrebesKab-CSIRT-Tools/5-006"
 
 HUMAN_INTERACTION_PATTERNS = [
     r"cloudflare turnstile",
@@ -254,7 +254,7 @@ def target_from_scope(scope: dict[str, Any]) -> dict[str, Any]:
 
 
 def artifact_dir(project_path: Path) -> Path:
-    return project_path / "07-authentication" / "bruteforce"
+    return project_path / "05-authentication" / "bruteforce"
 
 
 def artifact_file(project_path: Path) -> Path:
@@ -825,7 +825,7 @@ def initial_artifact(context: dict[str, Any], target: dict[str, Any]) -> dict[st
             "reason": "Belum dilakukan testing.",
         },
         "evidence": {
-            "path": "07-authentication/bruteforce/evidence/bruteforce-probes.json",
+            "path": "05-authentication/bruteforce/evidence/bruteforce-probes.json",
             "password_logged": False,
             "plaintext_password_persisted": False,
             "csrf_logged": False,
@@ -970,7 +970,7 @@ def cmd_analyze(account_id: str | None, attempts: int, timeout: int, delay: floa
         "reason": summary["stop_reason"],
     }
     data["evidence"] = {
-        "path": "07-authentication/bruteforce/evidence/bruteforce-probes.json",
+        "path": "05-authentication/bruteforce/evidence/bruteforce-probes.json",
         "password_logged": False,
         "plaintext_password_persisted": False,
         "csrf_logged": False,
@@ -1188,7 +1188,7 @@ def print_help() -> None:
     print(
         "BrebesKab-CSIRT-Tools - Brute-Force / Rate-Limit Protection\n\n"
         "Checklist:\n"
-        "  7-001 Brute-Force / Rate-Limit Protection\n\n"
+        "  5-006 Brute-Force / Rate-Limit Protection\n\n"
         "Usage:\n"
         "  python scripts/authentication/bruteforce.py version\n"
         "  python scripts/authentication/bruteforce.py init\n"
