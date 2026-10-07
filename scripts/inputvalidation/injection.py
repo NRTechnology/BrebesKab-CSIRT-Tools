@@ -25,7 +25,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 import requests
 import yaml
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.0.1"
 SCHEMA_VERSION = "1.0"
 CHECKLIST_ID = "7-005"
 CHECKLIST_NAME = "Expression / Template / Parser Injection"
@@ -316,8 +316,17 @@ def crawl(s: requests.Session, base: str) -> Tuple[List[str], List[Dict[str, Any
 
         for link in hrefs(r.text, url):
             link = normalize(link)
-            if same_origin(base, link) and link not in visited:
+
+            # External links may be recorded as discovered links, but they
+            # must never become probe candidates. The checklist is strictly
+            # same-origin and must not send authenticated probes to external
+            # destinations.
+            if not same_origin(base, link):
+                continue
+
+            if link not in visited:
                 queue.append((link, depth + 1))
+
             q = parse_qsl(urlparse(link).query, keep_blank_values=True)
             for name, value in q[:MAX_PARAMS_PER_URL]:
                 endpoint = urlunparse((urlparse(link).scheme, urlparse(link).netloc,
@@ -582,6 +591,7 @@ def artifact(project: str, sc: Dict[str, Any]) -> Dict[str, Any]:
             "Generic CAPTCHA/reCAPTCHA/Turnstile markers alone do not stop probing.",
             "Only non-destructive expression/template/parser probes are used.",
             "SQLi, XSS, Command Injection, and Path Traversal are covered by separate checklists.",
+            "External links are not probe candidates and are never tested.",
         ],
         "created_at": now(), "updated_at": now(),
     }
@@ -762,6 +772,13 @@ def cmd_verify(a):
             candidates = art.get("candidates", [])
             if art.get("results", {}).get("candidates") != len(candidates):
                 errors.append("Jumlah candidates tidak konsisten.")
+
+            target_url = art.get("target", {}).get("url", "")
+            for c in candidates:
+                cu = c.get("url", "")
+                if not target_url or not same_origin(target_url, cu):
+                    errors.append(f"External/non-same-origin candidate terdeteksi: {cu}")
+                    break
 
             ep = evidence_path(project)
             if art.get("results", {}).get("status") == "completed":
