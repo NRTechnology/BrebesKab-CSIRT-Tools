@@ -2,7 +2,7 @@
 """
 BrebesKab-CSIRT-Tools - Authentication Session Management
 
-Checklist: 5-002 Session Management
+Checklist: 7-003 Session Management
 Schema: 1.0
 
 Purpose:
@@ -72,10 +72,10 @@ except ImportError:
 
 SCRIPT_VERSION = "1.1.9"
 SCHEMA_VERSION = "1.0"
-CHECKLIST_ID = "5-002"
+CHECKLIST_ID = "7-003"
 CHECKLIST_NAME = "Session Management"
-PHASE_NAME = "05 Authentication"
-PHASE_DIR = "05-authentication"
+PHASE_NAME = "07 Authentication"
+PHASE_DIR = "07-authentication"
 SESSION_DIR = "session"
 SESSION_FILE = "session.yaml"
 EVIDENCE_DIR = "evidence"
@@ -377,7 +377,7 @@ def canonical_empty_artifact(context: ProjectContext) -> dict[str, Any]:
         },
         "evidence": {
             "session_probes": (
-                "05-authentication/session/evidence/session-probes.json"
+                "07-authentication/session/evidence/session-probes.json"
             ),
         },
         "errors": [],
@@ -4091,7 +4091,7 @@ def cmd_verify(_: argparse.Namespace) -> int:
 
     evidence = data.get("evidence") or {}
     if evidence.get("session_probes") != (
-        "05-authentication/session/evidence/session-probes.json"
+        "07-authentication/session/evidence/session-probes.json"
     ):
         raise SessionError("evidence.session_probes tidak canonical.")
 
