@@ -25,7 +25,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 import requests
 import yaml
 
-SCRIPT_VERSION = "1.0.1"
+SCRIPT_VERSION = "1.0.2"
 SCHEMA_VERSION = "1.0"
 CHECKLIST_ID = "7-005"
 CHECKLIST_NAME = "Expression / Template / Parser Injection"
@@ -402,6 +402,50 @@ def contexts(body: str, token: str) -> List[str]:
     return result
 
 
+def strong_expression_evidence(
+    body: str,
+    baseline_body: str,
+    payload: str,
+    expected: str | None,
+    status: int,
+) -> Dict[str, Any]:
+    """
+    Conservative automatic-evaluation detector.
+
+    The mere presence of the expected arithmetic result (e.g. "49")
+    is not evidence of evaluation because debug/error pages may contain
+    the same value for unrelated reasons.
+
+    Strong evidence requires ALL of:
+      1. arithmetic payload is known and expected result exists;
+      2. exact payload is absent from the response;
+      3. expected result was not already present in the baseline;
+      4. response is not an HTTP 4xx/5xx error;
+      5. the expected result is present in the response.
+
+    This intentionally favors false negatives over false positives.
+    """
+    expected_present = bool(expected and expected in body)
+    baseline_has_expected = bool(expected and expected in (baseline_body or ""))
+    payload_present = bool(payload and payload in body)
+    non_error_status = status < 400
+
+    strong = bool(
+        expected_present
+        and not baseline_has_expected
+        and not payload_present
+        and non_error_status
+    )
+
+    return {
+        "strong_evaluation_evidence": strong,
+        "expected_result_present": expected_present,
+        "expected_result_in_baseline": baseline_has_expected,
+        "payload_absent_in_response": not payload_present,
+        "non_error_status": non_error_status,
+    }
+
+
 def baseline(s: requests.Session, c: Dict[str, Any]) -> Dict[str, Any]:
     url = replace_param(c["url"], c["parameter"], c["original_value"])
     t = time.perf_counter()
@@ -431,12 +475,31 @@ def assess(r: requests.Response, elapsed: float, p: Dict[str, Any], b: Dict[str,
     ch = challenge(r, b.get("challenge_markers", []))
     reflected = p["payload"] in body
     expected = p.get("expected")
+    baseline_body = br.get("body_sample", "") or ""
+
     # Only the two known arithmetic probes can produce an automatic finding.
-    evaluated = p["id"] in {"expr-curly-49", "expr-dollar-49"} and bool(expected and expected in body)
+    # A bare "49" anywhere in the response is NOT sufficient: debug/error
+    # pages can contain unrelated occurrences of the same value.
+    evaluation = strong_expression_evidence(
+        body=body,
+        baseline_body=baseline_body,
+        payload=p["payload"],
+        expected=expected if p["id"] in {"expr-curly-49", "expr-dollar-49"} else None,
+        status=r.status_code,
+    )
+    evaluated = evaluation["strong_evaluation_evidence"]
+
     status_changed = br.get("status") is not None and r.status_code != br["status"]
     body_changed = br.get("body_hash") is not None and snap["body_hash"] != br["body_hash"]
     finding = evaluated
-    review = bool(reflected or errors or status_changed or body_changed or ch["challenge_detected"] or r.status_code >= 500)
+    review = bool(
+        reflected
+        or errors
+        or status_changed
+        or body_changed
+        or ch["challenge_detected"]
+        or r.status_code >= 500
+    )
 
     return {
         "payload_id": p["id"], "category": p["category"], "payload": p["payload"],
@@ -446,6 +509,7 @@ def assess(r: requests.Response, elapsed: float, p: Dict[str, Any], b: Dict[str,
             "payload_reflected": reflected,
             "expression_evaluated": evaluated,
             "evaluation_marker": expected if evaluated else None,
+            **evaluation,
             "parser_error": bool(errors),
             "parser_error_signatures": errors,
             **ch,
@@ -588,6 +652,11 @@ def artifact(project: str, sc: Dict[str, Any]) -> Dict[str, Any]:
             "HTTP 500 is forensic evidence, not a finding.",
             "Generic parser/template errors require manual verification.",
             "Automatic finding requires strong evidence of server-side expression evaluation.",
+            "A bare arithmetic result such as 49 is not evidence of evaluation.",
+            "A reflected arithmetic payload is not evidence of evaluation.",
+            "HTTP 4xx/5xx responses cannot confirm automatic expression evaluation.",
+            "Evaluation requires the expected result to be newly introduced, the payload to be absent, and a non-error response.",
+            "The detector intentionally favors false negatives over false positives.",
             "Generic CAPTCHA/reCAPTCHA/Turnstile markers alone do not stop probing.",
             "Only non-destructive expression/template/parser probes are used.",
             "SQLi, XSS, Command Injection, and Path Traversal are covered by separate checklists.",
@@ -666,6 +735,9 @@ def cmd_analyze(a):
             "non_destructive": True, "reflection_is_finding": False,
             "http_500_is_finding": False, "parser_error_is_finding": False,
             "challenge_marker_alone_is_stop": False, "strong_evaluation_required": True,
+            "arithmetic_result_alone_is_not_evidence": True,
+            "reflected_arithmetic_payload_is_not_evidence": True,
+            "http_error_cannot_confirm_evaluation": True,
         },
         "payloads": [{k: v for k, v in p.items() if k != "expected"} for p in PAYLOADS],
         "probe_records": records, "generated_at": now(),
@@ -768,6 +840,14 @@ def cmd_verify(a):
                 errors.append("HTTP 500 tidak boleh menjadi finding.")
             if m.get("parser_error_is_finding") is not False:
                 errors.append("Parser error tidak boleh menjadi finding.")
+            if m.get("strong_evaluation_required") is not True:
+                errors.append("Strong evaluation evidence harus diwajibkan.")
+            if m.get("arithmetic_result_alone_is_not_evidence") is not True:
+                errors.append("Hasil aritmetika saja tidak boleh menjadi evidence.")
+            if m.get("reflected_arithmetic_payload_is_not_evidence") is not True:
+                errors.append("Payload arithmetic yang ter-reflect tidak boleh menjadi evidence.")
+            if m.get("http_error_cannot_confirm_evaluation") is not True:
+                errors.append("HTTP error tidak boleh mengonfirmasi evaluasi.")
 
             candidates = art.get("candidates", [])
             if art.get("results", {}).get("candidates") != len(candidates):
