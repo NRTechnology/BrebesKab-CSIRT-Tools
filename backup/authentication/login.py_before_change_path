@@ -2,7 +2,7 @@
 """
 BrebesKab-CSIRT-Tools - Authentication Login
 
-Checklist: 7-001 Authentication Login
+Checklist: 5-001 Authentication Login
 
 Purpose
 -------
@@ -60,18 +60,18 @@ except ImportError:  # pragma: no cover
     PlaywrightTimeoutError = Exception
 
 
-SCRIPT_VERSION = "1.0.6"
+SCRIPT_VERSION = "1.0.5"
 SCHEMA_VERSION = "1.0"
-CHECKLIST_ID = "7-001"
+CHECKLIST_ID = "5-001"
 CHECKLIST_NAME = "Authentication Login"
-PHASE = "07 Authentication"
+PHASE = "05 Authentication"
 DEFAULT_LOGIN_PATH = "/login"
 DEFAULT_FAILED_ATTEMPTS = 5
 DEFAULT_TIMEOUT = 15
 MAX_FAILED_ATTEMPTS = 5
 MAX_BODY_BYTES = 262144
 BODY_SAMPLE_CHARS = 4000
-USER_AGENT = "BrebesKab-CSIRT-Tools/7-001"
+USER_AGENT = "BrebesKab-CSIRT-Tools/5-001"
 
 # Preparation account.py is the authoritative owner of the test-account
 # registry and credential decryption. Do not duplicate its YAML/encryption
@@ -241,7 +241,7 @@ def account_file(project_path: Path) -> Path:
 
 
 def artifact_dir(project_path: Path) -> Path:
-    return project_path / "07-authentication" / "login"
+    return project_path / "05-authentication" / "login"
 
 
 def artifact_file(project_path: Path) -> Path:
@@ -1104,7 +1104,7 @@ def initial_artifact(context: dict[str, Any], target: dict[str, Any]) -> dict[st
             "note": "No authentication finding is asserted automatically.",
         },
         "evidence": {
-            "login_probes": "07-authentication/login/evidence/login-probes.json",
+            "login_probes": "05-authentication/login/evidence/login-probes.json",
         },
         "errors": [],
         "notes": [
@@ -1809,7 +1809,7 @@ def print_help() -> None:
         "BrebesKab-CSIRT-Tools - Authentication Login\n"
         "\n"
         "Checklist:\n"
-        "  7-001 Authentication Login\n"
+        "  5-001 Authentication Login\n"
         "\n"
         "Usage:\n"
         "  python scripts/authentication/login.py version\n"
