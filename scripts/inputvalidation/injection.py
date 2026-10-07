@@ -3,7 +3,7 @@
 """
 BrebesKab-CSIRT-Tools
 Checklist 7-005 - Expression / Template / Parser Injection
-Version 1.0.6
+Version 1.0.7
 
 GET-only, same-origin, authenticated, non-destructive.
 Does NOT test SQLi, XSS, command injection, or path traversal.
@@ -26,7 +26,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 import requests
 import yaml
 
-SCRIPT_VERSION = "1.0.6"
+SCRIPT_VERSION = "1.0.7"
 SCHEMA_VERSION = "1.0"
 CHECKLIST_ID = "7-005"
 CHECKLIST_NAME = "Expression / Template / Parser Injection"
@@ -755,6 +755,10 @@ def artifact(project: str, sc: Dict[str, Any]) -> Dict[str, Any]:
             "parser_error_is_finding": False,
             "challenge_requires_strong_signal": True,
             "challenge_marker_alone_is_not_stop": True,
+            "strong_evaluation_required": True,
+            "arithmetic_result_alone_is_not_evidence": True,
+            "reflected_arithmetic_payload_is_not_evidence": True,
+            "http_error_cannot_confirm_evaluation": True,
             "arithmetic_result_context_required": True,
             "arithmetic_signal_preserved_for_manual_review": True,
             "evaluation_requires_parameter_context": True,
