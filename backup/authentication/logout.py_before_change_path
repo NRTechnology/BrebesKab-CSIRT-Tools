@@ -2,7 +2,7 @@
 """
 BrebesKab-CSIRT-Tools - Authentication Logout / Session Invalidation
 
-Checklist: 7-004 Logout / Session Invalidation
+Checklist: 5-003 Logout / Session Invalidation
 Schema: 1.0
 
 Purpose:
@@ -10,7 +10,7 @@ Purpose:
     logout and that the old authenticated session cannot be reused afterward.
 
 Security model:
-    - Uses only an explicitly authorized SUCCESS session from 7-003.
+    - Uses only an explicitly authorized SUCCESS session from 5-002.
     - Decrypts the session value only in memory using the canonical project secrets API.
     - Never stores or prints plaintext session values.
     - Performs one bounded authenticated request, one logout request, and one
@@ -63,10 +63,10 @@ except ImportError:
 
 SCRIPT_VERSION = "1.0.4"
 SCHEMA_VERSION = "1.0"
-CHECKLIST_ID = "7-004"
+CHECKLIST_ID = "5-003"
 CHECKLIST_NAME = "Logout / Session Invalidation"
-PHASE_NAME = "07 Authentication"
-PHASE_DIR = "07-authentication"
+PHASE_NAME = "05 Authentication"
+PHASE_DIR = "05-authentication"
 LOGOUT_DIR = "logout"
 LOGOUT_FILE = "logout.yaml"
 EVIDENCE_DIR = "evidence"
@@ -264,7 +264,7 @@ def empty_artifact() -> dict[str, Any]:
         "methodology": {
             "description": (
                 "Controlled logout and session-invalidation assessment using "
-                "an explicitly authorized SUCCESS session from 7-003."
+                "an explicitly authorized SUCCESS session from 5-002."
             ),
             "authorized_test_session_only": True,
             "session_secret_encryption": "project Fernet key via scripts/secrets.py",
@@ -285,10 +285,10 @@ def empty_artifact() -> dict[str, Any]:
             },
         },
         "baseline": {
-            "session_source": "07-authentication/session/session.yaml",
+            "session_source": "05-authentication/session/session.yaml",
             "scope_source": "01-preparation/scope/scope.yaml",
             "encryption_key_source": ".runtime/secrets/<PROJECT-ID>/encryption.key",
-            "authentication_source_checklist": "7-003 Session Management",
+            "authentication_source_checklist": "5-002 Session Management",
         },
         "toolchain": {
             "mandatory": [
@@ -359,7 +359,7 @@ def empty_artifact() -> dict[str, Any]:
             "note": "Logout assessment belum dijalankan.",
         },
         "evidence": {
-            "logout_probes": "07-authentication/logout/evidence/logout-probes.json",
+            "logout_probes": "05-authentication/logout/evidence/logout-probes.json",
         },
         "errors": [],
         "notes": [
@@ -503,7 +503,7 @@ def ensure_project_match(data: dict[str, Any]) -> ProjectContext:
 def load_session_artifact() -> dict[str, Any]:
     path = project_root() / PHASE_DIR / "session" / "session.yaml"
     if not path.exists():
-        raise LogoutError(f"Session artifact 7-003 tidak ditemukan: {path}")
+        raise LogoutError(f"Session artifact 5-002 tidak ditemukan: {path}")
     raw = load_yaml(path)
     if raw.get("project_id") != active_context().project_id:
         raise LogoutError("project_id pada session.yaml tidak sesuai active project.")
@@ -584,7 +584,7 @@ def build_session(record: dict[str, Any]) -> requests.Session:
     auth = record["authentication"]
     value = decrypt_session_value(str(auth["value_encrypted"]))
     s = requests.Session()
-    s.headers.update({"User-Agent": "BrebesKab-CSIRT-Tools/7-004"})
+    s.headers.update({"User-Agent": "BrebesKab-CSIRT-Tools/5-003"})
     hostname = str((record.get("target") or {}).get("hostname") or "")
     s.cookies.set(
         str(auth["name"]),
