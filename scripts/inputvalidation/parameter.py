@@ -1237,16 +1237,14 @@ def verify() -> bool:
     if target.get("hostname") != host_from_url(target.get("url", "")):
         failures.append("Hostname target tidak sesuai URL.")
 
+    # Methodology flags are validated according to their intended semantics.
+    # Some controls must explicitly remain false because the tool is
+    # deliberately conservative: duplicate acceptance, response changes,
+    # HTTP errors, and first/last-wins behavior are evidence/manual-review
+    # signals, not automatic HPP findings.
     required_true = [
         "same_origin_only",
-        "redirect_following",
         "non_destructive",
-        "duplicate_parameter_is_finding",
-        "response_change_is_finding",
-        "http_500_is_finding",
-        "http_error_is_finding",
-        "first_wins_is_finding",
-        "last_wins_is_finding",
         "order_sensitivity_requires_manual_review",
         "security_impact_required_for_finding",
         "protected_parameter_context_is_not_automatic_finding",
@@ -1262,9 +1260,24 @@ def verify() -> bool:
         "no_external_callbacks",
         "no_credential_harvesting",
     ]
+
+    required_false = [
+        "redirect_following",
+        "duplicate_parameter_is_finding",
+        "response_change_is_finding",
+        "http_500_is_finding",
+        "http_error_is_finding",
+        "first_wins_is_finding",
+        "last_wins_is_finding",
+    ]
+
     for key in required_true:
         if method.get(key) is not True:
             failures.append(f"Methodology {key} harus true.")
+
+    for key in required_false:
+        if method.get(key) is not False:
+            failures.append(f"Methodology {key} harus false.")
 
     if method.get("http_methods") != ["GET"]:
         failures.append("HTTP methods harus GET saja.")
