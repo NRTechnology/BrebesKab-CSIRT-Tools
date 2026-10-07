@@ -60,7 +60,7 @@ except ImportError:  # pragma: no cover
     PlaywrightTimeoutError = Exception
 
 
-SCRIPT_VERSION = "1.0.7"
+SCRIPT_VERSION = "1.0.8"
 SCHEMA_VERSION = "1.0"
 CHECKLIST_ID = "7-002"
 CHECKLIST_NAME = "Authentication Login"
@@ -1128,6 +1128,7 @@ def cmd_version() -> int:
     print(f"Schema   : {SCHEMA_VERSION}")
     print("Method   : authorized test account + bounded failed-login attempts")
     print("Browser  : Playwright Chromium emulator handoff on human interaction; no bypass")
+    print("Prefill  : authorized test username/password auto-filled in browser; secrets never logged")
     print("Limit    : maximum 5 failed attempts per account")
     print("Debug    : --debug-request shows safe prepared request mapping; secrets redacted")
     print("Audit    : --request-audit-only prepares request without sending authentication")
@@ -1210,17 +1211,103 @@ def get_login_page(session: requests.Session, login_url: str, timeout: int) -> d
     }
 
 
+def _xpath_literal(value: str) -> str:
+    """Return a safe XPath string literal for arbitrary field names."""
+    if "'" not in value:
+        return f"'{value}'"
+    if '"' not in value:
+        return f'"{value}"'
+    parts = value.split("'")
+    return "concat(" + ", \"'\", ".join(f"'{part}'" for part in parts) + ")"
+
+
+def _browser_fill_field(page: Any, field_name: str, value: str) -> bool:
+    """Fill one input field by its HTML name without logging the value."""
+    name = str(field_name or "").strip()
+    if not name:
+        return False
+
+    try:
+        locator = page.locator(f"//input[@name={_xpath_literal(name)}]").first
+        if locator.count() == 0 or not locator.is_visible():
+            return False
+        locator.fill(value)
+        return True
+    except Exception:
+        return False
+
+
+def _prefill_browser_credentials(
+    page: Any,
+    form: dict[str, Any] | None,
+    username: str,
+    password: str,
+) -> dict[str, Any]:
+    """Prefill authorized credentials in the browser only.
+
+    The credentials remain in memory and are never returned in the result,
+    printed, or written to evidence.
+    """
+    form = form or {}
+    username_field = str(form.get("username_field") or "").strip()
+    password_field = str(form.get("password_field") or "").strip()
+
+    username_filled = _browser_fill_field(page, username_field, username)
+    password_filled = _browser_fill_field(page, password_field, password)
+
+    # Conservative fallbacks for pages where the discovered form metadata
+    # is incomplete but the DOM still exposes standard input types.
+    if not username_filled:
+        try:
+            candidates = page.locator(
+                'input[type="text"], input[type="email"], input[type="tel"], input:not([type])'
+            )
+            for index in range(candidates.count()):
+                candidate = candidates.nth(index)
+                if candidate.is_visible() and candidate.is_editable():
+                    candidate.fill(username)
+                    username_filled = True
+                    break
+        except Exception:
+            pass
+
+    if not password_filled:
+        try:
+            candidate = page.locator('input[type="password"]').first
+            if candidate.count() > 0 and candidate.is_visible() and candidate.is_editable():
+                candidate.fill(password)
+                password_filled = True
+        except Exception:
+            pass
+
+    return {
+        "username_field": username_field,
+        "password_field": password_field,
+        "username_prefilled": username_filled,
+        "password_prefilled": password_filled,
+        "credentials_prefilled": bool(username_filled and password_filled),
+        "credential_values_logged": False,
+    }
+
+
 def playwright_human_interaction(
     login_url: str,
     timeout: int,
     interactive: bool = False,
+    form: dict[str, Any] | None = None,
+    username: str = "",
+    password: str = "",
+    account_id_value: str = "",
 ) -> dict[str, Any]:
     """Detect/render human interaction without solving or bypassing it.
 
-    When interactive=True, Chromium is launched in headed/emulated-browser mode
-    so an assessor can inspect or manually complete the legitimate human
-    interaction challenge. The script never attempts to solve/bypass the
-    challenge programmatically.
+    When a human-interaction challenge is detected, Chromium is opened in
+    headed/emulated-browser mode. Authorized username/password values are
+    automatically prefilled into the login form, but the challenge itself is
+    never solved or bypassed programmatically.
+
+    The browser remains open until the assessor presses ENTER in the terminal.
+    No credential values are returned, printed, or written to evidence.
     """
     if sync_playwright is None:
         return {
@@ -1228,6 +1315,7 @@ def playwright_human_interaction(
             "human_interaction_required": None,
             "classification": "playwright-unavailable",
             "browser_mode": "unavailable",
+            "credentials_prefilled": False,
             "error": "Playwright tidak tersedia.",
         }
 
@@ -1240,16 +1328,21 @@ def playwright_human_interaction(
         "classification": "no-human-challenge-observed",
         "browser_mode": "headless-detection",
         "manual_interaction": False,
+        "credentials_prefilled": False,
+        "username_prefilled": False,
+        "password_prefilled": False,
+        "credential_values_logged": False,
+        "account_id": str(account_id_value or ""),
         "error": "",
     }
 
     browser = None
     try:
         with sync_playwright() as pw:
-            launch_kwargs: dict[str, Any] = {
-                "headless": not interactive,
-            }
-            browser = pw.chromium.launch(**launch_kwargs)
+            # If requests already detected the challenge, go directly to the
+            # visible browser handoff. Otherwise perform a headless detection
+            # first and only open a visible browser when a challenge appears.
+            browser = pw.chromium.launch(headless=not interactive)
             page = browser.new_page(
                 viewport={"width": 1366, "height": 900},
                 user_agent=USER_AGENT,
@@ -1271,8 +1364,8 @@ def playwright_human_interaction(
                 'iframe[src*="challenges.cloudflare.com"]',
                 'iframe[src*="turnstile"]',
                 '[name="cf-turnstile-response"]',
-                '.cf-turnstile',
-                '[data-sitekey]',
+                ".cf-turnstile",
+                "[data-sitekey]",
             ]
             visible = False
             for selector in selectors:
@@ -1285,25 +1378,78 @@ def playwright_human_interaction(
                     continue
 
             result["challenge_visible"] = visible
-            if result["human_interaction_required"] or visible:
+            challenge = bool(result["human_interaction_required"] or visible)
+
+            if challenge:
                 result["human_interaction_required"] = True
                 result["classification"] = "human-interaction-required"
 
-                if interactive:
+                if not interactive:
+                    # The first browser was headless. Close it and hand off to
+                    # a visible Chromium emulator only after challenge detection.
+                    browser.close()
+                    browser = pw.chromium.launch(headless=False)
+                    page = browser.new_page(
+                        viewport={"width": 1366, "height": 900},
+                        user_agent=USER_AGENT,
+                    )
+                    page.goto(
+                        login_url,
+                        wait_until="domcontentloaded",
+                        timeout=timeout * 1000,
+                    )
+                    page.wait_for_timeout(1000)
+
+                    # Re-check the visible browser DOM because the challenge
+                    # may be dynamically rendered by Cloudflare/JavaScript.
+                    html = page.content()
+                    detected = detect_turnstile_html(html)
+                    result.update(
+                        {
+                            "human_interaction_required": (
+                                detected["human_interaction_detected"]
+                                or result["human_interaction_required"]
+                            ),
+                            "turnstile_detected": (
+                                detected["cloudflare_turnstile_detected"]
+                                or result["turnstile_detected"]
+                            ),
+                            "captcha_detected": (
+                                detected["captcha_detected"]
+                                or result["captcha_detected"]
+                            ),
+                        }
+                    )
                     result["browser_mode"] = "headed-browser-emulator"
-                    result["manual_interaction"] = True
-                    print("[INFO] Human interaction terdeteksi.")
-                    print("[INFO] Berpindah ke browser emulator Chromium.")
-                    print("[INFO] Challenge tidak dibypass atau diselesaikan secara otomatis.")
-                    print("[INFO] Silakan lakukan interaksi yang diperlukan secara manual.")
-                    print("[INFO] Setelah selesai, kembali ke terminal lalu tekan ENTER.")
-                    try:
-                        input()
-                    except EOFError:
-                        pass
-                    result["manual_interaction_completed"] = True
                 else:
-                    result["browser_mode"] = "headless-detection"
+                    result["browser_mode"] = "headed-browser-emulator"
+
+                # Prefill only the explicitly authorized account credentials.
+                # This is form filling, not challenge solving or bypass.
+                prefill = _prefill_browser_credentials(
+                    page,
+                    form,
+                    username,
+                    password,
+                )
+                result.update(prefill)
+
+                print("[INFO] Human interaction terdeteksi.")
+                print("[INFO] Berpindah ke browser emulator Chromium.")
+                if result["credentials_prefilled"]:
+                    print("[INFO] Username dan password test account otomatis dimasukkan.")
+                else:
+                    print("[WARN] Username/password belum seluruhnya dapat dipetakan ke form browser.")
+                print("[INFO] Challenge tidak dibypass atau diselesaikan secara otomatis.")
+                print("[INFO] Silakan lakukan interaksi yang diperlukan secara manual.")
+                print("[INFO] Setelah selesai, kembali ke terminal lalu tekan ENTER.")
+
+                result["manual_interaction"] = True
+                try:
+                    input()
+                except EOFError:
+                    pass
+                result["manual_interaction_completed"] = True
 
             browser.close()
             browser = None
@@ -1317,6 +1463,7 @@ def playwright_human_interaction(
             except Exception:
                 pass
 
+    # Never expose the actual credential values through the returned object.
     return result
 
 
@@ -1411,13 +1558,27 @@ def cmd_analyze(account_id_value: str | None, failed_attempts: int, timeout: int
 
     session = build_session()
     login_page = get_login_page(session, login_url, timeout)
+
+    # Resolve the first selected authorized account in memory so that if the
+    # browser-side probe discovers a dynamically rendered challenge, the
+    # visible Chromium handoff can still prefill the same authorized account.
+    # The password is cleared immediately after the browser handoff.
+    browser_account = accounts[0]
+    browser_account_id = account_id(browser_account)
+    browser_username, browser_password = resolve_account_credentials(browser_account)
+
     browser = playwright_human_interaction(
         login_url,
         timeout,
         interactive=bool(
             login_page.get("human_interaction", {}).get("human_interaction_detected")
         ),
+        form=login_page.get("form") or {},
+        username=browser_username,
+        password=browser_password,
+        account_id_value=browser_account_id,
     )
+    browser_password = ""
 
     evidence: list[dict[str, Any]] = [
         {
@@ -1884,6 +2045,7 @@ def print_help() -> None:
         "  - Failed-login testing uses one generated wrong password and max 5 attempts/account.\n"
         "  - No password wordlist, password spraying, username enumeration, or unrestricted brute force.\n"
         "  - Cloudflare Turnstile/CAPTCHA is detected but never bypassed; when detected, Chromium browser emulator is opened for manual interaction.\n"
+        "  - The selected authorized test account username/password is auto-filled in the browser; credential values are never logged or persisted.\n"
         "  - Human interaction requirement stops automated login testing and is PASS for anti-automation.\n"
         "  - --request-audit-only prepares the login request but never sends the authentication request.\n"
         "  - Raw evidence is retained without passwords; report redaction remains a separate layer.\n"
