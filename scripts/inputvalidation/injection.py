@@ -3,7 +3,7 @@
 """
 BrebesKab-CSIRT-Tools
 Checklist 7-005 - Expression / Template / Parser Injection
-Version 1.0.3
+Version 1.0.6
 
 GET-only, same-origin, authenticated, non-destructive.
 Does NOT test SQLi, XSS, command injection, or path traversal.
@@ -26,7 +26,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 import requests
 import yaml
 
-SCRIPT_VERSION = "1.0.3"
+SCRIPT_VERSION = "1.0.6"
 SCHEMA_VERSION = "1.0"
 CHECKLIST_ID = "7-005"
 CHECKLIST_NAME = "Expression / Template / Parser Injection"
@@ -410,30 +410,67 @@ def evaluation_contexts(body: str, expected: str | None) -> List[str]:
     return contexts(body, expected)
 
 
-def suspicious_evaluation_context(context: str) -> bool:
+def parameter_contexts(
+    contexts_found: List[str],
+    parameter: str,
+) -> List[str]:
     """
-    Detect contexts that are commonly unrelated to application evaluation.
+    Keep only response contexts that are structurally tied to the parameter
+    currently being tested.
 
-    This is intentionally conservative. A suspicious context does NOT delete
-    the signal; it only prevents that signal from becoming an automatic
-    finding and keeps it available for manual verification.
+    A numeric result found elsewhere in the response is intentionally not
+    allowed to become automatic expression-evaluation evidence. This removes
+    the previous out-of-context detector behavior while preserving the raw
+    arithmetic signal for manual review.
+
+    The context must contain a direct HTML/DOM-style reference to the tested
+    parameter, such as:
+      name="keyword"
+      id="keyword"
+      data-keyword="..."
+      name='keyword'
     """
-    c = (context or "").lower()
+    if not parameter:
+        return []
 
-    # CodeIgniter/debugbar/Kint and browser-side dynamic instrumentation can
-    # contain arbitrary numeric values, timestamps, counters, etc.
-    suspicious = (
-        "debugbar" in c
-        or "kint" in c
-        or "debug-view" in c
-        or "debug_view" in c
-        or "data-time=" in c
-        or "microtime" in c
-        or "window.kint" in c
-        or "kintrich" in c
-        or "debugbar_loader" in c
+    p = re.escape(str(parameter))
+    patterns = (
+        rf'\bname\s*=\s*["\']{p}["\']',
+        rf'\bid\s*=\s*["\'][^"\']*\b{p}\b[^"\']*["\']',
+        rf'\bdata-{p}\b',
+        rf'\bdata-[a-z0-9_-]+\s*=\s*["\'][^"\']*\b{p}\b[^"\']*["\']',
     )
-    return suspicious
+
+    result = []
+    for context in contexts_found:
+        c = context or ""
+        if any(re.search(pattern, c, re.I) for pattern in patterns):
+            result.append(c)
+
+    return result
+
+
+def protected_parameter(parameter: str) -> bool:
+    """
+    Parameters that are normally security/session/instrumentation values are
+    never treated as automatic expression-evaluation context.
+
+    Their arithmetic signals are still preserved as forensic/manual-review
+    notes.
+    """
+    n = (parameter or "").lower()
+    protected_tokens = (
+        "csrf",
+        "token",
+        "nonce",
+        "session",
+        "cookie",
+        "signature",
+        "sig",
+        "hash",
+        "auth",
+    )
+    return any(token in n for token in protected_tokens)
 
 
 def strong_expression_evidence(
@@ -442,23 +479,24 @@ def strong_expression_evidence(
     payload: str,
     expected: str | None,
     status: int,
+    parameter: str = "",
 ) -> Dict[str, Any]:
     """
     Conservative automatic-evaluation detector.
 
     IMPORTANT:
     A newly introduced arithmetic result such as "49" is preserved as a
-    forensic signal, but it is not automatically promoted to a finding when
-    the result may originate from debugbar/Kint/dynamic page content.
+    forensic signal, but a result found elsewhere in the response is NOT
+    allowed to become a finding.
 
-    The detector therefore separates:
-      - evaluation_signal: expected result is newly observed;
-      - strong_evaluation_evidence: enough evidence remains after excluding
-        clearly unrelated debug/dynamic contexts;
-      - manual_review: the signal should be checked manually.
+    Automatic expression-evaluation evidence requires the expected result to
+    appear inside a response context structurally tied to the parameter being
+    tested. Generic page-wide occurrences, CSRF/session/token values,
+    Debugbar/Kint output, timestamps, counters, and unrelated response
+    content remain manual-review signals only.
 
     Existing payloads, crawl behavior, request behavior, and evidence are
-    intentionally preserved. This function only changes the assessment of
+    intentionally preserved. This function only narrows the assessment of
     arithmetic evaluation signals.
     """
     expected_present = bool(expected and expected in body)
@@ -467,15 +505,16 @@ def strong_expression_evidence(
     non_error_status = status < 400
 
     contexts_found = evaluation_contexts(body, expected)
-    suspicious_contexts = [
-        ctx for ctx in contexts_found if suspicious_evaluation_context(ctx)
-    ]
-    clean_contexts = [
-        ctx for ctx in contexts_found if not suspicious_evaluation_context(ctx)
+    contextual_contexts = parameter_contexts(contexts_found, parameter)
+    out_of_context_contexts = [
+        ctx for ctx in contexts_found if ctx not in contextual_contexts
     ]
 
-    # A result newly introduced in a successful response remains a useful
-    # forensic signal even when it is not strong enough for a finding.
+    protected = protected_parameter(parameter)
+
+    # Preserve the arithmetic signal for forensic/manual review, but do not
+    # promote it to a finding merely because the expected number appeared
+    # somewhere in a successful response.
     evaluation_signal = bool(
         expected_present
         and not baseline_has_expected
@@ -483,35 +522,52 @@ def strong_expression_evidence(
         and non_error_status
     )
 
-    # v1.0.3 deliberately does NOT call a bare "49" a vulnerability.
-    # Arithmetic output must have a non-debug/non-dynamic context before it
-    # can be promoted. If no such context exists, manual verification remains
-    # mandatory.
-    strong = bool(
+    # Automatic finding is now strictly context-bound.
+    # Security/session/token parameters are explicitly excluded from automatic
+    # evaluation even if their name happens to occur near the expected value.
+    contextual_evidence = bool(
         evaluation_signal
-        and clean_contexts
-        and not suspicious_contexts
+        and contextual_contexts
+        and not protected
     )
 
-    manual_review = bool(evaluation_signal and not strong)
+    manual_review = bool(evaluation_signal and not contextual_evidence)
+
+    if manual_review:
+        if protected:
+            manual_reason = (
+                "Expected arithmetic result was newly introduced, but the "
+                "tested parameter is a security/session/token-style parameter; "
+                "automatic evaluation is disabled and manual verification is required."
+            )
+        elif not contextual_contexts:
+            manual_reason = (
+                "Expected arithmetic result was newly introduced, but no response "
+                "context structurally tied to the tested parameter was found; "
+                "the arithmetic signal is preserved for manual verification."
+            )
+        else:
+            manual_reason = (
+                "Expected arithmetic result was newly introduced, but the "
+                "context does not satisfy automatic evaluation requirements; "
+                "inspect the exact response location manually."
+            )
+    else:
+        manual_reason = None
 
     return {
-        "strong_evaluation_evidence": strong,
+        "strong_evaluation_evidence": contextual_evidence,
         "evaluation_signal": evaluation_signal,
         "expected_result_present": expected_present,
         "expected_result_in_baseline": baseline_has_expected,
         "payload_absent_in_response": not payload_present,
         "non_error_status": non_error_status,
         "evaluation_contexts": contexts_found,
-        "suspicious_evaluation_contexts": suspicious_contexts,
-        "clean_evaluation_contexts": clean_contexts,
+        "contextual_evaluation_contexts": contextual_contexts,
+        "out_of_context_evaluation_contexts": out_of_context_contexts,
+        "protected_parameter_context": protected,
         "evaluation_requires_manual_review": manual_review,
-        "manual_review_reason": (
-            "Expected arithmetic result is newly introduced, but the "
-            "response context is not sufficient to prove server-side "
-            "evaluation; inspect the exact response location manually."
-            if manual_review else None
-        ),
+        "manual_review_reason": manual_reason,
     }
 
 
@@ -555,6 +611,7 @@ def assess(r: requests.Response, elapsed: float, p: Dict[str, Any], b: Dict[str,
         payload=p["payload"],
         expected=expected if p["id"] in {"expr-curly-49", "expr-dollar-49"} else None,
         status=r.status_code,
+        parameter=p.get("_parameter", ""),
     )
     evaluated = evaluation["strong_evaluation_evidence"]
 
@@ -590,8 +647,8 @@ def assess(r: requests.Response, elapsed: float, p: Dict[str, Any], b: Dict[str,
         "evidence": {
             "reflection_contexts": contexts(body, p["payload"]),
             "evaluation_contexts": evaluation["evaluation_contexts"],
-            "suspicious_evaluation_contexts": evaluation["suspicious_evaluation_contexts"],
-            "clean_evaluation_contexts": evaluation["clean_evaluation_contexts"],
+            "out_of_context_evaluation_contexts": evaluation["out_of_context_evaluation_contexts"],
+            "contextual_evaluation_contexts": evaluation["contextual_evaluation_contexts"],
             "baseline_status": br.get("status"),
             "baseline_body_hash": br.get("body_hash"),
             "baseline_body_sample": sample(br.get("body_sample", "")),
@@ -637,7 +694,9 @@ def analyze_candidate(s: requests.Session, c: Dict[str, Any]) -> Dict[str, Any]:
         try:
             r = s.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=False)
             elapsed = round((time.perf_counter() - t) * 1000, 2)
-            item = assess(r, elapsed, p, b)
+            p_probe = dict(p)
+            p_probe["_parameter"] = c["parameter"]
+            item = assess(r, elapsed, p_probe, b)
             item["request"].update({
                 "url": url,
                 "parameter": c["parameter"],
@@ -698,6 +757,8 @@ def artifact(project: str, sc: Dict[str, Any]) -> Dict[str, Any]:
             "challenge_marker_alone_is_not_stop": True,
             "arithmetic_result_context_required": True,
             "arithmetic_signal_preserved_for_manual_review": True,
+            "evaluation_requires_parameter_context": True,
+            "security_token_context_is_not_automatic_evidence": True,
             "no_command_execution": True, "no_sql_injection": True,
             "no_xss": True, "no_path_traversal": True,
             "no_file_read_write_delete": True, "no_upload": True,
@@ -738,7 +799,8 @@ def artifact(project: str, sc: Dict[str, Any]) -> Dict[str, Any]:
             "HTTP 4xx/5xx responses cannot confirm automatic expression evaluation.",
             "Evaluation requires the expected result to be newly introduced, the payload to be absent, and a non-error response.",
             "A newly introduced arithmetic result is preserved as an evaluation signal even when it is downgraded from finding to manual review.",
-            "Arithmetic results found only in Debugbar/Kint/dynamic instrumentation contexts are not automatic findings.",
+            "Arithmetic results found outside the tested parameter context are not automatic findings.",
+            "Security/session/token-style parameters are not automatic expression-evaluation contexts.",
             "When an arithmetic evaluation signal is downgraded, its response contexts and manual-review reason remain in evidence.",
             "The detector intentionally favors false negatives over false positives.",
             "Generic CAPTCHA/reCAPTCHA/Turnstile markers alone do not stop probing.",
@@ -824,6 +886,8 @@ def cmd_analyze(a):
             "http_error_cannot_confirm_evaluation": True,
             "arithmetic_result_context_required": True,
             "arithmetic_signal_preserved_for_manual_review": True,
+            "evaluation_requires_parameter_context": True,
+            "security_token_context_is_not_automatic_evidence": True,
         },
         "payloads": [{k: v for k, v in p.items() if k != "expected"} for p in PAYLOADS],
         "probe_records": records, "generated_at": now(),
@@ -940,6 +1004,10 @@ def cmd_verify(a):
                 errors.append("Konteks hasil aritmetika harus diwajibkan.")
             if m.get("arithmetic_signal_preserved_for_manual_review") is not True:
                 errors.append("Signal aritmetika harus tetap dipertahankan untuk review manual.")
+            if m.get("evaluation_requires_parameter_context") is not True:
+                errors.append("Evaluation harus membutuhkan parameter context.")
+            if m.get("security_token_context_is_not_automatic_evidence") is not True:
+                errors.append("Security/session/token context tidak boleh menjadi automatic evidence.")
 
             candidates = art.get("candidates", [])
             if art.get("results", {}).get("candidates") != len(candidates):
