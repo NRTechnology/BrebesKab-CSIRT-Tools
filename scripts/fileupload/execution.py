@@ -55,7 +55,7 @@ except ImportError as exc:
 
 
 SCRIPT_NAME = "execution.py"
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.0.1"
 CHECKLIST_ID = "10-002"
 CHECKLIST_NAME = "File Upload Extension Validation"
 PHASE_NAME = "10 File Upload"
@@ -199,12 +199,18 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat()
 
 
+def active_context() -> Any:
+    return load_active_context()
+
+
+def project_root() -> Path:
+    return Path(get_active_project_path()).resolve()
+
+
 def project_context() -> Tuple[Any, Path, str]:
-    context = load_active_context()
-    project_path = Path(get_active_project_path(context))
+    context = active_context()
+    project_path = project_root()
     project_id = str(getattr(context, "project_id", "") or "").strip()
-    if not project_id:
-        project_id = str(context.get("project_id", "") if isinstance(context, dict) else "")
     if not project_id:
         raise ExecutionError("Project ID aktif tidak ditemukan.")
     return context, project_path, project_id
