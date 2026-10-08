@@ -26,6 +26,7 @@ import hashlib
 import json
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -51,7 +52,7 @@ except ImportError as exc:
 
 
 SCRIPT_NAME = "discovery.py"
-SCRIPT_VERSION = "1.0.1"
+SCRIPT_VERSION = "1.1.0"
 CHECKLIST_ID = "10-001"
 CHECKLIST_NAME = "File Upload Discovery"
 PHASE_NAME = "10 File Upload"
@@ -62,7 +63,11 @@ DEFAULT_MAX_LINKS = 0
 DEFAULT_MAX_CANDIDATES = 200
 DEFAULT_MAX_PARAMS_PER_URL = 5
 DEFAULT_TIMEOUT = 20
+DEFAULT_BROWSER_WAIT = 3
+DEFAULT_HIDDEN_ENDPOINT_LIMIT = 60
+DEFAULT_HIDDEN_ENDPOINT_TIMEOUT = 10
 BODY_SAMPLE_LIMIT = 12000
+
 USER_AGENT = "BrebesKab-CSIRT-Tools/10-001-file-upload-discovery"
 
 UPLOAD_INPUT_RE = re.compile(
@@ -137,6 +142,44 @@ COMMON_UPLOAD_PATH_RE = re.compile(
        dokumen|lampiran|media|images|image|foto|photos|storage)
     (?:/|$)
     """
+)
+
+
+# Passive JavaScript/network hints. These are only parsed from already
+# retrieved same-origin resources; no upload request is ever generated.
+JS_UPLOAD_ENDPOINT_RE = re.compile(
+    r"""(?ix)
+    (?:
+        (?:fetch|axios\\.(?:post|put|patch)|\\$\\.(?:post|ajax)|XMLHttpRequest)
+        [^\\n]{0,500}?
+        (?:['"])(/[^'"]{1,300}(?:upload|file|attachment|document|media|import)[^'"]*)['"]
+    |
+        (?:['"])(/[^'"]{1,300}(?:upload|file|attachment|document|media|import)[^'"]*)['"]
+        [^\\n]{0,500}?
+        (?:fetch|axios|XMLHttpRequest)
+    )""",
+    re.I | re.S,
+)
+
+JS_UPLOAD_KEYWORD_RE = re.compile(
+    r"""(?ix)
+    (?:upload|fileupload|file_upload|attachment|document|dokumen|
+       lampiran|berkas|import|impor|multipart|FormData)
+    """
+)
+
+# Conservative, bounded GET-only endpoint candidates. These are discovery
+# hints, not upload operations. Existing linked discovery remains unchanged.
+HIDDEN_UPLOAD_ENDPOINTS = (
+    "/upload", "/uploads", "/uploadfile", "/upload-file",
+    "/file/upload", "/files/upload", "/file-upload",
+    "/attachment/upload", "/attachments/upload",
+    "/document/upload", "/documents/upload",
+    "/dokumen/upload", "/lampiran/upload",
+    "/media/upload", "/image/upload", "/images/upload",
+    "/photo/upload", "/photos/upload",
+    "/import", "/import/upload", "/bulk-upload",
+    "/unggah", "/unggah/file",
 )
 
 
@@ -593,6 +636,352 @@ def discover_upload_keywords(
     return findings
 
 
+def discover_js_upload_signals(body: str, page_url: str) -> List[Dict[str, Any]]:
+    """Passively inspect inline HTML/JS for upload endpoint hints."""
+    results: List[Dict[str, Any]] = []
+    seen = set()
+
+    for match in JS_UPLOAD_ENDPOINT_RE.finditer(body):
+        raw = match.group(1) or match.group(2)
+        normalized = normalize_url(raw, page_url) if raw else None
+        if not normalized or not same_origin(normalized, page_url):
+            continue
+        key = (normalized, "js_upload_endpoint")
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append({
+            "page_url": page_url,
+            "url": normalized,
+            "signal": "js_upload_endpoint",
+            "url_sha256": sha256_text(normalized),
+        })
+
+    keyword_matches = list(JS_UPLOAD_KEYWORD_RE.finditer(body))
+    if keyword_matches:
+        context_count = 0
+        for match in keyword_matches:
+            start = max(0, match.start() - 160)
+            end = min(len(body), match.end() + 160)
+            context = re.sub(r"\\s+", " ", body[start:end]).strip()
+            context_sha = sha256_text(context)
+            key = (page_url, match.group(0).lower(), context_sha)
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append({
+                "page_url": page_url,
+                "keyword": match.group(0),
+                "signal": "js_upload_keyword",
+                "context": context[:500],
+                "context_sha256": context_sha,
+            })
+            context_count += 1
+            if context_count >= 25:
+                break
+
+    return results
+
+
+def authenticated_response_state(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """Classify whether a GET response still appears authenticated."""
+    if not snapshot.get("ok"):
+        return {"authenticated": False, "reason": "request_error"}
+
+    response = snapshot.get("response", {})
+    status = int(response.get("status", 0) or 0)
+    location = str(response.get("headers", {}).get("Location", "") or "")
+    body = str(snapshot.get("_body", "") or "")
+
+    login_markers = re.search(
+        r"""(?ix)(?:\\blogin\\b|\\bsign[ -]?in\\b|\\busername\\b.*\\bpassword\\b)""",
+        body,
+    )
+    login_redirect = bool(re.search(r"""(?ix)/(?:login|signin|sign-in)(?:[/?#]|$)""", location))
+    authenticated_markers = bool(
+        re.search(r"""(?ix)(?:\\blogout\\b|\\bsign[ -]?out\\b|\\bdashboard\\b|\\bprofile\\b)""", body)
+    )
+
+    if status in {401, 403}:
+        return {"authenticated": False, "reason": f"http_{status}"}
+    if login_redirect or login_markers and not authenticated_markers:
+        return {"authenticated": False, "reason": "login_state_detected"}
+    if authenticated_markers:
+        return {"authenticated": True, "reason": "authenticated_marker"}
+    return {"authenticated": True, "reason": "no_login_indicator"}
+
+
+def browser_dependency():
+    """Load Playwright lazily so HTTP-only operation remains unchanged."""
+    try:
+        from playwright.sync_api import sync_playwright
+        return sync_playwright
+    except ImportError:
+        return None
+
+
+def apply_browser_session(context: Any, session_data: Dict[str, Any], target_url: str) -> int:
+    """Apply encrypted session values to a Playwright browser context in memory."""
+    records = session_data.get("sessions")
+    if not isinstance(records, list):
+        return 0
+
+    target_host = (urlparse(target_url).hostname or "").lower()
+    applied = 0
+
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        outcome = str(record.get("authentication_outcome") or record.get("outcome") or "").upper()
+        status = str(record.get("status") or "").lower()
+        if outcome and outcome != "SUCCESS":
+            continue
+        if status and status not in {"completed", "active", "valid", "success"}:
+            continue
+
+        target = record.get("target")
+        record_url = str(target.get("url") or "").strip() if isinstance(target, dict) else ""
+        if record_url:
+            record_host = (urlparse(record_url).hostname or "").lower()
+            if record_host and record_host != target_host:
+                continue
+
+        auth = record.get("authentication")
+        if not isinstance(auth, dict):
+            continue
+        encrypted = str(auth.get("value_encrypted") or "").strip()
+        if not encrypted:
+            continue
+
+        try:
+            value = decrypt(encrypted, project_id=active_context().project_id)
+        except Exception:
+            continue
+
+        try:
+            auth_type = str(auth.get("type") or "cookie").strip().lower()
+            if auth_type == "cookie":
+                name = str(auth.get("name") or "").strip()
+                if not name:
+                    continue
+                domain = str(auth.get("domain") or "").strip()
+                path = str(auth.get("path") or "/").strip() or "/"
+                cookie = {
+                    "name": name,
+                    "value": value,
+                    "path": path,
+                }
+                if domain:
+                    cookie["domain"] = domain
+                context.add_cookies([cookie])
+            else:
+                # Browser header injection is intentionally not persisted.
+                # Use extra_http_headers only at the browser-context level.
+                header_name = str(auth.get("header_name") or "Authorization").strip()
+                if header_name:
+                    context.set_extra_http_headers({header_name: value})
+            applied += 1
+        finally:
+            value = None
+
+    return applied
+
+
+def browser_discovery(
+    session_data: Dict[str, Any],
+    target_url: str,
+    max_depth: int,
+    max_candidates: int,
+    wait_seconds: int,
+) -> Dict[str, Any]:
+    """Authenticated browser-assisted GET discovery; no upload actions."""
+    sync_playwright = browser_dependency()
+    if sync_playwright is None:
+        return {
+            "available": False,
+            "reason": "Playwright tidak terpasang",
+            "pages": [],
+            "forms": [],
+            "links": [],
+            "js_upload_signals": [],
+            "browser_authenticated": False,
+        }
+
+    pages: List[Dict[str, Any]] = []
+    forms: List[Dict[str, Any]] = []
+    links_seen = set()
+    queue: List[Tuple[str, int]] = [(target_url, 0)]
+    js_signals: List[Dict[str, Any]] = []
+    browser_authenticated = False
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent=USER_AGENT,
+            ignore_https_errors=False,
+        )
+        applied = apply_browser_session(context, session_data, target_url)
+        if not applied:
+            browser.close()
+            return {
+                "available": True,
+                "reason": "Tidak ada authenticated session yang dapat diterapkan",
+                "pages": [],
+                "forms": [],
+                "links": [],
+                "js_upload_signals": [],
+                "browser_authenticated": False,
+            }
+
+        page = context.new_page()
+
+        def on_response(response: Any) -> None:
+            try:
+                if response.request.method.upper() != "GET":
+                    return
+                url = normalize_url(response.url)
+                if not url or not same_origin(url, target_url):
+                    return
+                ctype = str(response.headers.get("content-type", "")).lower()
+                if "javascript" not in ctype and "html" not in ctype:
+                    return
+                # Only record URL/method/status; never persist response bodies from
+                # network resources here.
+                if UPLOAD_URL_RE.search(url):
+                    js_signals.append({
+                        "url": url,
+                        "signal": "browser_network_upload_url",
+                        "method": "GET",
+                        "status": response.status,
+                    })
+            except Exception:
+                pass
+
+        page.on("response", on_response)
+
+        while queue and len(pages) < max_candidates:
+            current_url, depth = queue.pop(0)
+            if depth > max_depth or current_url in links_seen:
+                continue
+            if not same_origin(current_url, target_url):
+                continue
+            links_seen.add(current_url)
+
+            try:
+                response = page.goto(current_url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT * 1000)
+                if wait_seconds:
+                    page.wait_for_timeout(wait_seconds * 1000)
+                body = page.content()
+                final_url = normalize_url(page.url) or current_url
+                status = response.status if response else 0
+
+                state = authenticated_response_state({
+                    "ok": True,
+                    "response": {
+                        "status": status,
+                        "headers": response.headers if response else {},
+                    },
+                    "_body": body,
+                })
+                browser_authenticated = browser_authenticated or bool(state["authenticated"])
+
+                page_forms = discover_forms(body, final_url)
+                for form in page_forms:
+                    form["discovery_mode"] = "browser_dom"
+                    forms.append(form)
+
+                js_page = discover_js_upload_signals(body, final_url)
+                js_signals.extend(js_page)
+
+                page_record = {
+                    "url": current_url,
+                    "final_url": final_url,
+                    "depth": depth,
+                    "status": status,
+                    "content_type": str(response.headers.get("content-type", "")) if response else "",
+                    "body_sha256": sha256_text(body),
+                    "upload_surface": bool(page_forms),
+                    "authenticated_state": state,
+                    "discovery_mode": "browser_dom",
+                }
+                pages.append(page_record)
+
+                for link in extract_links(body, final_url):
+                    if same_origin(link, target_url) and link not in links_seen:
+                        queue.append((link, depth + 1))
+            except Exception as exc:
+                pages.append({
+                    "url": current_url,
+                    "depth": depth,
+                    "status": "browser_error",
+                    "error": type(exc).__name__,
+                    "error_message": str(exc)[:500],
+                    "discovery_mode": "browser_dom",
+                })
+
+        context.close()
+        browser.close()
+
+    return {
+        "available": True,
+        "reason": "completed",
+        "pages": pages,
+        "forms": dedupe_dicts(forms, keys=("page_url", "action_url", "form_sha256")),
+        "links": sorted(links_seen),
+        "js_upload_signals": dedupe_dicts(
+            js_signals,
+            keys=("url", "signal", "page_url", "context_sha256"),
+        ),
+        "browser_authenticated": browser_authenticated,
+    }
+
+
+def hidden_endpoint_discovery(
+    session: requests.Session,
+    target_url: str,
+    timeout: int = DEFAULT_HIDDEN_ENDPOINT_TIMEOUT,
+    limit: int = DEFAULT_HIDDEN_ENDPOINT_LIMIT,
+) -> List[Dict[str, Any]]:
+    """Probe only bounded, same-origin GET candidates for upload-related paths."""
+    results: List[Dict[str, Any]] = []
+    seen = set()
+
+    for path in HIDDEN_UPLOAD_ENDPOINTS[:max(0, limit)]:
+        url = normalize_url(path, target_url)
+        if not url or not same_origin(url, target_url) or url in seen:
+            continue
+        seen.add(url)
+
+        try:
+            response = session.get(url, timeout=timeout, allow_redirects=False)
+            location = response.headers.get("Location", "")
+            interesting = (
+                response.status_code not in {404, 405}
+                or bool(location)
+            )
+            results.append({
+                "url": url,
+                "method": "GET",
+                "status": response.status_code,
+                "content_type": response.headers.get("Content-Type", ""),
+                "content_length": len(response.content),
+                "location": location,
+                "interesting": interesting,
+                "signal": "bounded_upload_endpoint_probe",
+            })
+        except requests.RequestException as exc:
+            results.append({
+                "url": url,
+                "method": "GET",
+                "status": "request_error",
+                "error": type(exc).__name__,
+                "error_message": str(exc)[:500],
+                "signal": "bounded_upload_endpoint_probe",
+            })
+
+    return results
+
+
 def request_snapshot(
     session: requests.Session,
     url: str,
@@ -724,12 +1113,16 @@ def build_artifact(
         "methodology": {
             "description": (
                 "Same-origin authenticated GET crawl to identify file inputs, "
-                "multipart forms, upload-related actions and upload-related URL hints."
+                "multipart forms, upload-related actions, upload-related URL hints, "
+                "browser-rendered DOM, JavaScript/API hints and bounded GET-only endpoint candidates."
             ),
             "authenticated_session_required": True,
             "same_origin_only": True,
             "redirect_following": False,
             "get_only_discovery": True,
+            "browser_assisted_discovery": True,
+            "javascript_passive_discovery": True,
+            "bounded_get_endpoint_discovery": True,
             "upload_performed": False,
             "multipart_post_performed": False,
             "file_creation": False,
@@ -763,6 +1156,8 @@ def build_artifact(
                 "sqlmap",
                 "ZAP",
                 "Hydra",
+            ],
+            "optional": [
                 "Playwright",
                 "Chromium",
             ],
@@ -780,6 +1175,10 @@ def build_artifact(
                 "upload_related_action",
                 "upload_related_url",
                 "upload_related_keyword",
+                "javascript_upload_endpoint",
+                "javascript_upload_keyword",
+                "browser_dom_upload_surface",
+                "bounded_upload_endpoint",
             ],
             "finding_policy": (
                 "Discovery signal alone is never a vulnerability finding."
@@ -847,6 +1246,11 @@ def cmd_init(_: argparse.Namespace) -> int:
             "multipart_forms": 0,
             "upload_related_urls": 0,
             "upload_keyword_signals": 0,
+            "javascript_upload_signals": 0,
+            "browser_pages": 0,
+            "browser_forms": 0,
+            "hidden_endpoint_candidates": 0,
+            "hidden_endpoint_interesting": 0,
             "candidates": 0,
             "request_errors": 0,
             "http_errors": 0,
@@ -889,10 +1293,6 @@ def cmd_crawl(args: argparse.Namespace) -> int:
     if not same_origin(target_url, target_url):
         raise ValueError("Target URL tidak valid.")
 
-    # Session artifacts are deliberately handled through the toolkit's
-    # established authenticated session mechanism. This script supports
-    # cookie-bearing session artifacts when cookies are available, while
-    # never printing or persisting credential values.
     session = requests.Session()
     session.headers.update(
         {
@@ -918,6 +1318,7 @@ def cmd_crawl(args: argparse.Namespace) -> int:
     forms: List[Dict[str, Any]] = []
     upload_related_urls: List[Dict[str, Any]] = []
     keyword_signals: List[Dict[str, Any]] = []
+    javascript_signals: List[Dict[str, Any]] = []
 
     request_errors = 0
     http_errors = 0
@@ -927,10 +1328,8 @@ def cmd_crawl(args: argparse.Namespace) -> int:
 
         if current_url in visited:
             continue
-
         if depth > max_depth:
             continue
-
         if not same_origin(current_url, target_url):
             continue
 
@@ -950,6 +1349,7 @@ def cmd_crawl(args: argparse.Namespace) -> int:
                     "status": "request_error",
                     "error": snapshot.get("error"),
                     "error_message": snapshot.get("error_message"),
+                    "discovery_mode": "http",
                 }
             )
             continue
@@ -961,6 +1361,7 @@ def cmd_crawl(args: argparse.Namespace) -> int:
         if status_code >= 400:
             http_errors += 1
 
+        auth_state = authenticated_response_state(snapshot)
         page_record = {
             "url": current_url,
             "depth": depth,
@@ -969,16 +1370,16 @@ def cmd_crawl(args: argparse.Namespace) -> int:
             "content_length": response.get("content_length", 0),
             "body_sha256": response.get("body_sha256"),
             "upload_surface": False,
+            "authenticated_state": auth_state,
+            "discovery_mode": "http",
         }
 
         page_forms = discover_forms(body, current_url)
-
         for form in page_forms:
             if not form["same_origin_action"]:
                 form["scope_note"] = (
                     "External-origin action; recorded as discovery signal only."
                 )
-
             forms.append(form)
 
         related_urls = discover_upload_related_links(body, current_url)
@@ -986,6 +1387,9 @@ def cmd_crawl(args: argparse.Namespace) -> int:
 
         page_keywords = discover_upload_keywords(body, current_url)
         keyword_signals.extend(page_keywords)
+
+        page_js = discover_js_upload_signals(body, current_url)
+        javascript_signals.extend(page_js)
 
         if page_forms:
             page_record["upload_surface"] = True
@@ -995,26 +1399,57 @@ def cmd_crawl(args: argparse.Namespace) -> int:
         for link in extract_links(body, current_url):
             if not same_origin(link, target_url):
                 continue
-
             if link not in discovered_links:
                 discovered_links.add(link)
                 if len(discovered_links) <= max_candidates:
                     queue.append((link, depth + 1))
 
-    # De-duplicate forms and URL signals deterministically.
+    # Preserve existing HTTP discovery and add optional bounded GET endpoint
+    # discovery. This never sends an upload request.
+    hidden_endpoints = hidden_endpoint_discovery(
+        session,
+        target_url,
+        timeout=args.hidden_timeout,
+        limit=args.hidden_limit,
+    ) if not args.no_hidden_endpoints else []
+
+    browser_result = {
+        "available": False,
+        "reason": "disabled",
+        "pages": [],
+        "forms": [],
+        "links": [],
+        "js_upload_signals": [],
+        "browser_authenticated": False,
+    }
+
+    if args.browser:
+        browser_result = browser_discovery(
+            session_data=session_data,
+            target_url=target_url,
+            max_depth=max_depth,
+            max_candidates=min(max_candidates, args.browser_max_pages),
+            wait_seconds=args.browser_wait,
+        )
+        forms.extend(browser_result.get("forms", []))
+        javascript_signals.extend(browser_result.get("js_upload_signals", []))
+
+    # De-duplicate all signals deterministically.
     forms = dedupe_dicts(
         forms,
         keys=("page_url", "action_url", "form_sha256"),
     )
-
     upload_related_urls = dedupe_dicts(
         upload_related_urls,
         keys=("url", "signal"),
     )
-
     keyword_signals = dedupe_dicts(
         keyword_signals,
         keys=("page_url", "keyword", "context_sha256"),
+    )
+    javascript_signals = dedupe_dicts(
+        javascript_signals,
+        keys=("url", "signal", "page_url", "keyword", "context_sha256"),
     )
 
     file_input_count = sum(
@@ -1034,6 +1469,52 @@ def cmd_crawl(args: argparse.Namespace) -> int:
         if form.get("same_origin_action")
     ]
 
+    # Add JS/API/hidden endpoint candidates as discovery-only records.
+    for signal in javascript_signals:
+        url = signal.get("url")
+        if not url or not same_origin(url, target_url):
+            continue
+        candidates.append({
+            "type": "javascript_endpoint",
+            "page_url": signal.get("page_url", target_url),
+            "action_url": url,
+            "method": "UNKNOWN",
+            "enctype": "",
+            "same_origin_action": True,
+            "file_inputs": [],
+            "signals": [str(signal.get("signal", "javascript_upload_signal"))],
+            "priority_score": 60,
+            "discovery_only": True,
+            "upload_performed": False,
+            "finding": False,
+            "requires_review": False,
+        })
+
+    for endpoint in hidden_endpoints:
+        if endpoint.get("interesting") and endpoint.get("status") != "request_error":
+            url = endpoint.get("url")
+            if url and same_origin(url, target_url):
+                candidates.append({
+                    "type": "hidden_endpoint",
+                    "page_url": target_url,
+                    "action_url": url,
+                    "method": "GET",
+                    "enctype": "",
+                    "same_origin_action": True,
+                    "file_inputs": [],
+                    "signals": ["bounded_upload_endpoint"],
+                    "priority_score": 40,
+                    "discovery_only": True,
+                    "upload_performed": False,
+                    "finding": False,
+                    "requires_review": False,
+                })
+
+    candidates = dedupe_dicts(
+        candidates,
+        keys=("type", "page_url", "action_url", "signals"),
+    )
+
     candidates.sort(
         key=lambda item: (
             -int(item.get("priority_score", 0)),
@@ -1041,7 +1522,6 @@ def cmd_crawl(args: argparse.Namespace) -> int:
             item.get("action_url", ""),
         )
     )
-
     candidates = candidates[:max_candidates]
 
     results = {
@@ -1059,6 +1539,13 @@ def cmd_crawl(args: argparse.Namespace) -> int:
         "multipart_forms": multipart_count,
         "upload_related_urls": len(upload_related_urls),
         "upload_keyword_signals": len(keyword_signals),
+        "javascript_upload_signals": len(javascript_signals),
+        "browser_pages": len(browser_result.get("pages", [])),
+        "browser_forms": len(browser_result.get("forms", [])),
+        "hidden_endpoint_candidates": len(hidden_endpoints),
+        "hidden_endpoint_interesting": len(
+            [item for item in hidden_endpoints if item.get("interesting")]
+        ),
         "candidates": len(candidates),
         "request_errors": request_errors,
         "http_errors": http_errors,
@@ -1085,7 +1572,18 @@ def cmd_crawl(args: argparse.Namespace) -> int:
         "visited": sorted(visited),
         "links": sorted(discovered_links),
     }
-
+    artifact["browser"] = {
+        "enabled": bool(args.browser),
+        "available": browser_result.get("available", False),
+        "reason": browser_result.get("reason"),
+        "browser_authenticated": browser_result.get("browser_authenticated", False),
+        "pages": browser_result.get("pages", []),
+        "links": browser_result.get("links", []),
+    }
+    artifact["javascript"] = {
+        "upload_signals": javascript_signals,
+    }
+    artifact["hidden_endpoints"] = hidden_endpoints
     artifact["candidates"] = candidates
 
     save_yaml(artifact_path(project_path), artifact)
@@ -1099,6 +1597,9 @@ def cmd_crawl(args: argparse.Namespace) -> int:
         "forms": forms,
         "upload_related_urls": upload_related_urls,
         "upload_keyword_signals": keyword_signals,
+        "javascript_upload_signals": javascript_signals,
+        "hidden_endpoints": hidden_endpoints,
+        "browser": browser_result,
         "candidates": candidates,
         "created_at": utc_now(),
     }
@@ -1106,20 +1607,23 @@ def cmd_crawl(args: argparse.Namespace) -> int:
     save_json(evidence_path(project_path), evidence)
 
     print("[PASS] File Upload Discovery crawl selesai.")
-    print(f"[PASS] Project            : {project_id}")
-    print(f"[PASS] Pages              : {len(visited)}")
-    print(f"[PASS] Links              : {len(discovered_links)}")
-    print(f"[PASS] Upload forms       : {len(forms)}")
-    print(f"[PASS] File inputs        : {file_input_count}")
-    print(f"[PASS] Multipart forms    : {multipart_count}")
-    print(f"[PASS] Upload URL signals : {len(upload_related_urls)}")
-    print(f"[PASS] Candidates         : {len(candidates)}")
-    print(f"[PASS] Request errors     : {request_errors}")
-    print(f"[PASS] HTTP errors        : {http_errors}")
-    print("[PASS] Upload performed   : 0")
-    print(f"[PASS] Evidence           : {evidence_path(project_path)}")
+    print(f"[PASS] Project               : {project_id}")
+    print(f"[PASS] Pages                 : {len(visited)}")
+    print(f"[PASS] Links                 : {len(discovered_links)}")
+    print(f"[PASS] Upload forms          : {len(forms)}")
+    print(f"[PASS] File inputs           : {file_input_count}")
+    print(f"[PASS] Multipart forms       : {multipart_count}")
+    print(f"[PASS] Upload URL signals    : {len(upload_related_urls)}")
+    print(f"[PASS] JS upload signals     : {len(javascript_signals)}")
+    print(f"[PASS] Hidden endpoints      : {len(hidden_endpoints)}")
+    print(f"[PASS] Hidden interesting    : {results['hidden_endpoint_interesting']}")
+    print(f"[PASS] Browser pages         : {results['browser_pages']}")
+    print(f"[PASS] Candidates            : {len(candidates)}")
+    print(f"[PASS] Request errors        : {request_errors}")
+    print(f"[PASS] HTTP errors           : {http_errors}")
+    print("[PASS] Upload performed      : 0")
+    print(f"[PASS] Evidence              : {evidence_path(project_path)}")
     return 0
-
 
 def apply_authenticated_session(
     session: requests.Session,
@@ -1277,6 +1781,8 @@ def cmd_status(_: argparse.Namespace) -> int:
     print(f"Status    : {checklist.get('status', 'unknown')}")
     print(f"Results   : {results.get('status', 'unknown')}")
     print(f"Candidates: {results.get('candidates', 0)}")
+    print(f"JS signals: {results.get('javascript_upload_signals', 0)}")
+    print(f"Hidden    : {results.get('hidden_endpoint_interesting', 0)}")
     print(f"Findings  : {results.get('findings', 0)}")
     print(f"Review    : {results.get('requires_review', 0)}")
     print(f"Upload    : {'yes' if results.get('upload_performed') else 'no'}")
@@ -1322,6 +1828,9 @@ def cmd_verify(_: argparse.Namespace) -> int:
         "authenticated_session_required",
         "same_origin_only",
         "get_only_discovery",
+        "browser_assisted_discovery",
+        "javascript_passive_discovery",
+        "bounded_get_endpoint_discovery",
         "forensic_evidence_preserved",
     ]
     required_false = [
@@ -1374,6 +1883,11 @@ def cmd_verify(_: argparse.Namespace) -> int:
         "multipart_forms",
         "upload_related_urls",
         "upload_keyword_signals",
+        "javascript_upload_signals",
+        "browser_pages",
+        "browser_forms",
+        "hidden_endpoint_candidates",
+        "hidden_endpoint_interesting",
         "candidates",
         "request_errors",
         "http_errors",
@@ -1491,6 +2005,40 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_CANDIDATES,
     )
     p_crawl.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    p_crawl.add_argument(
+        "--browser",
+        action="store_true",
+        help="Aktifkan authenticated browser-assisted DOM/JS discovery (GET/navigation only).",
+    )
+    p_crawl.add_argument(
+        "--browser-wait",
+        type=int,
+        default=DEFAULT_BROWSER_WAIT,
+        help="Waktu tunggu setelah DOMContentLoaded untuk render JavaScript.",
+    )
+    p_crawl.add_argument(
+        "--browser-max-pages",
+        type=int,
+        default=100,
+        help="Batas halaman untuk browser-assisted discovery.",
+    )
+    p_crawl.add_argument(
+        "--hidden-limit",
+        type=int,
+        default=DEFAULT_HIDDEN_ENDPOINT_LIMIT,
+        help="Batas candidate endpoint GET-only yang diperiksa.",
+    )
+    p_crawl.add_argument(
+        "--hidden-timeout",
+        type=int,
+        default=DEFAULT_HIDDEN_ENDPOINT_TIMEOUT,
+        help="Timeout per bounded hidden endpoint GET.",
+    )
+    p_crawl.add_argument(
+        "--no-hidden-endpoints",
+        action="store_true",
+        help="Nonaktifkan bounded GET-only hidden upload endpoint discovery.",
+    )
     p_crawl.set_defaults(func=cmd_crawl)
 
     p_show = subparsers.add_parser("show")
