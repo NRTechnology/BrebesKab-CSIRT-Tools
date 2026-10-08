@@ -39,10 +39,11 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin, parse_qs
 
 import requests
 import yaml
+from html.parser import HTMLParser
 
 try:
     SCRIPTS_DIR = Path(__file__).resolve().parents[1]
@@ -55,7 +56,7 @@ except ImportError as exc:
 
 
 SCRIPT_NAME = "execution.py"
-SCRIPT_VERSION = "1.0.3"
+SCRIPT_VERSION = "1.1.0"
 CHECKLIST_ID = "10-002"
 CHECKLIST_NAME = "File Upload Extension Validation"
 PHASE_NAME = "10 File Upload"
@@ -497,11 +498,499 @@ def choose_field(candidate: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+class FormReconstructionError(RuntimeError):
+    pass
+
+
+class FormHTMLParser(HTMLParser):
+    """Small dependency-free HTML form parser for deterministic reconstruction."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.forms: List[Dict[str, Any]] = []
+        self._form: Optional[Dict[str, Any]] = None
+        self._control: Optional[Dict[str, Any]] = None
+        self._textarea: Optional[Dict[str, Any]] = None
+        self._select: Optional[Dict[str, Any]] = None
+        self._option: Optional[Dict[str, Any]] = None
+
+    @staticmethod
+    def _attrs(attrs: List[Tuple[str, Optional[str]]]) -> Dict[str, str]:
+        return {
+            str(k).lower(): str(v) if v is not None else ""
+            for k, v in attrs
+            if k
+        }
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        tag = tag.lower()
+        a = self._attrs(attrs)
+
+        if tag == "form":
+            self._form = {
+                "attrs": a,
+                "controls": [],
+                "action": a.get("action", ""),
+                "method": (a.get("method") or "get").upper(),
+            }
+            self.forms.append(self._form)
+            return
+
+        if self._form is None:
+            return
+
+        if tag == "input":
+            control = {
+                "tag": "input",
+                "attrs": a,
+                "type": (a.get("type") or "text").lower(),
+                "name": a.get("name", ""),
+                "value": a.get("value", ""),
+                "checked": "checked" in a,
+            }
+            self._form["controls"].append(control)
+            return
+
+        if tag == "textarea":
+            self._textarea = {
+                "tag": "textarea",
+                "attrs": a,
+                "type": "textarea",
+                "name": a.get("name", ""),
+                "value": "",
+            }
+            self._form["controls"].append(self._textarea)
+            return
+
+        if tag == "select":
+            self._select = {
+                "tag": "select",
+                "attrs": a,
+                "type": "select",
+                "name": a.get("name", ""),
+                "options": [],
+            }
+            self._form["controls"].append(self._select)
+            return
+
+        if tag == "option" and self._select is not None:
+            self._option = {
+                "attrs": a,
+                "value": a.get("value", ""),
+                "text": "",
+                "selected": "selected" in a,
+            }
+            self._select["options"].append(self._option)
+
+    def handle_data(self, data: str) -> None:
+        if self._textarea is not None:
+            self._textarea["value"] += data
+        if self._option is not None:
+            self._option["text"] += data
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag == "textarea":
+            self._textarea = None
+        elif tag == "option":
+            self._option = None
+        elif tag == "select":
+            self._select = None
+        elif tag == "form":
+            self._form = None
+
+
+def _control_attrs(control: Dict[str, Any]) -> Dict[str, str]:
+    return control.get("attrs") or {}
+
+
+def _is_sensitive_name(name: str) -> bool:
+    lowered = name.lower()
+    return any(
+        token in lowered
+        for token in (
+            "password", "passwd", "passcode", "otp", "token",
+            "secret", "authorization", "cookie", "session",
+        )
+    )
+
+
+def _is_csrf_control(control: Dict[str, Any]) -> bool:
+    a = _control_attrs(control)
+    name = str(control.get("name") or "").lower()
+    return (
+        name in {"csrf", "csrf_token", "csrf-token"}
+        or "csrf" in name
+        or "csrf" in str(a.get("id") or "").lower()
+    )
+
+
+def _safe_length(a: Dict[str, str], default: int = 24) -> int:
+    try:
+        minimum = max(0, int(a.get("minlength", "0") or 0))
+    except ValueError:
+        minimum = 0
+    try:
+        maximum = int(a.get("maxlength", "") or 0)
+    except ValueError:
+        maximum = 0
+    if maximum > 0:
+        return max(1, min(maximum, max(minimum, default)))
+    return max(minimum, default)
+
+
+def _pattern_value(pattern: str, minimum: int, maximum: int) -> Optional[str]:
+    """Handle common HTML pattern forms without pretending to be a regex solver."""
+    p = pattern.strip()
+    if not p:
+        return None
+
+    # Common exact character classes.
+    m = re.fullmatch(r"\[A-Z\]\{(\d+)(?:,(\d+))?\}", p)
+    if m:
+        n = int(m.group(1))
+        return "A" * min(maximum, max(n, minimum))
+
+    m = re.fullmatch(r"\[a-z\]\{(\d+)(?:,(\d+))?\}", p)
+    if m:
+        n = int(m.group(1))
+        return "a" * min(maximum, max(n, minimum))
+
+    m = re.fullmatch(r"\[0-9\]\{(\d+)(?:,(\d+))?\}", p)
+    if m:
+        n = int(m.group(1))
+        return "1" * min(maximum, max(n, minimum))
+
+    m = re.fullmatch(r"\[A-Za-z0-9\]\{(\d+)(?:,(\d+))?\}", p)
+    if m:
+        n = int(m.group(1))
+        return "A" * min(maximum, max(n, minimum))
+
+    # Common combined forms such as [A-Z]{3}[0-9]{4}.
+    tokens = re.findall(r"\[[^\]]+\]\{(\d+)(?:,(\d+))?\}", p)
+    classes = re.findall(r"\[([^\]]+)\]\{", p)
+    if tokens and len(tokens) == len(classes):
+        out = []
+        for cls, count in zip(classes, tokens):
+            n = int(count[0])
+            char = "A" if "A-Z" in cls else ("1" if "0-9" in cls else "a")
+            out.append(char * n)
+        value = "".join(out)
+        if minimum <= len(value) <= maximum:
+            return value
+
+    # Very common literal-prefix pattern: ^ABC[0-9]+$
+    m = re.fullmatch(r"\^([A-Za-z]+)\[0-9\]\{(\d+)(?:,(\d+))?\}\$", p)
+    if m:
+        n = int(m.group(2))
+        value = m.group(1) + ("1" * n)
+        if minimum <= len(value) <= maximum:
+            return value
+
+    return None
+
+
+def _generate_number(a: Dict[str, str]) -> str:
+    try:
+        minimum = float(a.get("min", "") or 0)
+    except ValueError:
+        minimum = 0
+    try:
+        maximum = float(a.get("max", "") or minimum + 100)
+    except ValueError:
+        maximum = minimum + 100
+    try:
+        step = float(a.get("step", "") or 1)
+        if step <= 0:
+            step = 1
+    except ValueError:
+        step = 1
+
+    value = minimum
+    if value > maximum:
+        value = maximum
+    # Align to step from min where possible.
+    if step:
+        value = minimum + ((value - minimum) // step) * step
+
+    if float(value).is_integer():
+        return str(int(value))
+    return f"{value:g}"
+
+
+def _generate_control_value(control: Dict[str, Any]) -> Tuple[Optional[str], str]:
+    """Return (value, reason). Empty/None means unresolved."""
+    a = _control_attrs(control)
+    typ = str(control.get("type") or "text").lower()
+    name = str(control.get("name") or "").strip()
+
+    if not name:
+        return None, "unnamed_control"
+
+    if typ in {"submit", "button", "reset", "image", "file"}:
+        return None, f"non_data_control:{typ}"
+
+    original = str(control.get("value") or "")
+    if _is_csrf_control(control):
+        if original:
+            return original, "csrf_from_form"
+        return None, "csrf_value_missing"
+
+    if typ == "hidden":
+        return original, "hidden_original_value"
+
+    if typ in {"password"} or _is_sensitive_name(name):
+        # Do not invent credentials/OTP/secrets. Existing non-empty values are
+        # still not copied into evidence; the caller may classify unresolved.
+        return None, "sensitive_field_requires_existing_application_value"
+
+    if typ in {"checkbox"}:
+        if "required" in a or "checked" in a:
+            return original or "on", "checkbox_required_or_selected"
+        return None, "optional_checkbox_not_selected"
+
+    if typ == "radio":
+        return original or None, "radio_selected_candidate"
+
+    if typ == "select":
+        options = control.get("options") or []
+        valid = [
+            x for x in options
+            if isinstance(x, dict)
+            and x.get("value") != ""
+            and "disabled" not in (x.get("attrs") or {})
+        ]
+        selected = [
+            x for x in valid
+            if x.get("selected")
+        ]
+        choice = (selected or valid[:1])
+        if choice:
+            return str(choice[0].get("value") or ""), "select_valid_option"
+        return None, "select_no_valid_option"
+
+    if typ == "textarea":
+        default = "BREBES UPLOAD TEST DESCRIPTION"
+    elif typ == "email":
+        default = "brebes-upload-test@example.invalid"
+    elif typ == "number" or typ == "range":
+        return _generate_number(a), "numeric_constraints"
+    elif typ == "tel":
+        default = "081234567890"
+    elif typ == "url":
+        default = "https://example.invalid/brebes-upload-test"
+    elif typ == "date":
+        default = datetime.now().date().isoformat()
+    elif typ == "datetime-local":
+        default = datetime.now().replace(microsecond=0).isoformat(timespec="minutes")
+    elif typ == "time":
+        default = "12:00"
+    elif typ == "month":
+        default = datetime.now().strftime("%Y-%m")
+    elif typ == "week":
+        default = datetime.now().strftime("%G-W%V")
+    else:
+        default = "BREBES_UPLOAD_TEST"
+
+    try:
+        minimum = max(0, int(a.get("minlength", "0") or 0))
+    except ValueError:
+        minimum = 0
+    try:
+        maximum = int(a.get("maxlength", "") or 0)
+    except ValueError:
+        maximum = 0
+    if maximum <= 0:
+        maximum = max(len(default), minimum, 512)
+
+    pattern = a.get("pattern", "").strip()
+    if pattern:
+        candidate = _pattern_value(pattern, minimum, maximum)
+        if candidate is None:
+            return None, "unsupported_pattern_requires_review"
+        return candidate, "pattern_constraint"
+
+    if len(default) < minimum:
+        seed = "BREBES_UPLOAD_TEST"
+        default = (seed * ((minimum // len(seed)) + 1))[:minimum]
+    if len(default) > maximum:
+        default = default[:maximum]
+    return default, "type_and_length_constraints"
+
+
+def _form_matches(form: Dict[str, Any], page_url: str, action_url: str) -> bool:
+    form_action = urljoin(page_url, str(form.get("action") or ""))
+    return same_origin(form_action, action_url) and form_action.rstrip("/") == action_url.rstrip("/")
+
+
+def reconstruct_form(
+    session: requests.Session,
+    candidate: Dict[str, Any],
+    timeout: int,
+) -> Dict[str, Any]:
+    """GET the real form and reconstruct valid multipart text fields."""
+    page_url = str(candidate.get("page_url") or "").strip()
+    action_url = str(candidate.get("action_url") or "").strip()
+    method = str(candidate.get("method") or "POST").upper()
+
+    if not page_url or not action_url:
+        raise FormReconstructionError("page_url/action_url tidak lengkap.")
+    if not same_origin(page_url, action_url):
+        raise FormReconstructionError("Form reconstruction menolak cross-origin candidate.")
+
+    response = session.get(page_url, timeout=timeout, allow_redirects=True)
+    if response.status_code >= 400:
+        raise FormReconstructionError(
+            f"GET form gagal HTTP {response.status_code}."
+        )
+
+    parser = FormHTMLParser()
+    parser.feed(response.text)
+
+    matching = [
+        form for form in parser.forms
+        if _form_matches(form, page_url, action_url)
+    ]
+
+    # Some applications omit action; if there is exactly one form on the page,
+    # safely use it only when its effective action is the candidate action.
+    if not matching:
+        for form in parser.forms:
+            effective = urljoin(page_url, str(form.get("action") or ""))
+            if effective.rstrip("/") == page_url.rstrip("/") and effective.rstrip("/") == action_url.rstrip("/"):
+                matching.append(form)
+
+    if not matching:
+        raise FormReconstructionError(
+            "Form target tidak ditemukan pada halaman GET."
+        )
+
+    form = matching[0]
+    if str(form.get("method") or "GET").upper() != "POST":
+        raise FormReconstructionError(
+            f"Form target method bukan POST: {form.get('method')}"
+        )
+
+    controls = form.get("controls") or []
+    fields: Dict[str, str] = {}
+    field_meta: List[Dict[str, Any]] = []
+    file_field_names = {
+        str(x.get("name") or "").strip()
+        for x in candidate.get("file_inputs") or []
+        if isinstance(x, dict) and str(x.get("name") or "").strip()
+    }
+
+    unresolved: List[Dict[str, str]] = []
+    csrf_fields: List[str] = []
+
+    # First pass: normal controls and selected radio/checkbox handling.
+    radio_groups: Dict[str, List[Dict[str, Any]]] = {}
+    for control in controls:
+        if not isinstance(control, dict):
+            continue
+        typ = str(control.get("type") or "text").lower()
+        name = str(control.get("name") or "").strip()
+        if typ == "radio" and name:
+            radio_groups.setdefault(name, []).append(control)
+
+    for control in controls:
+        if not isinstance(control, dict):
+            continue
+        typ = str(control.get("type") or "text").lower()
+        name = str(control.get("name") or "").strip()
+
+        if not name:
+            continue
+        if typ == "file" or name in file_field_names:
+            continue
+
+        # For radio, only submit one selected/first valid member.
+        if typ == "radio":
+            group = radio_groups.get(name) or []
+            selected = next((x for x in group if x.get("checked")), None)
+            if selected is not control:
+                continue
+
+        value, reason = _generate_control_value(control)
+
+        if _is_csrf_control(control):
+            if value is None:
+                unresolved.append({"name": name, "reason": reason})
+            else:
+                fields[name] = value
+                csrf_fields.append(name)
+        elif typ == "checkbox":
+            if value is not None:
+                fields[name] = value
+            elif "required" in _control_attrs(control):
+                unresolved.append({"name": name, "reason": reason})
+        elif value is not None:
+            # Multiple controls with the same name are handled conservatively:
+            # keep the first value for normal scalar fields.
+            fields.setdefault(name, value)
+        elif "required" in _control_attrs(control):
+            unresolved.append({"name": name, "reason": reason})
+
+        field_meta.append({
+            "name": name,
+            "type": typ,
+            "required": "required" in _control_attrs(control),
+            "minlength": _control_attrs(control).get("minlength", ""),
+            "maxlength": _control_attrs(control).get("maxlength", ""),
+            "pattern": bool(_control_attrs(control).get("pattern")),
+            "generated": value is not None,
+            "reason": reason,
+            "value_redacted": (
+                "[REDACTED]"
+                if (_is_sensitive_name(name) or _is_csrf_control(control))
+                else (value if value is not None else "")
+            ),
+        })
+
+    if not csrf_fields:
+        # CSRF is not necessarily named "csrf"; discover hidden security-token
+        # fields conservatively from the form metadata.
+        hidden_names = [
+            str(c.get("name") or "")
+            for c in controls
+            if isinstance(c, dict)
+            and str(c.get("type") or "").lower() == "hidden"
+            and c.get("value")
+        ]
+        csrf_like = [
+            n for n in hidden_names
+            if "token" in n.lower() or "security" in n.lower()
+        ]
+        if csrf_like:
+            # Keep the actual hidden value already captured; mark it as a
+            # security token in evidence without exposing it.
+            csrf_fields.extend(csrf_like)
+
+    required_unresolved = [
+        item for item in unresolved
+        if item["name"] not in file_field_names
+    ]
+
+    return {
+        "page_url": page_url,
+        "requested_action_url": action_url,
+        "fetched_url": response.url,
+        "http_status": response.status_code,
+        "form_action": urljoin(page_url, str(form.get("action") or "")),
+        "method": form.get("method"),
+        "field_count": len(controls),
+        "file_field_names": sorted(file_field_names),
+        "csrf_fields": sorted(set(csrf_fields)),
+        "fields": fields,
+        "field_meta": field_meta,
+        "unresolved_required": required_unresolved,
+    }
+
+
 def choose_text_fields(candidate: Dict[str, Any]) -> Dict[str, str]:
     """
-    Provide only benign defaults for required/non-file form fields when they
-    are explicitly present in discovery evidence. Unknown fields are not
-    guessed. The upload candidate can still be tested with only the file part.
+    Backward-compatible fallback for callers that do not have a live form.
+    Normal execution uses reconstruct_form() immediately before each upload.
     """
     fields: Dict[str, str] = {}
     for item in candidate.get("inputs") or candidate.get("form_inputs") or []:
@@ -573,7 +1062,43 @@ def upload_one(
     print(f"[FILE] Size             : {len(content)} bytes", flush=True)
     print(f"[FILE] SHA256           : {sha256_bytes(content)}", flush=True)
 
-    text_fields = choose_text_fields(candidate)
+    try:
+        reconstruction = reconstruct_form(session, candidate, timeout)
+    except (requests.RequestException, FormReconstructionError) as exc:
+        return {
+            "status": "form_reconstruction_error",
+            "error": f"{type(exc).__name__}: {exc}",
+            "request": {
+                "method": "POST",
+                "url": action_url,
+                "page_url": page_url,
+                "field_name": field_name,
+                "filename": path.name,
+                "sha256": sha256_bytes(content),
+            },
+        }
+
+    if reconstruction.get("unresolved_required"):
+        return {
+            "status": "form_reconstruction_incomplete",
+            "reason": "required_form_fields_could_not_be_reconstructed_safely",
+            "reconstruction": reconstruction,
+            "request": {
+                "method": "POST",
+                "url": action_url,
+                "page_url": page_url,
+                "field_name": field_name,
+                "filename": path.name,
+                "sha256": sha256_bytes(content),
+            },
+        }
+
+    text_fields = reconstruction["fields"]
+    print(
+        f"[FORM] Reconstructed : {reconstruction['field_count']} controls "
+        f"(CSRF: {', '.join(reconstruction['csrf_fields']) or 'not detected'})",
+        flush=True,
+    )
 
     # requests will build multipart/form-data. This is the only write request
     # performed by this script.
@@ -633,6 +1158,7 @@ def upload_one(
             "sha256": sha256_bytes(content),
         },
         "response": info,
+        "form_reconstruction": reconstruction,
         "interpretation": classify_response(response, test),
     }
 
@@ -777,6 +1303,8 @@ def cmd_init(_: argparse.Namespace) -> int:
             "same_origin_only": True,
             "authenticated_session_required": True,
             "multipart_post_allowed": True,
+            "form_reconstruction": True,
+            "csrf_from_live_form": True,
             "file_execution": False,
             "uploaded_file_execution": False,
             "webshell": False,
@@ -828,6 +1356,9 @@ def cmd_init(_: argparse.Namespace) -> int:
         "notes": [
             "Candidate discovery is performed only by 10-001 discovery.py.",
             "Only same-origin candidates with a known file field are executed.",
+            "The target form is fetched immediately before each test and reconstructed from its HTML constraints.",
+            "CSRF/security tokens are taken from the live form and redacted from evidence.",
+            "Required fields that cannot be safely reconstructed stop that test instead of guessing.",
             "Test files are benign and generated locally.",
             "PHP files contain only marker output and are never requested for execution.",
             "Executable files are never executed.",
@@ -1020,6 +1551,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         "candidates": candidate_results,
         "notes": [
             "Execution means upload/validation execution stage, not execution of uploaded files.",
+            "The target form is reconstructed immediately before each multipart POST.",
+            "CSRF/security tokens are taken from the live form and redacted from evidence.",
             "No uploaded file was executed by this tool.",
             "Acceptance is not automatically classified as a vulnerability.",
             "Review is required for accepted dangerous/executable extensions.",
@@ -1110,6 +1643,8 @@ def cmd_verify(_: argparse.Namespace) -> int:
             "source_candidates_only",
             "same_origin_only",
             "authenticated_session_required",
+            "form_reconstruction",
+            "csrf_from_live_form",
         ):
             if methodology.get(key) is not True:
                 errors.append(f"methodology.{key} harus true.")
