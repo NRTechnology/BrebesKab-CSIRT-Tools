@@ -52,7 +52,7 @@ except ImportError as exc:
 
 
 SCRIPT_NAME = "discovery.py"
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.1.1"
 CHECKLIST_ID = "10-001"
 CHECKLIST_NAME = "File Upload Discovery"
 PHASE_NAME = "10 File Upload"
@@ -711,6 +711,21 @@ def authenticated_response_state(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     return {"authenticated": True, "reason": "no_login_indicator"}
 
 
+def progress(message: str, *_: Any) -> None:
+    """Display human-readable crawl progress without affecting evidence."""
+    print(f"[INFO] {message}", flush=True)
+
+
+def progress_step(number: int, total: int, title: str) -> None:
+    print(f"\\n[STEP {number}/{total}] {title}", flush=True)
+
+
+def progress_counter(prefix: str, current: int, total: int, every: int = 10) -> None:
+    """Print bounded progress updates; avoid flooding the terminal."""
+    if current == 1 or current == total or current % max(1, every) == 0:
+        print(f"[INFO] {prefix}: {current}/{total}", flush=True)
+
+
 def browser_dependency():
     """Load Playwright lazily so HTTP-only operation remains unchanged."""
     try:
@@ -793,6 +808,7 @@ def browser_discovery(
     max_depth: int,
     max_candidates: int,
     wait_seconds: int,
+    progress_callback: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Authenticated browser-assisted GET discovery; no upload actions."""
     sync_playwright = browser_dependency()
@@ -815,12 +831,16 @@ def browser_discovery(
     browser_authenticated = False
 
     with sync_playwright() as pw:
+        if progress_callback:
+            progress_callback("Starting Chromium (headless)...")
         browser = pw.chromium.launch(headless=True)
         context = browser.new_context(
             user_agent=USER_AGENT,
             ignore_https_errors=False,
         )
         applied = apply_browser_session(context, session_data, target_url)
+        if progress_callback:
+            progress_callback(f"Authenticated browser session applied: {applied} credential material(s) in memory.")
         if not applied:
             browser.close()
             return {
@@ -866,6 +886,8 @@ def browser_discovery(
             if not same_origin(current_url, target_url):
                 continue
             links_seen.add(current_url)
+            if progress_callback:
+                progress_callback(f"Browser pages: {len(pages) + 1}/{max_candidates}", True)
 
             try:
                 response = page.goto(current_url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT * 1000)
@@ -922,6 +944,9 @@ def browser_discovery(
         context.close()
         browser.close()
 
+    if progress_callback:
+        progress_callback(f"Browser discovery finished: {len(pages)} page(s), {len(forms)} upload surface(s), {len(js_signals)} JS signal(s).")
+
     return {
         "available": True,
         "reason": "completed",
@@ -941,12 +966,17 @@ def hidden_endpoint_discovery(
     target_url: str,
     timeout: int = DEFAULT_HIDDEN_ENDPOINT_TIMEOUT,
     limit: int = DEFAULT_HIDDEN_ENDPOINT_LIMIT,
+    progress_callback: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     """Probe only bounded, same-origin GET candidates for upload-related paths."""
     results: List[Dict[str, Any]] = []
     seen = set()
 
-    for path in HIDDEN_UPLOAD_ENDPOINTS[:max(0, limit)]:
+    endpoint_paths = HIDDEN_UPLOAD_ENDPOINTS[:max(0, limit)]
+    total = len(endpoint_paths)
+    for index, path in enumerate(endpoint_paths, start=1):
+        if progress_callback:
+            progress_callback(f"Hidden endpoints: {index}/{total}", True)
         url = normalize_url(path, target_url)
         if not url or not same_origin(url, target_url) or url in seen:
             continue
@@ -1290,6 +1320,15 @@ def cmd_init(_: argparse.Namespace) -> int:
 def cmd_crawl(args: argparse.Namespace) -> int:
     project_id, project_path, scope, session_data, target_url = get_project_context()
 
+    print("[INFO] File Upload Discovery crawl dimulai...", flush=True)
+    print(f"[INFO] Project : {project_id}", flush=True)
+    print(f"[INFO] Target  : {target_url}", flush=True)
+    print(f"[INFO] Mode    : authenticated GET-only discovery", flush=True)
+    if args.browser:
+        print("[INFO] Browser : enabled (Chromium headless)", flush=True)
+    else:
+        print("[INFO] Browser : disabled", flush=True)
+
     if not same_origin(target_url, target_url):
         raise ValueError("Target URL tidak valid.")
 
@@ -1323,6 +1362,9 @@ def cmd_crawl(args: argparse.Namespace) -> int:
     request_errors = 0
     http_errors = 0
 
+    progress_step(1, 4, "HTTP authenticated crawl")
+    progress("Crawling same-origin pages; no upload request is performed.")
+
     while queue:
         current_url, depth = queue.pop(0)
 
@@ -1334,6 +1376,9 @@ def cmd_crawl(args: argparse.Namespace) -> int:
             continue
 
         visited.add(current_url)
+        progress_counter("HTTP pages", len(visited), max_links if max_links else 0, every=10) if max_links else (
+            progress(f"HTTP pages: {len(visited)}") if len(visited) == 1 or len(visited) % 10 == 0 else None
+        )
 
         if max_links and len(visited) > max_links:
             break
@@ -1404,6 +1449,11 @@ def cmd_crawl(args: argparse.Namespace) -> int:
                 if len(discovered_links) <= max_candidates:
                     queue.append((link, depth + 1))
 
+    progress(f"HTTP crawl finished: {len(visited)} page(s), {len(discovered_links)} link(s), {len(forms)} upload form(s).")
+
+    progress_step(2, 4, "Bounded GET-only hidden endpoint discovery")
+    progress(f"Checking up to {min(len(HIDDEN_UPLOAD_ENDPOINTS), max(0, args.hidden_limit))} candidate endpoint(s).")
+
     # Preserve existing HTTP discovery and add optional bounded GET endpoint
     # discovery. This never sends an upload request.
     hidden_endpoints = hidden_endpoint_discovery(
@@ -1411,7 +1461,9 @@ def cmd_crawl(args: argparse.Namespace) -> int:
         target_url,
         timeout=args.hidden_timeout,
         limit=args.hidden_limit,
+        progress_callback=lambda message, counter=False: progress(message),
     ) if not args.no_hidden_endpoints else []
+    progress(f"Hidden endpoint discovery finished: {len(hidden_endpoints)} checked, {sum(1 for item in hidden_endpoints if item.get('interesting'))} interesting.")
 
     browser_result = {
         "available": False,
@@ -1423,16 +1475,24 @@ def cmd_crawl(args: argparse.Namespace) -> int:
         "browser_authenticated": False,
     }
 
+    progress_step(3, 4, "Browser-assisted discovery" if args.browser else "Browser-assisted discovery skipped")
     if args.browser:
+        progress(f"Starting browser discovery (max {min(max_candidates, args.browser_max_pages)} page(s), wait {args.browser_wait}s/page).")
         browser_result = browser_discovery(
             session_data=session_data,
             target_url=target_url,
             max_depth=max_depth,
             max_candidates=min(max_candidates, args.browser_max_pages),
             wait_seconds=args.browser_wait,
+            progress_callback=lambda message, counter=False: progress(message),
         )
         forms.extend(browser_result.get("forms", []))
         javascript_signals.extend(browser_result.get("js_upload_signals", []))
+    else:
+        progress("Browser discovery skipped; HTTP/GET-only discovery remains unchanged.")
+
+    progress_step(4, 4, "Menyusun kandidat dan evidence")
+    progress("De-duplicating discovery signals and building discovery-only candidates.")
 
     # De-duplicate all signals deterministically.
     forms = dedupe_dicts(
@@ -1606,6 +1666,7 @@ def cmd_crawl(args: argparse.Namespace) -> int:
 
     save_json(evidence_path(project_path), evidence)
 
+    progress("Evidence YAML/JSON berhasil disimpan.")
     print("[PASS] File Upload Discovery crawl selesai.")
     print(f"[PASS] Project               : {project_id}")
     print(f"[PASS] Pages                 : {len(visited)}")
