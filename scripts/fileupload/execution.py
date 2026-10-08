@@ -55,7 +55,7 @@ except ImportError as exc:
 
 
 SCRIPT_NAME = "execution.py"
-SCRIPT_VERSION = "1.0.1"
+SCRIPT_VERSION = "1.0.3"
 CHECKLIST_ID = "10-002"
 CHECKLIST_NAME = "File Upload Extension Validation"
 PHASE_NAME = "10 File Upload"
@@ -224,8 +224,12 @@ def artifact_path(project_path: Path) -> Path:
     return execution_dir(project_path) / "execution.yaml"
 
 
+def evidence_dir(project_path: Path) -> Path:
+    return execution_dir(project_path) / "evidence"
+
+
 def evidence_path(project_path: Path) -> Path:
-    return execution_dir(project_path) / "execution-evidence.json"
+    return evidence_dir(project_path) / "execution-evidence.json"
 
 
 def discovery_path(project_path: Path) -> Path:
@@ -561,6 +565,14 @@ def upload_one(
     path = make_test_file(tmp, test)
     content = path.read_bytes()
 
+    print(f"[FILE] Dummy file      : {path}", flush=True)
+    print(f"[FILE] Filename         : {path.name}", flush=True)
+    print(f"[FILE] Extension        : {test["extension"]}", flush=True)
+    print(f"[FILE] Category         : {test["category"]}", flush=True)
+    print(f"[FILE] MIME             : {test["mime"]}", flush=True)
+    print(f"[FILE] Size             : {len(content)} bytes", flush=True)
+    print(f"[FILE] SHA256           : {sha256_bytes(content)}", flush=True)
+
     text_fields = choose_text_fields(candidate)
 
     # requests will build multipart/form-data. This is the only write request
@@ -572,6 +584,10 @@ def upload_one(
             test["content_type"],
         )
     }
+
+    print(f"[UPLOAD] POST           : {action_url}", flush=True)
+    print(f"[UPLOAD] Field            : {field_name}", flush=True)
+    print(f"[UPLOAD] File             : {path.name}", flush=True)
 
     try:
         response = session.post(
