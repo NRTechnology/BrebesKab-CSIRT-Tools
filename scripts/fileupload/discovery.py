@@ -1585,7 +1585,7 @@ def cmd_crawl(args: argparse.Namespace) -> int:
     candidates = candidates[:max_candidates]
 
     results = {
-        "status": "crawled",
+        "status": "completed",
         "pages_requested": len(visited),
         "pages_completed": len(
             [item for item in pages if item.get("status") != "request_error"]
