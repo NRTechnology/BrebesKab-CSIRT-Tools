@@ -59,7 +59,7 @@ except ImportError as exc:
 
 
 SCRIPT_NAME = "overwrite.py"
-SCRIPT_VERSION = "1.1.2-browser"
+SCRIPT_VERSION = "1.1.3-browser"
 CHECKLIST_ID = "10-004"
 CHECKLIST_NAME = "File Upload Overwrite Validation"
 PHASE_NAME = "10 File Upload"
@@ -1270,6 +1270,14 @@ def summarize(results: List[Dict[str, Any]]) -> Dict[str, int]:
         "findings": 0,
         "executed_files": 0,
         "automatic_execution": 0,
+        "human_interaction_not_completed": sum(
+            1 for x in results
+            if x.get("status") == "human_interaction_not_completed"
+        ),
+        "overwrite_proven_tests": sum(
+            1 for x in results
+            if x.get("overwrite_proven") is True
+        ),
     }
 
 def cmd_version(_: argparse.Namespace) -> int:
@@ -2477,6 +2485,56 @@ def cmd_browser_run(args: argparse.Namespace) -> int:
                     "stage": test["stage"],
                     "marker": test["marker"],
                 }
+
+                # Normalize browser-run result metadata to the same contract
+                # used by run(). This does not change browser behavior.
+                if item.get("status") == "completed":
+                    item.setdefault("accepted_indicator", True)
+                    item.setdefault("blocked_indicator", False)
+
+                    prior_same_filename = any(
+                        x.get("status") == "completed"
+                        and str((x.get("request") or {}).get("filename") or "")
+                        == test["filename"]
+                        for x in all_results
+                    )
+                    prior_accepted = any(
+                        x.get("status") == "completed"
+                        and x.get("accepted_indicator") is True
+                        for x in all_results
+                    )
+                    collision_accepted = (
+                        test.get("stage", 1) > 1
+                        and prior_same_filename
+                        and prior_accepted
+                        and item.get("accepted_indicator") is True
+                    )
+
+                    item["interpretation"] = {
+                        "disposition": "accepted_or_processed",
+                        "http_status": item.get("browser", {}).get(
+                            "final_status_observed"
+                        ),
+                        "redirect": False,
+                        "response_keyword_signals": [],
+                        "post_upload_filename_observed": bool(
+                            item.get("browser", {}).get("disclosed_file_urls")
+                        ),
+                        "post_upload_marker_hits": [],
+                        "same_filename_reused": prior_same_filename,
+                        "collision_accepted_indicator": collision_accepted,
+                        "overwrite_proven": bool(item.get("overwrite_proven")),
+                        "automatic_finding": False,
+                        "overwrite_validation_test": True,
+                        "requires_review": bool(
+                            item.get("requires_review") or collision_accepted
+                        ),
+                        "note": item.get("note", ""),
+                    }
+                    item["requires_review"] = item["interpretation"]["requires_review"]
+                elif item.get("status") != "request_error":
+                    item.setdefault("blocked_indicator", False)
+
                 all_results.append(item)
 
                 if item.get("overwrite_proven"):
@@ -2500,6 +2558,7 @@ def cmd_browser_run(args: argparse.Namespace) -> int:
 
         browser.close()
 
+    summary = summarize(all_results)
     completed = [x for x in all_results if x.get("status") == "completed"]
     proven = [x for x in completed if x.get("overwrite_proven") is True]
     human = [x for x in all_results if x.get("status") == "human_interaction_not_completed"]
@@ -2536,13 +2595,8 @@ def cmd_browser_run(args: argparse.Namespace) -> int:
             "automatic_finding": False,
         },
         "results": {
-            "tests": len(all_results),
-            "completed": len(completed),
-            "human_interaction_not_completed": len(human),
-            "overwrite_proven_tests": len(proven),
-            "findings": 0,
-            "executed_files": 0,
-            "automatic_execution": 0,
+            **summary,
+            "candidate_count": len(candidates),
         },
         "results_detail": all_results,
         "notes": [
@@ -2575,9 +2629,14 @@ def cmd_browser_run(args: argparse.Namespace) -> int:
     )
 
     print("\n[PASS] Browser-simulator overwrite validation selesai.")
-    print(f"[PASS] Tests completed         : {len(completed)}")
-    print(f"[PASS] Overwrite proven tests  : {len(proven)}")
-    print(f"[PASS] Human interaction stop  : {len(human)}")
+    print(f"[PASS] Tests completed         : {summary['completed']}")
+    print(f"[PASS] Accepted indicators     : {summary['accepted_indicators']}")
+    print(f"[PASS] Blocked indicators      : {summary['blocked_indicators']}")
+    print(f"[PASS] Collision accepted      : {summary['collision_accepted_indicators']}")
+    print(f"[PASS] Request errors          : {summary['request_errors']}")
+    print(f"[PASS] Manual review           : {summary['requires_review']}")
+    print(f"[PASS] Overwrite proven tests  : {summary['overwrite_proven_tests']}")
+    print(f"[PASS] Human interaction stop  : {summary['human_interaction_not_completed']}")
     print("[PASS] Findings                : 0")
     print("[PASS] Files executed          : 0")
     print(f"[PASS] Artifact                : {artifact_path(project_path)}")
