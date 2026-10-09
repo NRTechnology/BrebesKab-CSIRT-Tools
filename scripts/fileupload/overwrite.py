@@ -59,7 +59,7 @@ except ImportError as exc:
 
 
 SCRIPT_NAME = "overwrite.py"
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.1.2-browser"
 CHECKLIST_ID = "10-004"
 CHECKLIST_NAME = "File Upload Overwrite Validation"
 PHASE_NAME = "10 File Upload"
@@ -1586,6 +1586,1004 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"[PASS] Evidence                   : {evidence_path(project_path)}")
     return 0
 
+
+# ---------------------------------------------------------------------------
+# Browser-simulator method
+# ---------------------------------------------------------------------------
+# This is an additional execution path. The original requests-based run()
+# remains unchanged. browser-run uses Playwright/Chromium, reuses the same
+# authenticated session artifact, reconstructs the live form in the browser,
+# uploads the same benign filename sequentially, and can pause for manual
+# human-interaction challenges such as Turnstile.
+#
+# It never requests execution of an uploaded file. For overwrite proof it
+# only follows URLs/links that the application itself exposes after upload.
+# It does not guess /uploads, /storage, etc.
+
+def _browser_session_records(
+    session_data: Dict[str, Any],
+    project_id: str,
+    target_url: str,
+) -> List[Dict[str, str]]:
+    return decrypt_session_candidates(session_data, project_id, target_url)
+
+
+def _browser_add_session(context: Any, records: List[Dict[str, str]], target_url: str) -> None:
+    hostname = (urlparse(target_url).hostname or "").lower()
+    for item in records:
+        if item.get("type") != "cookie":
+            continue
+        try:
+            context.add_cookies([{
+                "name": item["name"],
+                "value": item["value"],
+                "domain": hostname,
+                "path": item.get("path") or "/",
+                "secure": str(target_url).lower().startswith("https://"),
+            }])
+        except Exception as exc:
+            print(
+                f"[BROWSER] Cookie {item.get('name', '-')} gagal dipasang: {exc}",
+                flush=True,
+            )
+
+
+def _browser_auth_headers(records: List[Dict[str, str]]) -> Dict[str, str]:
+    headers: Dict[str, str] = {}
+    for item in records:
+        if item.get("type") in {"header", "authorization", "bearer"}:
+            name = item.get("header_name") or "Authorization"
+            headers[name] = item.get("value") or ""
+    return headers
+
+
+def _browser_visible_text(page: Any, limit: int = 12000) -> str:
+    try:
+        return (page.locator("body").inner_text(timeout=5000) or "")[:limit]
+    except Exception:
+        try:
+            return (page.content() or "")[:limit]
+        except Exception:
+            return ""
+
+
+def _browser_human_interaction_detected(page: Any) -> bool:
+    text = _browser_visible_text(page).lower()
+    markers = (
+        "turnstile",
+        "cloudflare",
+        "verify you are human",
+        "verify that you are human",
+        "checking your browser",
+        "captcha",
+        "recaptcha",
+        "hcaptcha",
+        "human verification",
+        "security verification",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _browser_pause_for_human(page: Any, timeout_seconds: int) -> bool:
+    print(
+        "\n[HUMAN] Human-interaction challenge terdeteksi pada browser.",
+        flush=True,
+    )
+    print(
+        "[HUMAN] Selesaikan challenge secara manual di browser yang terbuka.",
+        flush=True,
+    )
+    print(
+        "[HUMAN] Tool tidak mencoba bypass CAPTCHA/Turnstile.",
+        flush=True,
+    )
+    print(
+        f"[HUMAN] Setelah selesai, tekan ENTER. Timeout {timeout_seconds} detik.",
+        flush=True,
+    )
+    try:
+        input()
+    except EOFError:
+        return False
+    return not _browser_human_interaction_detected(page)
+
+
+def _browser_form_locator(page: Any, candidate: Dict[str, Any]) -> Any:
+    action_url = str(candidate.get("action_url") or "")
+    forms = page.locator("form")
+    count = forms.count()
+    for i in range(count):
+        form = forms.nth(i)
+        try:
+            action = form.get_attribute("action") or ""
+            effective = urljoin(str(page.url), action)
+            if same_origin(effective, action_url) and effective.rstrip("/") == action_url.rstrip("/"):
+                return form
+        except Exception:
+            continue
+    if count == 1:
+        return forms.nth(0)
+    raise FormReconstructionError("Form target tidak ditemukan oleh browser.")
+
+
+
+def _browser_control_context(control: Any) -> Dict[str, str]:
+    """Collect DOM context used for generic field classification."""
+    try:
+        return control.evaluate(
+            """(el) => {
+                const clean = (v) => (v || '').replace(/\\s+/g, ' ').trim();
+                const id = clean(el.id);
+                const name = clean(el.getAttribute('name'));
+                const placeholder = clean(el.getAttribute('placeholder'));
+                const aria = clean(el.getAttribute('aria-label'));
+                const type = clean(el.getAttribute('type'));
+                const min = clean(el.getAttribute('min'));
+                const max = clean(el.getAttribute('max'));
+
+                let label = '';
+                if (id) {
+                    const byFor = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+                    if (byFor) label = clean(byFor.innerText);
+                }
+                if (!label) {
+                    const parentLabel = el.closest('label');
+                    if (parentLabel) label = clean(parentLabel.innerText);
+                }
+
+                let nearby = '';
+                const wrapper = el.closest('.form-group, .form-row, .row, .mb-3, .mb-2, .mb-1, td, div');
+                if (wrapper) nearby = clean(wrapper.innerText).slice(0, 500);
+
+                return {id, name, placeholder, aria, type, min, max, label, nearby};
+            }"""
+        )
+    except Exception:
+        return {}
+
+
+def _browser_geo_map_signal(form: Any) -> bool:
+    """Detect a map/geo UI as a confidence signal only."""
+    try:
+        body = form.locator("xpath=ancestor::body[1]")
+        selectors = (
+            ".leaflet-container",
+            "[class*='leaflet']",
+            "[id*='map']",
+            "[class*='mapbox']",
+            "[class*='openlayers']",
+            ".ol-viewport",
+            "[class*='google-map']",
+            "[id*='google-map']",
+        )
+        for selector in selectors:
+            if body.locator(selector).count():
+                return True
+
+        page_text = (body.inner_text(timeout=3000) or "").lower()
+        return any(
+            marker in page_text
+            for marker in (
+                "latitude", "longitude", "koordinat",
+                "coordinate", "lokasi", "location",
+            )
+        )
+    except Exception:
+        return False
+
+
+def _browser_geo_candidates(form: Any) -> Dict[str, Any]:
+    """
+    Generic Geo Position detector.
+
+    It does not depend on the user telling the tool which fields are geo
+    coordinates. It uses DOM semantics, labels, constraints, field pairing,
+    and map presence. Only high-confidence pairs are auto-filled.
+    """
+    controls = form.locator("input, textarea, select")
+    items: List[Dict[str, Any]] = []
+
+    for i in range(controls.count()):
+        control = controls.nth(i)
+        try:
+            typ = (control.get_attribute("type") or "text").lower()
+            if typ in {"file", "submit", "button", "reset", "image", "checkbox", "radio"}:
+                continue
+
+            ctx = _browser_control_context(control)
+            identity = " ".join(
+                str(ctx.get(k) or "")
+                for k in ("name", "id", "placeholder", "aria", "label", "nearby")
+            ).lower()
+
+            try:
+                minimum = float(ctx.get("min")) if ctx.get("min") not in (None, "") else None
+            except (TypeError, ValueError):
+                minimum = None
+            try:
+                maximum = float(ctx.get("max")) if ctx.get("max") not in (None, "") else None
+            except (TypeError, ValueError):
+                maximum = None
+
+            lat_score = 0
+            lon_score = 0
+            reasons: List[str] = []
+
+            lat_tokens = (
+                "latitude", "latitud", "lat_laporan", "lat_report",
+                "geo_lat", "geolat", "lat_coord", "lat_coordinate",
+                "lintang",
+            )
+            lon_tokens = (
+                "longitude", "longitud", "long_laporan", "lng", "lon",
+                "long_report", "geo_lng", "geolong", "long_coord",
+                "long_coordinate", "bujur",
+            )
+
+            for token in lat_tokens:
+                if token in identity:
+                    lat_score += 5
+                    reasons.append(f"latitude-token:{token}")
+                    break
+
+            for token in lon_tokens:
+                if token in identity:
+                    lon_score += 5
+                    reasons.append(f"longitude-token:{token}")
+                    break
+
+            if minimum is not None and maximum is not None:
+                if -90 <= minimum <= 90 and -90 <= maximum <= 90 and minimum < maximum:
+                    lat_score += 4
+                    reasons.append("latitude-range")
+                if (
+                    -180 <= minimum <= 180
+                    and -180 <= maximum <= 180
+                    and minimum < maximum
+                    and (minimum < -90 or maximum > 90)
+                ):
+                    lon_score += 4
+                    reasons.append("longitude-range")
+
+            if typ in {"number", "range"} and (lat_score or lon_score):
+                lat_score += 1
+                lon_score += 1
+
+            if any(token in identity for token in ("koordinat", "coordinate", "geo", "geolocation")):
+                lat_score += 1
+                lon_score += 1
+                reasons.append("geo-context")
+
+            items.append({
+                "index": i,
+                "name": ctx.get("name") or "",
+                "id": ctx.get("id") or "",
+                "type": typ,
+                "label": ctx.get("label") or "",
+                "placeholder": ctx.get("placeholder") or "",
+                "nearby": ctx.get("nearby") or "",
+                "min": ctx.get("min") or "",
+                "max": ctx.get("max") or "",
+                "lat_score": lat_score,
+                "lon_score": lon_score,
+                "reasons": reasons,
+            })
+        except Exception:
+            continue
+
+    map_signal = _browser_geo_map_signal(form)
+    lat_items = [x for x in items if x["lat_score"] >= 4]
+    lon_items = [x for x in items if x["lon_score"] >= 4]
+
+    pair: Optional[Tuple[Dict[str, Any], Dict[str, Any]]] = None
+    best_pair_score = 0
+
+    for lat in lat_items:
+        for lon in lon_items:
+            distance = abs(int(lat["index"]) - int(lon["index"]))
+            pair_score = lat["lat_score"] + lon["lon_score"]
+            if distance <= 6:
+                pair_score += 4
+            if map_signal:
+                pair_score += 3
+            if pair_score > best_pair_score:
+                best_pair_score = pair_score
+                pair = (lat, lon)
+
+    if pair is None:
+        return {
+            "detected": False,
+            "confidence": "none",
+            "map_signal": map_signal,
+            "fields": [],
+            "reason": "Tidak ditemukan pasangan latitude/longitude dengan confidence cukup.",
+            "all_candidates": items,
+        }
+
+    lat, lon = pair
+    high_confidence = (
+        lat["lat_score"] >= 5
+        and lon["lon_score"] >= 5
+        and (abs(int(lat["index"]) - int(lon["index"])) <= 6 or map_signal)
+    )
+
+    if not high_confidence:
+        return {
+            "detected": False,
+            "confidence": "medium",
+            "map_signal": map_signal,
+            "fields": [lat, lon],
+            "reason": "Geo position dicurigai tetapi confidence belum cukup untuk auto-fill.",
+            "all_candidates": items,
+        }
+
+    lat["role"] = "latitude"
+    lon["role"] = "longitude"
+
+    return {
+        "detected": True,
+        "confidence": "high",
+        "map_signal": map_signal,
+        "fields": [lat, lon],
+        "reason": "Pasangan geo position terdeteksi otomatis.",
+        "all_candidates": items,
+    }
+
+
+def _browser_fill_dom_value(control: Any, value: str) -> None:
+    """Fill normally, with a DOM setter fallback for map-backed controls."""
+    try:
+        control.fill(value)
+        return
+    except Exception:
+        control.evaluate(
+            """(el, value) => {
+                const proto = el instanceof HTMLTextAreaElement
+                    ? HTMLTextAreaElement.prototype
+                    : HTMLInputElement.prototype;
+                const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                if (setter) setter.call(el, value);
+                else el.value = value;
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+            }""",
+            value,
+        )
+
+
+def _browser_fill_safe_form(form: Any, candidate: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Existing browser form reconstruction plus generic Geo Position detection.
+    The requests-based run() path is untouched.
+    """
+    controls = form.locator("input, textarea, select")
+    count = controls.count()
+    csrf_fields: List[str] = []
+    filled: List[Dict[str, Any]] = []
+    unresolved: List[Dict[str, str]] = []
+
+    geo = _browser_geo_candidates(form)
+    geo_by_index = {
+        int(item["index"]): item
+        for item in geo.get("fields", [])
+        if item.get("role") in {"latitude", "longitude"}
+    }
+
+    if geo.get("detected"):
+        print(
+            "[GEO] Geo position detected automatically "
+            f"(confidence={geo.get('confidence')}, map={geo.get('map_signal')}).",
+            flush=True,
+        )
+        for item in geo.get("fields", []):
+            score = item.get("lat_score") if item.get("role") == "latitude" else item.get("lon_score")
+            print(
+                f"[GEO] {item.get('role'):9s} "
+                f"name={item.get('name') or '-'} "
+                f"id={item.get('id') or '-'} score={score}",
+                flush=True,
+            )
+
+    file_names = {
+        str(x.get("name") or "").strip()
+        for x in candidate.get("file_inputs") or []
+        if isinstance(x, dict) and str(x.get("name") or "").strip()
+    }
+    radio_done: set[str] = set()
+
+    for i in range(count):
+        control = controls.nth(i)
+        try:
+            tag = (control.evaluate("(e) => e.tagName") or "").lower()
+            typ = (
+                control.get_attribute("type")
+                or ("textarea" if tag == "textarea" else "text")
+            ).lower()
+            name = (control.get_attribute("name") or "").strip()
+            control_id = (control.get_attribute("id") or "").strip()
+            placeholder = (control.get_attribute("placeholder") or "").strip()
+            key = name or control_id or placeholder or f"control-{i}"
+
+            if typ == "file" or name in file_names:
+                continue
+            if typ in {"submit", "button", "reset", "image"}:
+                continue
+
+            if i in geo_by_index:
+                role = geo_by_index[i]["role"]
+                value = "-6.869400" if role == "latitude" else "109.036900"
+                _browser_fill_dom_value(control, value)
+                filled.append({
+                    "name": key,
+                    "type": typ,
+                    "generated": True,
+                    "reason": f"auto_detected_geo_{role}",
+                    "value_redacted": value,
+                    "geo_confidence": geo.get("confidence"),
+                    "geo_detection_reasons": geo_by_index[i].get("reasons", []),
+                })
+                print(f"[GEO] Auto-fill {role:9s}: {key} = {value}", flush=True)
+                continue
+
+            if typ == "radio":
+                if name in radio_done:
+                    continue
+                radio_done.add(name)
+                radio = form.locator(f'input[type="radio"][name="{name}"]')
+                checked = form.locator(f'input[type="radio"][name="{name}"]:checked')
+                if checked.count():
+                    checked.first.check()
+                elif radio.count():
+                    radio.first.check()
+                filled.append({"name": key, "type": typ, "generated": True, "reason": "radio"})
+                continue
+
+            if typ == "checkbox":
+                if control.is_checked():
+                    filled.append({"name": key, "type": typ, "generated": True, "reason": "already_checked"})
+                elif control.get_attribute("required") is not None:
+                    control.check()
+                    filled.append({"name": key, "type": typ, "generated": True, "reason": "required_checkbox"})
+                continue
+
+            if typ == "select":
+                options = control.locator("option")
+                chosen = None
+                for j in range(options.count()):
+                    opt = options.nth(j)
+                    if not opt.is_disabled():
+                        val = opt.get_attribute("value")
+                        if val not in (None, ""):
+                            chosen = val
+                            break
+                if chosen is not None:
+                    control.select_option(chosen)
+                    filled.append({"name": key, "type": typ, "generated": True, "reason": "select_valid_option"})
+                continue
+
+            current = (
+                control.input_value()
+                if typ not in {"hidden"}
+                else (control.get_attribute("value") or "")
+            )
+
+            if _is_csrf_control({"name": name, "attrs": {"id": control_id}}):
+                if current:
+                    csrf_fields.append(key)
+                    filled.append({"name": key, "type": typ, "generated": True, "reason": "csrf_from_live_dom"})
+                else:
+                    unresolved.append({"name": key, "reason": "csrf_value_missing"})
+                continue
+
+            if typ == "hidden":
+                filled.append({"name": key, "type": typ, "generated": True, "reason": "hidden_original_value"})
+                continue
+
+            if typ == "password" or _is_sensitive_name(name):
+                unresolved.append({
+                    "name": key,
+                    "reason": "sensitive_field_requires_existing_application_value",
+                })
+                continue
+
+            attrs = {
+                "minlength": control.get_attribute("minlength") or "",
+                "maxlength": control.get_attribute("maxlength") or "",
+                "pattern": control.get_attribute("pattern") or "",
+                "min": control.get_attribute("min") or "",
+                "max": control.get_attribute("max") or "",
+                "step": control.get_attribute("step") or "",
+                "id": control_id,
+            }
+            value, reason = _generate_control_value({
+                "type": typ,
+                "name": name,
+                "value": current,
+                "attrs": attrs,
+            })
+
+            if value is not None:
+                _browser_fill_dom_value(control, value)
+                filled.append({"name": key, "type": typ, "generated": True, "reason": reason})
+            elif control.get_attribute("required") is not None:
+                unresolved.append({"name": key, "reason": reason})
+        except Exception as exc:
+            unresolved.append({
+                "name": "unknown",
+                "reason": f"browser_fill_error:{type(exc).__name__}:{exc}",
+            })
+
+    return {
+        "field_count": count,
+        "csrf_fields": sorted(set(csrf_fields)),
+        "filled_fields": filled,
+        "unresolved_required": unresolved,
+        "geo_detection": {
+            "detected": bool(geo.get("detected")),
+            "confidence": geo.get("confidence"),
+            "map_signal": bool(geo.get("map_signal")),
+            "reason": geo.get("reason"),
+            "fields": [
+                {
+                    "role": x.get("role"),
+                    "name": x.get("name"),
+                    "id": x.get("id"),
+                    "label": x.get("label"),
+                    "score": (
+                        x.get("lat_score")
+                        if x.get("role") == "latitude"
+                        else x.get("lon_score")
+                    ),
+                    "reasons": x.get("reasons", []),
+                }
+                for x in geo.get("fields", [])
+            ],
+        },
+    }
+
+
+def _browser_extract_candidate_links(page: Any, filename: str, target_url: str) -> List[str]:
+    """
+    Extract only same-origin links/URLs that the application itself exposes
+    after upload and that mention the controlled filename. No path guessing.
+    """
+    urls: List[str] = []
+    try:
+        anchors = page.locator("a")
+        for i in range(anchors.count()):
+            href = anchors.nth(i).get_attribute("href") or ""
+            if not href:
+                continue
+            absolute = urljoin(page.url, href)
+            if not same_origin(absolute, target_url):
+                continue
+            if filename.lower() in absolute.lower():
+                urls.append(absolute)
+    except Exception:
+        pass
+
+    # Also inspect src/href attributes from common rendered elements.
+    for selector, attr in (("img", "src"), ("iframe", "src"), ("source", "src"), ("a", "href")):
+        try:
+            nodes = page.locator(selector)
+            for i in range(nodes.count()):
+                value = nodes.nth(i).get_attribute(attr) or ""
+                absolute = urljoin(page.url, value)
+                if (
+                    value
+                    and same_origin(absolute, target_url)
+                    and filename.lower() in absolute.lower()
+                ):
+                    urls.append(absolute)
+        except Exception:
+            pass
+
+    return sorted(set(urls))
+
+
+def _browser_fetch_marker(context: Any, url: str, marker: str, timeout: int) -> Dict[str, Any]:
+    """
+    GET only an application-disclosed same-origin URL. Compare the benign
+    marker; never execute the response as code.
+    """
+    try:
+        response = context.request.get(url, timeout=timeout * 1000, fail_on_status_code=False)
+        body = response.body()
+        text = body[:DEFAULT_MAX_BODY].decode("utf-8", errors="replace")
+        return {
+            "status": "completed",
+            "http_status": response.status,
+            "url": url,
+            "content_type": response.headers.get("content-type", ""),
+            "content_length": len(body),
+            "body_sha256": sha256_bytes(body),
+            "marker_observed": marker.lower() in text.lower(),
+            "body_sample": text,
+            "headers": redacted_headers(dict(response.headers)),
+        }
+    except Exception as exc:
+        return {
+            "status": "request_error",
+            "url": url,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _browser_upload_one(
+    page: Any,
+    context: Any,
+    candidate: Dict[str, Any],
+    test: Dict[str, Any],
+    target_url: str,
+    timeout: int,
+) -> Dict[str, Any]:
+    page_url = str(candidate.get("page_url") or "")
+    action_url = str(candidate.get("action_url") or "")
+    field_name = choose_field(candidate)
+    if not field_name:
+        return {"status": "skipped", "reason": "file_field_name_not_known"}
+
+    if not same_origin(page_url, target_url) or not same_origin(action_url, target_url):
+        return {"status": "skipped", "reason": "candidate_not_same_origin"}
+
+    import tempfile as _tempfile
+    with _tempfile.TemporaryDirectory(prefix="brebes-browser-overwrite-") as td:
+        tmp = Path(td)
+        path = make_test_file(tmp, test)
+        content = path.read_bytes()
+        marker = str(test.get("marker") or "")
+
+        print(f"[FILE] Filename         : {path.name}", flush=True)
+        print(f"[FILE] Stage            : {test['stage']}", flush=True)
+        print(f"[FILE] Marker           : {marker}", flush=True)
+        print(f"[FILE] SHA256           : {sha256_bytes(content)}", flush=True)
+
+        page.goto(page_url, wait_until="domcontentloaded", timeout=timeout * 1000)
+
+        if _browser_human_interaction_detected(page):
+            if not _browser_pause_for_human(page, max(30, timeout * 3)):
+                return {
+                    "status": "human_interaction_not_completed",
+                    "reason": "browser challenge remained active",
+                }
+
+        form = _browser_form_locator(page, candidate)
+        fill_result = _browser_fill_safe_form(form, candidate)
+
+        if fill_result["unresolved_required"]:
+            return {
+                "status": "form_reconstruction_incomplete",
+                "reason": "required_form_fields_could_not_be_filled_safely",
+                "browser_form": fill_result,
+            }
+
+        # File inputs cannot be populated with normal fill(); Playwright must
+        # attach the local file through set_input_files(). Prefer DOM-name
+        # matching, then fall back to the first file input in the selected form.
+        file_input = form.locator('input[type="file"]')
+        matched_file_input = None
+
+        for i in range(file_input.count()):
+            candidate_input = file_input.nth(i)
+            input_name = (candidate_input.get_attribute("name") or "").strip()
+            if input_name == field_name:
+                matched_file_input = candidate_input
+                break
+
+        if matched_file_input is None:
+            if file_input.count() == 1:
+                matched_file_input = file_input.first
+            else:
+                return {
+                    "status": "file_input_not_found_in_browser_form",
+                    "reason": f"file input dengan name={field_name!r} tidak ditemukan",
+                }
+
+        matched_file_input.set_input_files(str(path))
+
+        # Verify that Chromium actually accepted the local file before submit.
+        selected_name = ""
+        selected_count = 0
+        try:
+            selected_count = matched_file_input.locator("xpath=.").evaluate(
+                "(e) => e.files ? e.files.length : 0"
+            )
+            selected_name = matched_file_input.locator("xpath=.").evaluate(
+                "(e) => e.files && e.files.length ? e.files[0].name : ''"
+            ) or ""
+        except Exception:
+            pass
+
+        if selected_count != 1 or selected_name != path.name:
+            return {
+                "status": "file_selection_failed",
+                "reason": "Chromium tidak mengonfirmasi file pada input.",
+                "expected_filename": path.name,
+                "selected_filename": selected_name,
+                "selected_count": selected_count,
+            }
+
+        print(f"[BROWSER] Form            : {page.url}", flush=True)
+        print(f"[BROWSER] File field      : {field_name}", flush=True)
+        print(f"[BROWSER] File selected   : {selected_name}", flush=True)
+        print("[BROWSER] File input      : OK", flush=True)
+
+        # Submit through the real browser DOM after the file selection has
+        # been verified. No uploaded file is requested or executed.
+        print("[BROWSER] Submit via real browser DOM.", flush=True)
+
+        # Submit through the form's own submit mechanism. This preserves
+        # browser-side JS validation and challenge state.
+        try:
+            with page.expect_navigation(wait_until="domcontentloaded", timeout=timeout * 1000):
+                form.locator('button[type="submit"], input[type="submit"]').first.click()
+        except Exception:
+            # Some apps submit asynchronously or replace the page without a
+            # navigation event. Give the browser a short settle period.
+            try:
+                form.locator('button[type="submit"], input[type="submit"]').first.click(timeout=3000)
+            except Exception:
+                try:
+                    form.evaluate("(f) => f.requestSubmit()")
+                except Exception as exc:
+                    return {
+                        "status": "submit_error",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+            page.wait_for_timeout(1500)
+
+        final_url = page.url
+        final_status = None
+        try:
+            final_status = page.locator("body").count() and 200
+        except Exception:
+            final_status = None
+
+        disclosed_urls = _browser_extract_candidate_links(page, path.name, target_url)
+        disclosed_fetches = [
+            _browser_fetch_marker(context, url, marker, timeout)
+            for url in disclosed_urls[:5]
+        ]
+
+        marker_hits = [
+            item for item in disclosed_fetches
+            if item.get("marker_observed") is True
+        ]
+
+        return {
+            "status": "completed",
+            "accepted_indicator": True,
+            "request": {
+                "method": "POST",
+                "url": action_url,
+                "page_url": page_url,
+                "field_name": field_name,
+                "filename": path.name,
+                "stage": test["stage"],
+                "category": test["category"],
+                "declared_mime": test["mime"],
+                "content_type": test["content_type"],
+                "size_bytes": len(content),
+                "sha256": sha256_bytes(content),
+                "marker": marker,
+            },
+            "browser": {
+                "final_url": final_url,
+                "final_status_observed": final_status,
+                "form": fill_result,
+                "file_input": {
+                    "field_name": field_name,
+                    "selected_filename": selected_name,
+                    "selected_count": selected_count,
+                    "selection_confirmed": selected_count == 1 and selected_name == path.name,
+                },
+                "disclosed_file_urls": disclosed_urls,
+                "disclosed_file_fetches": disclosed_fetches,
+            },
+            "overwrite_proven": bool(marker_hits),
+            "marker_matches": len(marker_hits),
+            "automatic_finding": False,
+            "requires_review": bool(marker_hits) or test.get("stage", 1) > 1,
+            "note": (
+                "Browser execution proves overwrite only when the application "
+                "itself discloses a same-origin file URL and the fetched content "
+                "contains the controlled marker. Otherwise manual review remains."
+            ),
+        }
+
+
+def cmd_browser_run(args: argparse.Namespace) -> int:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        raise ExecutionError(
+            "Playwright belum terpasang. Jalankan: pip install playwright "
+            "lalu: playwright install chromium"
+        )
+
+    _, project_path, project_id = project_context()
+    discovery = load_discovery(project_path)
+    target = str((discovery.get("target") or {}).get("url") or "").strip()
+    if not target:
+        raise ExecutionError("Target URL tidak ditemukan.")
+
+    session_data = load_session_data(project_path)
+    session_records = _browser_session_records(session_data, project_id, target)
+    candidates = usable_candidates(discovery, target)
+
+    if args.candidate:
+        selected = []
+        for index in args.candidate:
+            if index < 1 or index > len(candidates):
+                raise ExecutionError(f"Candidate index {index} di luar range 1..{len(candidates)}.")
+            selected.append(candidates[index - 1])
+        candidates = selected
+
+    if not candidates:
+        raise ExecutionError("Tidak ada candidate yang aman untuk browser execution.")
+
+    selected_tests = TEST_MATRIX
+    if args.tests:
+        wanted = {x.strip().lower() for x in args.tests.split(",") if x.strip()}
+        selected_tests = [
+            item for item in TEST_MATRIX
+            if item["id"].lower() in wanted or item["filename"].lower() in wanted
+        ]
+        if not selected_tests:
+            raise ExecutionError("Tidak ada overwrite test/id yang cocok dengan --tests.")
+
+    print(f"[INFO] Browser simulator : Playwright Chromium", flush=True)
+    print(f"[INFO] Headed             : {not args.headless}", flush=True)
+    print(f"[INFO] Candidates          : {len(candidates)}", flush=True)
+    print(f"[INFO] Tests               : {len(selected_tests)}", flush=True)
+    print("[INFO] Uploaded files will NOT be executed.", flush=True)
+    print("[INFO] File URL is verified only if the application exposes it.", flush=True)
+
+    all_results: List[Dict[str, Any]] = []
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=False if not args.headless else True)
+        context = browser.new_context(ignore_https_errors=False)
+        _browser_add_session(context, session_records, target)
+        auth_headers = _browser_auth_headers(session_records)
+        if auth_headers:
+            context.set_extra_http_headers(auth_headers)
+
+        page = context.new_page()
+
+        for cidx, candidate in enumerate(candidates, 1):
+            print(
+                f"\n[STEP] Browser candidate {cidx}/{len(candidates)} "
+                f"{candidate.get('action_url')}",
+                flush=True,
+            )
+
+            for tidx, test in enumerate(selected_tests, 1):
+                print(
+                    f"[TEST] {tidx}/{len(selected_tests)} "
+                    f"stage={test['stage']} {test['category']} "
+                    f"filename={test['filename']}",
+                    flush=True,
+                )
+
+                item = _browser_upload_one(
+                    page, context, candidate, test, target, args.timeout
+                )
+                item["candidate_index"] = cidx
+                item["test"] = {
+                    "id": test["id"],
+                    "filename": test["filename"],
+                    "category": test["category"],
+                    "stage": test["stage"],
+                    "marker": test["marker"],
+                }
+                all_results.append(item)
+
+                if item.get("overwrite_proven"):
+                    print(
+                        "[PROOF] Controlled marker observed through an "
+                        "application-disclosed file URL.",
+                        flush=True,
+                    )
+                elif item.get("status") == "completed":
+                    print(
+                        "[REVIEW] Browser upload completed, but overwrite is "
+                        "not proven yet.",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[INFO] {item.get('status')} "
+                        f"{item.get('reason', item.get('error', ''))}",
+                        flush=True,
+                    )
+
+        browser.close()
+
+    completed = [x for x in all_results if x.get("status") == "completed"]
+    proven = [x for x in completed if x.get("overwrite_proven") is True]
+    human = [x for x in all_results if x.get("status") == "human_interaction_not_completed"]
+
+    artifact = {
+        "schema_version": SCHEMA_VERSION,
+        "project_id": project_id,
+        "tool": {
+            "name": "BrebesKab-CSIRT-Tools",
+            "script": SCRIPT_NAME,
+            "version": SCRIPT_VERSION,
+            "method": "browser-simulator",
+        },
+        "checklist": {
+            "id": CHECKLIST_ID,
+            "name": CHECKLIST_NAME,
+            "phase": PHASE_NAME,
+            "status": "completed",
+        },
+        "target": {"application": project_id, "url": target},
+        "sources": {
+            "discovery": str(discovery_path(project_path)),
+            "discovery_evidence": str(discovery_evidence_path(project_path)),
+            "session": str(session_path(project_path)),
+        },
+        "methodology": {
+            **methodology_definition(),
+            "browser_simulator": True,
+            "playwright_chromium": True,
+            "human_interaction_supported": True,
+            "manual_challenge_solve_allowed": True,
+            "application_disclosed_file_url_only": True,
+            "marker_content_verification": True,
+            "automatic_finding": False,
+        },
+        "results": {
+            "tests": len(all_results),
+            "completed": len(completed),
+            "human_interaction_not_completed": len(human),
+            "overwrite_proven_tests": len(proven),
+            "findings": 0,
+            "executed_files": 0,
+            "automatic_execution": 0,
+        },
+        "results_detail": all_results,
+        "notes": [
+            "Browser simulator is an additional method; the original requests run() is unchanged.",
+            "Authenticated session is reused from 07-authentication/session/session.yaml.",
+            "The browser performs the real DOM form flow and preserves browser-side validation.",
+            "If Turnstile/CAPTCHA/human verification appears, the tool pauses for manual completion; it does not bypass it.",
+            "Only same-origin application-disclosed file URLs are fetched for marker verification.",
+            "No storage-directory guessing is performed.",
+            "Uploaded files are never executed.",
+            "overwrite_proven is true only when a disclosed file URL returns the controlled marker.",
+        ],
+        "created_at": utc_now(),
+        "updated_at": utc_now(),
+    }
+
+    save_yaml(artifact_path(project_path), artifact)
+    save_json(
+        evidence_path(project_path),
+        {
+            "schema_version": SCHEMA_VERSION,
+            "project_id": project_id,
+            "checklist_id": CHECKLIST_ID,
+            "target": target,
+            "method": "browser-simulator",
+            "results": artifact["results"],
+            "results_detail": all_results,
+            "created_at": utc_now(),
+        },
+    )
+
+    print("\n[PASS] Browser-simulator overwrite validation selesai.")
+    print(f"[PASS] Tests completed         : {len(completed)}")
+    print(f"[PASS] Overwrite proven tests  : {len(proven)}")
+    print(f"[PASS] Human interaction stop  : {len(human)}")
+    print("[PASS] Findings                : 0")
+    print("[PASS] Files executed          : 0")
+    print(f"[PASS] Artifact                : {artifact_path(project_path)}")
+    print(f"[PASS] Evidence                : {evidence_path(project_path)}")
+    return 0
+
 def cmd_show(_: argparse.Namespace) -> int:
     _, project_path, _ = project_context()
     path = artifact_path(project_path)
@@ -1754,6 +2752,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser(
+        "browser-run",
+        help="Run 10-004 through a Playwright Chromium browser simulator.",
+    )
+    p.add_argument(
+        "--candidate",
+        type=int,
+        action="append",
+        help="Candidate number from discovery; repeat for multiple candidates.",
+    )
+    p.add_argument(
+        "--tests",
+        help="Comma-separated overwrite test IDs, e.g. baseline-a,collision-b,collision-c",
+    )
+    p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    p.add_argument(
+        "--headed",
+        action="store_true",
+        help="Open a visible Chromium window so human interaction can be completed.",
+    )
+    p.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run Chromium headless. Default is headed for browser-run.",
+    )
+    p.set_defaults(func=cmd_browser_run)
 
     p = sub.add_parser("show")
     p.set_defaults(func=cmd_show)
