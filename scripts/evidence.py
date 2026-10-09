@@ -9,8 +9,11 @@ Read the complete PENTEST project evidence set, normalize and aggregate the
 information needed for the final penetration-test report, preserve provenance,
 redact obvious secrets, and generate a ready-to-use ChatGPT report prompt.
 
-Default project:
-    projects/PENTEST-2026-002
+Project selection:
+    active-project.yaml
+
+Legacy project override:
+    --project PROJECT_ID
 
 Default outputs:
     23-final-sign-off/evidence.json
@@ -51,8 +54,12 @@ except ImportError:
 
 SCRIPT_VERSION = "1.0.0"
 
+# Project selection is driven by active-project.yaml.
+# The legacy default project is retained only as a compatibility fallback
+# when --project is explicitly supplied.
 DEFAULT_PROJECT_ID = "PENTEST-2026-002"
 DEFAULT_PROJECT_RELATIVE = Path("projects") / DEFAULT_PROJECT_ID
+ACTIVE_PROJECT_FILENAME = Path(".runtime") / "active-project.yaml"
 
 TEXT_EXTENSIONS = {
     ".yaml", ".yml", ".json", ".txt", ".md", ".log", ".csv",
@@ -122,18 +129,123 @@ def repo_root() -> Path:
     return Path.cwd().resolve()
 
 
-def resolve_project_root(explicit: str | None, project_id: str) -> Path:
+def load_active_project() -> dict[str, Any]:
+    """
+    Load the active project context from active-project.yaml.
+
+    The file is the authoritative project selector for normal execution.
+    A small amount of schema tolerance is intentional so existing
+    active-project.yaml variants can be used without changing the rest of
+    the evidence collector.
+
+    Supported project ID keys:
+        project_id
+        id
+
+    Supported project path keys:
+        project_path
+        path
+        root
+        project_root
+    """
+    root = repo_root()
+    path = root / ACTIVE_PROJECT_FILENAME
+
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Active project file not found: {path}"
+        )
+
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to read {path}: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"{path} must contain a YAML mapping/object."
+        )
+
+    project_id = data.get("project_id") or data.get("id")
+    if not project_id:
+        # Allow a nested project mapping if the active-project.yaml uses one.
+        nested = data.get("project")
+        if isinstance(nested, dict):
+            project_id = nested.get("project_id") or nested.get("id")
+
+    project_path = (
+        data.get("project_path")
+        or data.get("path")
+        or data.get("root")
+        or data.get("project_root")
+    )
+    if not project_path:
+        nested = data.get("project")
+        if isinstance(nested, dict):
+            project_path = (
+                nested.get("project_path")
+                or nested.get("path")
+                or nested.get("root")
+                or nested.get("project_root")
+            )
+
+    if not project_id:
+        raise ValueError(
+            f"{path} does not contain 'project_id' (or 'id')."
+        )
+
+    if not project_path:
+        raise ValueError(
+            f"{path} does not contain 'project_path' "
+            f"(or path/root/project_root)."
+        )
+
+    project_path = Path(str(project_path)).expanduser()
+    if not project_path.is_absolute():
+        project_path = (root / project_path).resolve()
+    else:
+        project_path = project_path.resolve()
+
+    return {
+        "path": path,
+        "project_id": str(project_id),
+        "project_path": project_path,
+        "data": redact_value(data),
+    }
+
+
+def resolve_project_root(
+    explicit: str | None,
+    project_id: str | None = None,
+    active_project: dict[str, Any] | None = None,
+) -> Path:
+    """
+    Resolve the project root.
+
+    Normal execution:
+        active-project.yaml -> project_path
+
+    Compatibility:
+        --project-root takes precedence when explicitly supplied.
+        --project can still select a project when explicitly supplied.
+        The existing fallback discovery behavior is preserved.
+    """
     if explicit:
         root = Path(explicit).expanduser().resolve()
+    elif active_project is not None:
+        root = Path(active_project["project_path"]).resolve()
     else:
-        root = (repo_root() / "projects" / project_id).resolve()
+        selected_id = project_id or DEFAULT_PROJECT_ID
+        root = (repo_root() / "projects" / selected_id).resolve()
 
         # Useful when the script is copied directly into the project.
         if not root.is_dir():
             cwd = Path.cwd().resolve()
             candidates = [
-                cwd / "projects" / project_id,
-                cwd / project_id,
+                cwd / "projects" / selected_id,
+                cwd / selected_id,
                 cwd,
             ]
             for candidate in candidates:
@@ -651,6 +763,251 @@ def calculate_high_level_counts(
     }
 
 
+
+def recommendation_contract(project_id: str) -> str:
+    """
+    Return the mandatory ChatGPT recommendation YAML contract.
+
+    This is intentionally embedded in report-prompt.md so the format consumed
+    later by report.py is standardized and deterministic. The evidence bundle
+    remains the source of truth; this contract only defines the optional
+    expert-review recommendation layer.
+    """
+    return f"""
+### 6. OPTIONAL CHATGPT EXPERT REVIEW — STRICT YAML CONTRACT
+
+Selain laporan akhir, Anda boleh memberikan rekomendasi expert review untuk
+digabungkan oleh `report.py`.
+
+Jika Anda menghasilkan rekomendasi, format yang dihasilkan **WAJIB** mengikuti
+schema berikut:
+
+`brebeskab-csirt-chatgpt-recommendation/v1`
+
+File yang akan disimpan adalah:
+
+`23-final-sign-off/chatgpt-recommendation.yaml`
+
+**PENTING:**
+- Jangan mengubah nama field.
+- Jangan menambah field di luar schema ini.
+- Jangan mengubah tipe data field.
+- Jangan mengubah struktur nesting.
+- Jangan mengubah nama schema.
+- Jangan membuat format YAML alternatif.
+- Jangan menggunakan Markdown sebagai pengganti YAML.
+- `project.project_id` harus sama dengan project ID pada evidence.
+- `checklist_ids` hanya boleh berisi checklist ID yang benar-benar ada pada
+  `evidence.json`.
+- `evidence_refs` hanya boleh merujuk source file yang benar-benar ada pada
+  `evidence.json`.
+- Jangan mengarang source file, checklist ID, endpoint, metric, atau evidence.
+- Recommendation tidak boleh mengubah status evidence.
+- Recommendation tidak boleh mengubah `finding`, `severity`, `completed`,
+  `requires_review`, atau status checklist.
+- Recommendation hanya merupakan interpretasi/rekomendasi tambahan.
+- Jika evidence belum cukup untuk memastikan vulnerability, gunakan
+  `requires_manual_validation: true`.
+- Jangan menyebut suatu item sebagai confirmed vulnerability hanya karena
+  item tersebut memiliki `requires_review: true`.
+- Jika tidak ada rekomendasi yang layak dibuat, gunakan `recommendations: []`.
+- Jangan membuat recommendation berdasarkan informasi yang tidak terdapat
+  pada evidence bundle atau analisis yang jelas-jelas dapat diturunkan dari
+  evidence.
+
+#### Allowed values
+
+`priority` wajib salah satu dari:
+
+- `Critical`
+- `High`
+- `Medium`
+- `Low`
+- `Informational`
+
+`type` wajib salah satu dari:
+
+- `finding`
+- `hardening`
+- `review`
+- `observation`
+
+`status` wajib salah satu dari:
+
+- `recommended`
+- `requires_validation`
+- `informational`
+
+`requires_manual_validation` wajib berupa boolean YAML:
+
+- `true`
+- `false`
+
+#### Exact YAML structure
+
+Gunakan struktur **persis** seperti berikut:
+
+```yaml
+schema: brebeskab-csirt-chatgpt-recommendation/v1
+
+project:
+  project_id: {project_id}
+
+review:
+  generated_by: ChatGPT
+  reviewed_at: "YYYY-MM-DDTHH:MM:SS+07:00"
+  reviewer: "NAMA REVIEWER"
+  basis:
+    - evidence.json
+    - report-prompt.md
+
+summary:
+  overall_assessment: >
+    Ringkasan assessment berdasarkan evidence.
+  priority: Medium
+
+recommendations:
+  - id: R-001
+    title: "Judul rekomendasi"
+    category: "Kategori"
+    priority: Medium
+    checklist_ids:
+      - "3-006"
+    type: hardening
+    status: recommended
+    evidence_refs:
+      - "03-infrastructure/example.yaml"
+    observation: >
+      Observasi yang benar-benar didukung evidence.
+    recommendation: >
+      Rekomendasi tindakan.
+    rationale: >
+      Alasan rekomendasi berdasarkan evidence.
+    requires_manual_validation: true
+```
+
+#### Field contract
+
+Setiap object pada `recommendations` **WAJIB** mempunyai field berikut:
+
+| Field | Type | Required | Rule |
+|---|---|---|---|
+| `id` | string | yes | Format rekomendasi, contoh `R-001` |
+| `title` | string | yes | Judul singkat |
+| `category` | string | yes | Kategori rekomendasi |
+| `priority` | string | yes | Salah satu allowed value |
+| `checklist_ids` | list[string] | yes | ID checklist yang benar-benar ada |
+| `type` | string | yes | Salah satu allowed value |
+| `status` | string | yes | Salah satu allowed value |
+| `evidence_refs` | list[string] | yes | Path evidence yang benar-benar ada |
+| `observation` | string | yes | Observasi berbasis evidence |
+| `recommendation` | string | yes | Tindakan yang direkomendasikan |
+| `rationale` | string | yes | Alasan berbasis evidence |
+| `requires_manual_validation` | boolean | yes | `true` jika perlu validasi manusia |
+
+Field berikut juga **WAJIB** ada:
+
+- `schema`
+- `project.project_id`
+- `review.generated_by`
+- `review.reviewed_at`
+- `review.reviewer`
+- `review.basis`
+- `summary.overall_assessment`
+- `summary.priority`
+- `recommendations`
+
+#### Evidence integrity rule
+
+`evidence.json` adalah **source of truth**.
+
+Contoh:
+- Evidence mengatakan `finding: false` → recommendation tidak boleh mengubah
+  menjadi finding.
+- Evidence mengatakan `requires_review: true` → recommendation boleh
+  menyarankan manual validation, tetapi tidak boleh menyatakan vulnerability
+  confirmed.
+- Evidence menunjukkan HTTP 500 → boleh direkomendasikan untuk review/debug
+  hardening, tetapi jangan menyimpulkan vulnerability tanpa evidence tambahan.
+- Upload `accepted_or_processed` → jangan menyimpulkan storage, execution,
+  persistence, atau overwrite jika belum dibuktikan.
+- Session reuse → jangan otomatis menyebut session fixation jika evidence
+  belum membuktikannya.
+- CVE candidate → jangan mengubah candidate menjadi confirmed vulnerability
+  tanpa validasi applicability.
+
+#### Standard output example
+
+Contoh berikut **hanya contoh format**, bukan fakta assessment:
+
+```yaml
+schema: brebeskab-csirt-chatgpt-recommendation/v1
+
+project:
+  project_id: PENTEST-2026-002
+
+review:
+  generated_by: ChatGPT
+  reviewed_at: "2026-10-09T20:00:00+07:00"
+  reviewer: "Hendrawan Aprillia Ashari"
+  basis:
+    - evidence.json
+    - report-prompt.md
+
+summary:
+  overall_assessment: >
+    Berdasarkan review terhadap evidence, tidak terdapat finding yang dapat
+    dikonfirmasi tanpa verifikasi manual tambahan.
+  priority: Medium
+
+recommendations:
+  - id: R-001
+    title: "Enforce HTTPS"
+    category: "Web Server Hardening"
+    priority: High
+    checklist_ids:
+      - "3-006"
+    type: hardening
+    status: recommended
+    evidence_refs:
+      - "03-infrastructure/example.yaml"
+    observation: >
+      HTTP masih dapat menyajikan content tanpa redirect ke HTTPS berdasarkan
+      evidence checklist terkait.
+    recommendation: >
+      Terapkan redirect HTTP ke HTTPS dan evaluasi HSTS setelah seluruh
+      endpoint HTTPS tervalidasi.
+    rationale: >
+      Mengurangi risiko komunikasi HTTP tanpa enkripsi.
+    requires_manual_validation: true
+```
+
+**ATURAN TERAKHIR UNTUK CHATGPT:**
+
+Jika menghasilkan `chatgpt-recommendation.yaml`, jangan membuat schema versi
+lain. Jangan mengganti nama field. Jangan menambahkan field seperti `severity`,
+`cwe`, `cvss`, `impact`, atau `finding_id` ke dalam recommendation schema
+kecuali schema ini nanti secara eksplisit diperbarui ke versi baru.
+
+`chatgpt-recommendation.yaml` adalah **optional expert interpretation layer**.
+File tersebut tidak menggantikan `evidence.json` dan tidak boleh mengubah
+hasil pengujian.
+
+### 7. OUTPUT FINAL
+
+Keluarkan laporan akhir sesuai struktur di atas.
+
+Jika memberikan ChatGPT recommendation YAML, letakkan setelah laporan dalam
+bagian terpisah:
+
+`## CHATGPT-RECOMMENDATION.YAML`
+
+dan isi bagian tersebut dengan YAML yang mengikuti **exact YAML structure**
+di atas.
+
+Jangan mencampurkan YAML recommendation dengan JSON source bundle.
+"""
+
 def make_prompt(bundle: dict[str, Any]) -> str:
     """
     Build a prompt that tells ChatGPT to write the final report from the
@@ -876,6 +1233,10 @@ sumbernya.
 
 ---
 
+{recommendation_contract(project["project_id"])}
+
+---
+
 # SOURCE BUNDLE
 
 Source bundle berikut dibuat otomatis oleh BrebesKab-CSIRT-Tools.
@@ -1094,8 +1455,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--project",
-        default=DEFAULT_PROJECT_ID,
-        help=f"Project ID (default: {DEFAULT_PROJECT_ID})",
+        default=None,
+        help=(
+            "Legacy project ID override. Normally the project is read "
+            "from active-project.yaml."
+        ),
     )
     parser.add_argument(
         "--project-root",
@@ -1111,8 +1475,34 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        root = resolve_project_root(args.project_root, args.project)
-        bundle = build_bundle(root, args.project)
+        # active-project.yaml is the authoritative project selector for
+        # normal execution. Explicit CLI overrides remain available so the
+        # existing script behavior is not unnecessarily removed.
+        active_project = None if args.project else load_active_project()
+
+        selected_project_id = (
+            args.project
+            if args.project
+            else active_project["project_id"]
+        )
+
+        root = resolve_project_root(
+            args.project_root,
+            selected_project_id,
+            active_project,
+        )
+
+        # Keep the existing bundle/output logic unchanged.
+        bundle = build_bundle(root, selected_project_id)
+
+        # Preserve the active project context in the bundle without changing
+        # the existing project metadata structure.
+        if active_project is not None:
+            bundle["active_project"] = {
+                "file": safe_rel(active_project["path"], repo_root()),
+                "project_id": active_project["project_id"],
+                "project_path": str(active_project["project_path"]),
+            }
 
         if args.command == "status":
             print_status(bundle)
