@@ -56,7 +56,7 @@ except ImportError as exc:
 
 
 SCRIPT_NAME = "execution.py"
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.1.1"
 CHECKLIST_ID = "10-002"
 CHECKLIST_NAME = "File Upload Extension Validation"
 PHASE_NAME = "10 File Upload"
@@ -264,6 +264,27 @@ def save_json(path: Path, data: Any) -> None:
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def methodology_definition() -> Dict[str, Any]:
+    """Return the canonical 10-002 methodology schema."""
+    return {
+        "source_candidates_only": True,
+        "same_origin_only": True,
+        "authenticated_session_required": True,
+        "multipart_post_allowed": True,
+        "form_reconstruction": True,
+        "csrf_from_live_form": True,
+        "file_execution": False,
+        "uploaded_file_execution": False,
+        "webshell": False,
+        "reverse_shell": False,
+        "command_execution": False,
+        "persistence": False,
+        "external_callbacks": False,
+        "automatic_finding": False,
+        "forensic_evidence_preserved": True,
+    }
 
 
 def same_origin(url: str, target_url: str) -> bool:
@@ -1298,23 +1319,7 @@ def cmd_init(_: argparse.Namespace) -> int:
             "session": str(session_path(project_path)),
             "session_records_available": len(session_records),
         },
-        "methodology": {
-            "source_candidates_only": True,
-            "same_origin_only": True,
-            "authenticated_session_required": True,
-            "multipart_post_allowed": True,
-            "form_reconstruction": True,
-            "csrf_from_live_form": True,
-            "file_execution": False,
-            "uploaded_file_execution": False,
-            "webshell": False,
-            "reverse_shell": False,
-            "command_execution": False,
-            "persistence": False,
-            "external_callbacks": False,
-            "automatic_finding": False,
-            "forensic_evidence_preserved": True,
-        },
+        "methodology": methodology_definition(),
         "toolchain": {
             "mandatory": ["Python", "requests", "PyYAML"],
             "external_scanners": [],
@@ -1521,19 +1526,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             "session": str(session_path(project_path)),
         },
         "methodology": {
-            "source_candidates_only": True,
-            "same_origin_only": True,
-            "authenticated_session_required": True,
+            **methodology_definition(),
             "multipart_post_performed": True,
-            "file_execution": False,
-            "uploaded_file_execution": False,
-            "webshell": False,
-            "reverse_shell": False,
-            "command_execution": False,
-            "persistence": False,
-            "external_callbacks": False,
-            "automatic_finding": False,
-            "forensic_evidence_preserved": True,
         },
         "test_matrix": [
             {
@@ -1643,6 +1637,7 @@ def cmd_verify(_: argparse.Namespace) -> int:
             "source_candidates_only",
             "same_origin_only",
             "authenticated_session_required",
+            "multipart_post_allowed",
             "form_reconstruction",
             "csrf_from_live_form",
         ):
