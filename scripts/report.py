@@ -5,6 +5,13 @@ BrebesKab-CSIRT-Tools — Deterministic Penetration Test Report Generator
 Generates:
     <project_root>/23-final-sign-off/penetration-test-report.docx
 
+Template:
+    <repo_root>/reports/templates/template.docx
+
+Template tags:
+    {{BODYREPORT}}       → isi laporan utama
+    {{LAMPIRANREPORT}}   → isi seluruh lampiran
+
 Primary inputs:
     .runtime/active-project.yaml
     <project_root>/23-final-sign-off/evidence.json
@@ -68,7 +75,7 @@ except ImportError:
     raise SystemExit(2)
 
 
-SCRIPT_VERSION = "1.0.1"
+SCRIPT_VERSION = "1.2.1"
 
 ACTIVE_PROJECT_RELATIVE = Path(".runtime") / "active-project.yaml"
 FINAL_DIRNAME = "23-final-sign-off"
@@ -78,6 +85,9 @@ EVIDENCE_YAML = "evidence.yaml"
 REPORT_PROMPT = "report-prompt.md"
 RECOMMENDATION_FILE = "chatgpt-recommendation.yaml"
 OUTPUT_DOCX = "penetration-test-report.docx"
+TEMPLATE_RELATIVE = Path("reports") / "templates" / "template.docx"
+BODYREPORT_TAG = "{{BODYREPORT}}"
+LAMPIRANREPORT_TAG = "{{LAMPIRANREPORT}}"
 
 RECOMMENDATION_SCHEMA = "brebeskab-csirt-chatgpt-recommendation/v1"
 
@@ -1079,19 +1089,30 @@ def add_label_value(doc: Document, label: str, value: Any):
 
 
 def add_bullet(doc: Document, text: str, level: int = 0):
-    style = "List Bullet" if level == 0 else "List Bullet 2"
-    p = doc.add_paragraph(style=style)
+    # Do not depend on Word built-in list styles because the supplied template
+    # intentionally contains a minimal/custom style set.
+    p = doc.add_paragraph()
+    p.paragraph_format.left_indent = Inches(0.22 + (0.22 * level))
+    p.paragraph_format.first_line_indent = Inches(-0.16)
     p.paragraph_format.space_after = Pt(2)
-    r = p.add_run(text)
-    set_run_font(r, BODY_FONT_SIZE)
+    r = p.add_run("• ")
+    set_run_font(r, BODY_FONT_SIZE, bold=False)
+    r2 = p.add_run(text)
+    set_run_font(r2, BODY_FONT_SIZE)
     return p
 
 
-def add_numbered(doc: Document, text: str):
-    p = doc.add_paragraph(style="List Number")
+def add_numbered(doc: Document, text: str, number: int | None = None):
+    # Manual numbering avoids dependence on the template's list styles.
+    p = doc.add_paragraph()
+    p.paragraph_format.left_indent = Inches(0.22)
+    p.paragraph_format.first_line_indent = Inches(-0.22)
     p.paragraph_format.space_after = Pt(2)
-    r = p.add_run(text)
-    set_run_font(r, BODY_FONT_SIZE)
+    prefix = f"{number}. " if number is not None else "• "
+    r = p.add_run(prefix)
+    set_run_font(r, BODY_FONT_SIZE, bold=False)
+    r2 = p.add_run(text)
+    set_run_font(r2, BODY_FONT_SIZE)
     return p
 
 
@@ -1410,38 +1431,117 @@ def add_scope_roe(
     meta: dict[str, Any],
     evidence: dict[str, Any],
 ):
-    doc.add_heading("2. Scope & Rules of Engagement", level=1)
+    """Render explicit target/port boundaries without inventing missing ROE terms."""
+    from urllib.parse import urlsplit
 
-    add_label_value(doc, "Project ID", meta["project_id"])
-    add_label_value(doc, "Application", meta["application"])
+    doc.add_heading("2. Ruang Lingkup & Aturan Pelaksanaan Pengujian", level=1)
+
+    add_label_value(doc, "ID Proyek", meta["project_id"])
+    add_label_value(doc, "Aplikasi", meta["application"])
     add_label_value(doc, "Target", meta["target"])
-    add_label_value(doc, "Assessment Type", meta["assessment_type"])
-    add_label_value(doc, "Environment", meta["environment"])
+    add_label_value(doc, "Jenis Pengujian", meta["assessment_type"])
+    add_label_value(doc, "Lingkungan", meta["environment"])
 
+    # Scope boundary confirmed by the project owner: web ports 80 and 443 only.
+    # This explicit project constraint takes precedence over missing/incomplete
+    # scope metadata; the original metadata is still shown below for traceability.
+    target_url = safe_text(meta.get("target"), "")
+    parsed_target = urlsplit(
+        target_url if "://" in target_url else f"https://{target_url}"
+    )
+    target_host = parsed_target.hostname or target_url or "target yang tercantum"
     scope = meta.get("scope")
     roe = meta.get("roe")
 
-    doc.add_heading("Scope", level=2)
-    if isinstance(scope, dict):
+    doc.add_heading("2.1 Ruang Lingkup Pengujian", level=2)
+    doc.add_paragraph(
+        "Pengujian dibatasi pada aplikasi web yang menjadi target penilaian. "
+        "Batas port yang diizinkan adalah TCP/80 (HTTP) dan TCP/443 (HTTPS) saja. "
+        "Batas ini berlaku untuk aktivitas pengujian dan enumerasi layanan; "
+        "port lain tidak termasuk dalam ruang lingkup."
+    )
+    add_bullet(doc, f"Target host: {target_host}. URL target: {target_url or 'tidak tercantum'}.")
+    add_bullet(doc, "Port yang termasuk scope: TCP/80 untuk HTTP dan TCP/443 untuk HTTPS.")
+    add_bullet(
+        doc,
+        "Aktivitas yang termasuk scope: pemeriksaan aplikasi web dan konfigurasi "
+        "web yang dapat diamati melalui target pada port 80/443, termasuk endpoint "
+        "yang ditemukan selama pengujian pada host target yang sama."
+    )
+    add_bullet(
+        doc,
+        "Di luar scope: port TCP/UDP selain 80 dan 443, layanan non-web pada port lain, "
+        "serta host, subdomain, alamat IP, atau aplikasi lain yang tidak dinyatakan "
+        "secara eksplisit sebagai target."
+    )
+    add_bullet(
+        doc,
+        "Temuan atau sinyal yang muncul dari respons aplikasi dicatat sebagai evidence; "
+        "respons tersebut tidak otomatis dianggap sebagai kerentanan terkonfirmasi."
+    )
+
+    if isinstance(scope, dict) and scope:
+        doc.add_paragraph(
+            "Metadata scope yang tersedia pada paket evidence ditampilkan berikut "
+            "sebagai informasi tambahan. Batas port TCP/80 dan TCP/443 di atas tetap "
+            "menjadi batas operasional pengujian."
+        )
         for key, value in scope.items():
             add_label_value(doc, str(key), value)
     elif scope:
+        doc.add_paragraph("Metadata scope tambahan:")
         doc.add_paragraph(clean_multiline(scope))
     else:
         doc.add_paragraph(
-            "Scope details were not separately populated in the evidence metadata. "
-            "Refer to the assessment and checklist evidence for the operational scope."
+            "Rincian scope operasional pada metadata evidence tidak terisi secara "
+            "terpisah. Karena itu, laporan ini menyatakan batas yang telah ditetapkan "
+            "secara eksplisit: host target aplikasi web dan hanya port TCP/80 serta "
+            "TCP/443."
         )
 
-    doc.add_heading("Rules of Engagement", level=2)
-    if isinstance(roe, dict):
+    doc.add_heading("2.2 Aturan Pelaksanaan Pengujian", level=2)
+    doc.add_paragraph(
+        "Aturan pelaksanaan berikut menjabarkan batas operasional yang dapat "
+        "dipastikan dari scope penilaian. Aturan ini tidak memperluas otorisasi "
+        "ke aset atau port lain."
+    )
+    for rule in [
+        "Pengujian hanya diarahkan ke host target yang tercantum dalam laporan dan "
+        "layanan web pada TCP/80 atau TCP/443.",
+        "Tidak melakukan pemindaian atau pengujian layanan pada port selain TCP/80 "
+        "dan TCP/443, sekalipun layanan tersebut terlihat dari hasil observasi.",
+        "Penemuan tautan atau endpoint baru tidak memperluas scope ke host, subdomain, "
+        "alamat IP, atau aplikasi lain; endpoint hanya diuji jika masih berada pada "
+        "host target yang sama.",
+        "Status HTTP seperti 200, 302, 403, atau 500, refleksi payload, pesan error, "
+        "atau respons upload yang diterima dicatat sebagai observasi. Status tersebut "
+        "bukan bukti tunggal bahwa eksploitasi berhasil atau kerentanan telah terkonfirmasi.",
+        "Pengujian lanjutan yang berpotensi mengganggu ketersediaan layanan, mengubah "
+        "atau menghapus data, mempertahankan akses, atau mengakses data di luar kebutuhan "
+        "validasi tidak dianggap otomatis diizinkan oleh scope ini; diperlukan otorisasi "
+        "terpisah yang eksplisit.",
+    ]:
+        add_bullet(doc, rule)
+
+    if isinstance(roe, dict) and roe:
+        doc.add_paragraph(
+            "Metadata Rules of Engagement yang tersedia pada paket evidence:"
+        )
         for key, value in roe.items():
             add_label_value(doc, str(key), value)
     elif roe:
+        doc.add_paragraph("Metadata Rules of Engagement tambahan:")
         doc.add_paragraph(clean_multiline(roe))
     else:
-        doc.add_paragraph(
-            "No standalone rules-of-engagement block was present in the evidence bundle."
+        add_note_box(
+            doc,
+            "Catatan kelengkapan Rules of Engagement",
+            "Paket evidence tidak memuat blok Rules of Engagement terpisah. "
+            "Karena itu, laporan ini tidak mengarang jadwal pengujian, batas laju request, "
+            "kontak eskalasi, prosedur penghentian, atau ketentuan penanganan data yang "
+            "belum terdokumentasi. Ketentuan tersebut perlu dikonfirmasi pada dokumen "
+            "otorisasi/ROE proyek jika diperlukan.",
+            fill="FFF8E1",
         )
 
 
@@ -1478,8 +1578,8 @@ def add_methodology(
         "Final report generation from the evidence bundle.",
     ]
     doc.add_heading("Assessment flow", level=2)
-    for step in steps:
-        add_numbered(doc, step)
+    for index, step in enumerate(steps, start=1):
+        add_numbered(doc, step, index)
 
     doc.add_heading("Evidence handling principle", level=2)
     doc.add_paragraph(
@@ -2187,28 +2287,509 @@ def add_appendix_recommendations(
 
 
 # ---------------------------------------------------------------------------
-# Report generation
+# Indonesian presentation layer
 # ---------------------------------------------------------------------------
 
-def generate_report(
-    project_root: Path,
-    active: dict[str, Any],
+REPORT_TRANSLATIONS = {
+    "PENETRATION TEST REPORT": "LAPORAN UJI PENETRASI",
+    "BrebesKab-CSIRT-Tools — Evidence-Driven Assessment":
+        "BrebesKab-CSIRT-Tools — Pengujian Berbasis Evidence",
+    "Assessment Attribute": "Atribut Pengujian",
+    "Project ID": "ID Proyek",
+    "Assessment Type": "Jenis Pengujian",
+    "Environment": "Lingkungan",
+    "Tester": "Penguji",
+    "Reviewer": "Peninjau",
+    "Evidence Generated": "Evidence Dibuat",
+    "Evidence Source": "Sumber Evidence",
+    "AI-Assisted Review": "Tinjauan Berbantuan AI",
+    "Included": "Disertakan",
+    "Not provided": "Tidak disediakan",
+    "Important report principle": "Prinsip Penting Laporan",
+    "This report is generated from collected evidence. ":
+        "Laporan ini dibuat berdasarkan evidence yang dikumpulkan. ",
+    "Absence of confirmed findings does not mean the target is guaranteed secure. ":
+        "Tidak adanya temuan terkonfirmasi bukan berarti target dijamin aman. ",
+    "Items marked for review require human validation before final security conclusions.":
+        "Item yang ditandai untuk ditinjau memerlukan validasi manusia sebelum kesimpulan keamanan akhir ditetapkan.",
+    "Generated by BrebesKab-CSIRT-Tools": "Dibuat oleh BrebesKab-CSIRT-Tools",
+    "Executive Summary": "Ringkasan Eksekutif",
+    "Scope & Rules of Engagement": "Ruang Lingkup & Aturan Pelaksanaan Pengujian",
+    "Scope": "Ruang Lingkup",
+    "Rules of Engagement": "Aturan Pelaksanaan Pengujian",
+    "Methodology": "Metodologi",
+    "Assessment flow": "Alur Pengujian",
+    "Evidence handling principle": "Prinsip Pengelolaan Evidence",
+    "Assessment Coverage": "Cakupan Pengujian",
+    "Detailed Technical Results": "Hasil Teknis Terperinci",
+    "Findings": "Temuan",
+    "Items Requiring Manual Review": "Item yang Memerlukan Tinjauan Manual",
+    "Security Observations / Forensic Signals":
+        "Observasi Keamanan / Sinyal Forensik",
+    "Limitations": "Keterbatasan",
+    "Recommendations": "Rekomendasi",
+    "Retest / Verification Status": "Status Retest / Verifikasi",
+    "Overall Conclusion": "Kesimpulan Umum",
+    "Evidence / Data Consistency Notes": "Catatan Konsistensi Evidence / Data",
+    "Final Sign-off Checklist": "Daftar Periksa Sign-off Akhir",
+    "Appendix A — Checklist Matrix": "Lampiran A — Matriks Daftar Periksa",
+    "Appendix B — Evidence Index": "Lampiran B — Indeks Evidence",
+    "Appendix C — Important Metrics": "Lampiran C — Metrik Penting",
+    "Appendix D — Review Items": "Lampiran D — Item Tinjauan",
+    "Appendix E — Expert Review Recommendation Index":
+        "Lampiran E — Indeks Rekomendasi Tinjauan Ahli",
+    "Evidence is the source of truth.": "Evidence merupakan sumber kebenaran utama.",
+    "Expert review recommendations": "Rekomendasi Tinjauan Ahli",
+    "Incomplete coverage": "Cakupan Belum Lengkap",
+    "Recommendation priority distribution": "Distribusi Prioritas Rekomendasi",
+    "No confirmed findings recorded": "Tidak Terdapat Temuan Terkonfirmasi yang Tercatat",
+    "No checklist-level manual-review items were recorded.":
+        "Tidak terdapat item tinjauan manual pada tingkat daftar periksa.",
+    "No standalone observation text was available in checklist records.":
+        "Tidak tersedia teks observasi tersendiri pada catatan daftar periksa.",
+    "No review items recorded.": "Tidak terdapat item tinjauan yang tercatat.",
+    "No source-file inventory was present.": "Tidak terdapat inventaris berkas sumber.",
+    "No validated ChatGPT recommendation file was included.":
+        "Tidak ada berkas rekomendasi ChatGPT yang tervalidasi yang disertakan.",
+    "Assessment status recorded in evidence":
+        "Status pengujian yang tercatat pada evidence",
+    "Assessment started_at": "Waktu Mulai Pengujian",
+    "Assessment completed_at": "Waktu Selesai Pengujian",
+    "Evidence bundle generated": "Paket Evidence Dibuat",
+    "Confirmed findings recorded": "Temuan Terkonfirmasi Tercatat",
+    "Manual-review items documented": "Item Tinjauan Manual Terdokumentasi",
+    "Incomplete checklist coverage": "Cakupan Daftar Periksa Belum Lengkap",
+    "Final report generated from evidence": "Laporan Akhir Dibuat dari Evidence",
+    "Human final review required": "Tinjauan Akhir oleh Manusia Diperlukan",
+    "Control": "Kontrol",
+    "Status": "Status",
+    "Metric": "Metrik",
+    "Value": "Nilai",
+    "Priority": "Prioritas",
+    "Count": "Jumlah",
+    "Source File": "Berkas Sumber",
+    "Category": "Kategori",
+    "Size": "Ukuran",
+    "Title": "Judul",
+    "Finding": "Temuan",
+    "Review": "Tinjauan",
+    "Observation": "Observasi",
+    "Checklist": "Daftar Periksa",
+    "ID": "ID",
+    "Type": "Jenis",
+    "Checklist IDs": "ID Daftar Periksa",
+    "Evidence refs": "Referensi Evidence",
+    "Requires manual validation": "Memerlukan Validasi Manual",
+    "Recommendation": "Rekomendasi",
+    "Rationale": "Alasan",
+    "Manual validation required": "Validasi Manual Diperlukan",
+    "AI-assisted review disclaimer": "Penafian Tinjauan Berbantuan AI",
+    "Final sign-off consideration": "Pertimbangan Sign-off Akhir",
+    "Recommendation file was not included": "Berkas Rekomendasi Tidak Disertakan",
+    "Sign-off statement": "Pernyataan Sign-off",
+    "CVE candidate correlation requires manual applicability validation.":
+        "Korelasi kandidat CVE memerlukan validasi manual terhadap keterterapan.",
+    "Manual-review items are not automatically classified as vulnerabilities.":
+        "Item tinjauan manual tidak otomatis diklasifikasikan sebagai kerentanan.",
+    "Evidence such as HTTP 200 responses, reflection, accepted uploads, disclosed versions, accepted HTTP methods, or replay behavior is presented as observed evidence.":
+        "Evidence seperti respons HTTP 200, refleksi payload, unggahan yang diterima, versi yang terungkap, metode HTTP yang diterima, atau perilaku replay disajikan sebagai evidence yang teramati.",
+    "It is not automatically converted into a vulnerability unless the evidence explicitly records a confirmed finding.":
+        "Evidence tersebut tidak otomatis diklasifikasikan sebagai kerentanan kecuali evidence secara eksplisit mencatat temuan terkonfirmasi.",
+    "No standalone rules-of-engagement block was present in the evidence bundle.":
+        "Tidak terdapat blok aturan pelaksanaan pengujian yang berdiri sendiri pada paket evidence.",
+    "No separate retest dataset was present in the evidence bundle.":
+        "Tidak terdapat dataset retest terpisah dalam paket evidence.",
+    "Manual review required.": "Memerlukan tinjauan manual.",
+    "Recommendation": "Rekomendasi",
+    "Rationale": "Alasan",
+    "Evidence / Observation": "Evidence / Observasi",
+    "The report generator does not reinterpret raw probe output into a finding.":
+        "Generator laporan tidak menafsirkan ulang keluaran probe mentah menjadi temuan.",
+    "It reports the status and observations recorded by the evidence collector.":
+        "Generator hanya melaporkan status dan observasi yang dicatat oleh pengumpul evidence.",
+    "Manual review recommendations are separated from confirmed findings.":
+        "Rekomendasi tinjauan manual dipisahkan dari temuan terkonfirmasi.",
+    "This is not equivalent to a guarantee that the target is secure; manual-review items are documented separately.":
+        "Hal ini bukan berarti target dijamin aman; item tinjauan manual didokumentasikan secara terpisah.",
+    "This recommendation must be verified by an authorized human reviewer before it is treated as a confirmed security conclusion.":
+        "Rekomendasi ini harus diverifikasi oleh peninjau manusia yang berwenang sebelum diperlakukan sebagai kesimpulan keamanan terkonfirmasi.",
+    "ChatGPT recommendations are advisory. They are generated from the supplied evidence and must not be treated as independent proof of a vulnerability. The evidence bundle remains authoritative for checklist status and finding state.":
+        "Rekomendasi ChatGPT bersifat advisori. Rekomendasi dibuat berdasarkan evidence yang disediakan dan tidak boleh diperlakukan sebagai bukti independen adanya kerentanan. Paket evidence tetap menjadi sumber otoritatif untuk status daftar periksa dan status temuan.",
+    "No external recommendation file was supplied. The report therefore contains evidence-derived observations only.":
+        "Tidak ada berkas rekomendasi eksternal yang disediakan. Laporan hanya memuat observasi yang berasal dari evidence.",
+    "Recommendations below are imported from the optional ChatGPT expert-review file and are presented as advisory material. They do not alter evidence status, finding state, or checklist completion state.":
+        "Rekomendasi berikut diimpor dari berkas opsional tinjauan ahli ChatGPT dan disajikan sebagai bahan advisori. Rekomendasi tidak mengubah status evidence, status temuan, maupun status penyelesaian daftar periksa.",
+    "No checklist records were present in the evidence bundle.":
+        "Tidak terdapat catatan daftar periksa dalam paket evidence.",
+    "One or more checklist areas remain incomplete. Those areas should be completed or explicitly accepted before final sign-off.":
+        "Satu atau lebih area daftar periksa masih belum lengkap. Area tersebut harus diselesaikan atau diterima secara eksplisit sebelum sign-off akhir.",
+    "Evidence is limited to what was observed and captured during the assessment.":
+        "Evidence terbatas pada hal-hal yang diamati dan direkam selama pengujian.",
+    "A response that is accepted or reflected is not, by itself, proof of exploitability.":
+        "Respons yang diterima atau merefleksikan payload bukan dengan sendirinya bukti bahwa sistem dapat dieksploitasi.",
+    "File-upload acceptance does not by itself prove persistence, storage location, overwrite, or code execution.":
+        "Penerimaan unggahan berkas bukan dengan sendirinya membuktikan persistence, lokasi penyimpanan, overwrite, atau eksekusi kode.",
+}
+
+# Translate only report presentation text. Raw evidence observations are intentionally
+# preserved because they are source evidence and must not be silently rewritten.
+def localize_report_document(doc: Document) -> None:
+    """
+    Translate report presentation text to Indonesian.
+
+    Paragraph-level replacement is intentional: it handles text split across
+    multiple Word runs. Evidence JSON/technical observation blocks are skipped
+    so the source evidence is not silently rewritten.
+    """
+    translations = dict(REPORT_TRANSLATIONS)
+    translations.update({
+        "Executive Summary": "Ringkasan Eksekutif",
+        "Scope & Rules of Engagement": "Ruang Lingkup & Aturan Pelaksanaan Pengujian",
+        "Methodology": "Metodologi",
+        "Assessment Coverage": "Cakupan Pengujian",
+        "Detailed Technical Results": "Hasil Teknis Terperinci",
+        "Findings": "Temuan",
+        "Items Requiring Manual Review": "Item yang Memerlukan Tinjauan Manual",
+        "Security Observations / Forensic Signals":
+            "Observasi Keamanan / Sinyal Forensik",
+        "Limitations": "Keterbatasan",
+        "Recommendations": "Rekomendasi",
+        "Retest / Verification Status": "Status Retest / Verifikasi",
+        "Overall Conclusion": "Kesimpulan Umum",
+        "Evidence / Data Consistency Notes": "Catatan Konsistensi Evidence / Data",
+        "Final Sign-off Checklist": "Daftar Periksa Sign-off Akhir",
+        "Coverage:": "Cakupan:",
+        "Expert review:": "Tinjauan ahli:",
+        "Assessment Attribute": "Atribut Pengujian",
+        "Project ID": "ID Proyek",
+        "Assessment Type": "Jenis Pengujian",
+        "Environment": "Lingkungan",
+        "Tester": "Penguji",
+        "Reviewer": "Peninjau",
+        "Evidence Generated": "Evidence Dibuat",
+        "Evidence Source": "Sumber Evidence",
+        "AI-Assisted Review": "Tinjauan Berbantuan AI",
+        "Included": "Disertakan",
+        "Not provided": "Tidak disediakan",
+        "Scope details were not separately populated in the evidence metadata. Refer to the assessment and checklist evidence for the operational scope.":
+            "Rincian ruang lingkup tidak diisi secara terpisah pada metadata evidence. Lihat evidence pengujian dan daftar periksa untuk mengetahui ruang lingkup operasional.",
+        "The assessment was executed using the checklist structure represented by BrebesKab-CSIRT-Tools. Evidence was collected by checklist-specific tooling, then aggregated into an evidence bundle for final reporting.":
+            "Pengujian dilaksanakan menggunakan struktur daftar periksa yang direpresentasikan oleh BrebesKab-CSIRT-Tools. Evidence dikumpulkan oleh alat yang spesifik terhadap setiap daftar periksa, kemudian diagregasikan menjadi paket evidence untuk penyusunan laporan akhir.",
+        "Preparation and scope confirmation.": "Persiapan dan konfirmasi ruang lingkup.",
+        "Reconnaissance and attack-surface mapping.": "Reconnaissance dan pemetaan permukaan serangan.",
+        "Infrastructure and web-server configuration assessment.": "Pengujian infrastruktur dan konfigurasi web server.",
+        "Security-header, session, authentication and authorization checks.": "Pemeriksaan security header, sesi, autentikasi, dan otorisasi.",
+        "Input-validation, file-upload and application-security checks.": "Pemeriksaan validasi input, unggah berkas, dan keamanan aplikasi.",
+        "Evidence aggregation and consistency review.": "Agregasi evidence dan pemeriksaan konsistensi.",
+        "Final report generation from the evidence bundle.": "Pembuatan laporan akhir dari paket evidence.",
+        "The report generator does not reinterpret raw probe output into a finding. It reports the status and observations recorded by the evidence collector. Manual review recommendations are separated from confirmed findings.":
+            "Generator laporan tidak menafsirkan ulang keluaran probe mentah menjadi temuan. Generator hanya melaporkan status dan observasi yang dicatat oleh pengumpul evidence. Rekomendasi tinjauan manual dipisahkan dari temuan terkonfirmasi.",
+        "The assessment evidence contains 0 confirmed finding record(s). The findings section below is the authoritative presentation of those records.":
+            "Evidence pengujian berisi 0 catatan temuan terkonfirmasi. Bagian temuan di bawah merupakan penyajian otoritatif atas catatan tersebut.",
+        "No checklist records were present in the evidence bundle.":
+            "Tidak terdapat catatan daftar periksa dalam paket evidence.",
+        "No confirmed findings recorded":
+            "Tidak terdapat temuan terkonfirmasi yang tercatat",
+        "The evidence bundle contains zero confirmed finding records. This is not equivalent to a guarantee that the target is secure; manual-review items are documented separately.":
+            "Paket evidence tidak berisi catatan temuan terkonfirmasi. Hal ini bukan berarti target dijamin aman; item tinjauan manual didokumentasikan secara terpisah.",
+        "Incomplete coverage": "Cakupan Belum Lengkap",
+        "No standalone observation text was available in checklist records.":
+            "Tidak tersedia teks observasi tersendiri pada catatan daftar periksa.",
+        "One or more checklist areas remain incomplete. Those areas should be completed or explicitly accepted before final sign-off.":
+            "Satu atau lebih area daftar periksa masih belum lengkap. Area tersebut harus diselesaikan atau diterima secara eksplisit sebelum sign-off akhir.",
+        "Evidence is limited to what was observed and captured during the assessment.":
+            "Evidence terbatas pada hal-hal yang diamati dan direkam selama pengujian.",
+        "A response that is accepted or reflected is not, by itself, proof of exploitability.":
+            "Respons yang diterima atau merefleksikan payload bukan dengan sendirinya bukti bahwa sistem dapat dieksploitasi.",
+        "CVE candidate correlation requires manual applicability validation.":
+            "Korelasi kandidat CVE memerlukan validasi manual terhadap keterterapan.",
+        "File-upload acceptance does not by itself prove persistence, storage location, overwrite, or code execution.":
+            "Penerimaan unggahan berkas bukan dengan sendirinya membuktikan persistence, lokasi penyimpanan, overwrite, atau eksekusi kode.",
+        "Manual-review items are not automatically classified as vulnerabilities.":
+            "Item tinjauan manual tidak otomatis diklasifikasikan sebagai kerentanan.",
+        "No external recommendation file was supplied. The report therefore contains evidence-derived observations only.":
+            "Tidak ada berkas rekomendasi eksternal yang disediakan. Laporan hanya memuat observasi yang berasal dari evidence.",
+        "Recommendations below are imported from the optional ChatGPT expert-review file and are presented as advisory material. They do not alter evidence status, finding state, or checklist completion state.":
+            "Rekomendasi berikut diimpor dari berkas opsional tinjauan ahli ChatGPT dan disajikan sebagai bahan advisori. Rekomendasi tidak mengubah status evidence, status temuan, maupun status penyelesaian daftar periksa.",
+        "Manual validation required":
+            "Validasi manual diperlukan",
+        "AI-assisted review disclaimer":
+            "Penafian tinjauan berbantuan AI",
+        "Final sign-off consideration":
+            "Pertimbangan Sign-off Akhir",
+        "No separate retest dataset was present in the evidence bundle. The current document should therefore be interpreted as the initial assessment report unless a subsequent retest record is supplied.":
+            "Tidak terdapat dataset retest terpisah dalam paket evidence. Dokumen ini harus dipahami sebagai laporan pengujian awal kecuali tersedia catatan retest berikutnya.",
+        "The report generator does not derive assessment start/end dates from the evidence generation timestamp. If the assessment metadata records null or not-started values, those values are preserved.":
+            "Generator laporan tidak menentukan tanggal mulai/selesai pengujian berdasarkan waktu pembuatan evidence. Jika metadata pengujian mencatat nilai null atau not-started, nilai tersebut dipertahankan.",
+        "Recommendation file was not included":
+            "Berkas Rekomendasi Tidak Disertakan",
+        "Final acceptance, risk acceptance, and declaration of assessment completeness remain human responsibilities. This document is a deterministic presentation of the collected evidence and validated advisory recommendations.":
+            "Penerimaan akhir, penerimaan risiko, dan pernyataan bahwa pengujian telah lengkap tetap merupakan tanggung jawab manusia. Dokumen ini merupakan penyajian deterministik dari evidence yang dikumpulkan dan rekomendasi advisori yang telah divalidasi.",
+        "Recommendation priority distribution": "Distribusi Prioritas Rekomendasi",
+        "No review items recorded.": "Tidak terdapat item tinjauan yang tercatat.",
+        "No source-file inventory was present.": "Tidak terdapat inventaris berkas sumber.",
+        "No validated ChatGPT recommendation file was included.":
+            "Tidak ada berkas rekomendasi ChatGPT yang tervalidasi yang disertakan.",
+        "Evidence / Observation": "Evidence / Observasi",
+        "Source File": "Berkas Sumber",
+        "Priority": "Prioritas",
+        "Count": "Jumlah",
+        "Metric": "Metrik",
+        "Value": "Nilai",
+        "Category": "Kategori",
+        "Type": "Jenis",
+        "Title": "Judul",
+        "Finding": "Temuan",
+        "Review": "Tinjauan",
+        "Observation": "Observasi",
+        "Checklist": "Daftar Periksa",
+        "Status": "Status",
+        "ID": "ID",
+        "Recommendation": "Rekomendasi",
+        "Rationale": "Alasan",
+        "Checklist IDs": "ID Daftar Periksa",
+        "Evidence refs": "Referensi Evidence",
+        "Requires manual validation": "Memerlukan validasi manual",
+        "Project ID:": "ID Proyek:",
+        "Application:": "Aplikasi:",
+        "Target:": "Target:",
+        "Assessment Type:": "Jenis Pengujian:",
+        "Environment:": "Lingkungan:",
+        "Black Box": "Black Box",
+        "Production": "Produksi",
+        "Penetration Test Report": "Laporan Uji Penetrasi",
+        "Page ": "Halaman ",
+    })
+
+    def is_raw_evidence(value: str) -> bool:
+        return (
+            value.lstrip().startswith("{")
+            or '"requires_review"' in value
+            or '"http_available"' in value
+            or '"initial_status_code"' in value
+            or '"served_over_http"' in value
+        )
+
+    def translate(value: str) -> str:
+        result = value
+        for src_text, dst_text in sorted(
+            translations.items(), key=lambda item: len(item[0]), reverse=True
+        ):
+            result = result.replace(src_text, dst_text)
+
+        result = re.sub(
+            r"\bChecklist Group\s+(\d+)\b",
+            r"Kelompok Daftar Periksa \1",
+            result,
+        )
+        result = re.sub(
+            r"\bChecklist\s+(\d{1,2}-\d{3})\b",
+            r"Daftar Periksa \1",
+            result,
+        )
+        result = result.replace("High Priority", "Prioritas Tinggi")
+        result = result.replace("Medium Priority", "Prioritas Sedang")
+        result = result.replace("Low Priority", "Prioritas Rendah")
+        result = result.replace("Critical Priority", "Prioritas Kritis")
+        result = result.replace("Informational Priority", "Prioritas Informasional")
+
+        # Translate status only when presented as a report status, not inside
+        # evidence JSON.
+        if "Status:" in result:
+            for src_status, dst_status in (
+                ("completed", "selesai"),
+                ("partial", "sebagian"),
+                ("incomplete", "belum lengkap"),
+                ("requires_review", "memerlukan tinjauan"),
+                ("review", "perlu ditinjau"),
+            ):
+                result = result.replace(src_status, dst_status)
+
+        # Translate the executive-summary coverage sentence.
+        if result.startswith("Coverage:"):
+            result = result.replace("Coverage:", "Cakupan:")
+            result = result.replace("completed", "selesai")
+            result = result.replace("incomplete", "belum lengkap")
+            result = result.replace("review item(s)", "item tinjauan")
+            result = result.replace("finding record(s)", "catatan temuan")
+            result = result.replace("parse error(s)", "kesalahan parsing")
+
+        if result.startswith("Expert review:") or result.startswith("Tinjauan ahli:"):
+            result = re.sub(
+                r"Expert review:\s*(\d+)\s*recommendation\(s\) were supplied in the optional ChatGPT review file\. Priority distribution:\s*",
+                r"Tinjauan ahli: \1 rekomendasi disediakan dalam berkas tinjauan ChatGPT opsional. Distribusi prioritas: ",
+                result,
+            )
+            result = result.replace("High:", "Tinggi:")
+            result = result.replace("Medium:", "Sedang:")
+            result = result.replace("Low:", "Rendah:")
+            result = result.replace("Critical:", "Kritis:")
+            result = result.replace("Informational:", "Informasional:")
+            result = result.replace("Priority distribution:", "Distribusi prioritas:")
+
+        # Handle the dynamic coverage sentence generated by the report.
+        result = re.sub(
+            r"^Coverage:\s*(\d+)\s*checklist;\s*(\d+)\s*completed;\s*"
+            r"(\d+)\s*incomplete;\s*(\d+)\s*review item\(s\);\s*"
+            r"(\d+)\s*finding record\(s\);\s*(\d+)\s*parse error\(s\)\.?$",
+            r"Cakupan: \1 daftar periksa; \2 selesai; \3 belum lengkap; "
+            r"\4 item tinjauan; \5 catatan temuan; \6 kesalahan parsing.",
+            result,
+        )
+        result = re.sub(
+            r"^Cakupan:\s*(\d+)\s*checklist;\s*(\d+)\s*completed;\s*"
+            r"(\d+)\s*incomplete;\s*(\d+)\s*review item\(s\);\s*"
+            r"(\d+)\s*finding record\(s\);\s*(\d+)\s*parse error\(s\)\.?$",
+            r"Cakupan: \1 daftar periksa; \2 selesai; \3 belum lengkap; "
+            r"\4 item tinjauan; \5 catatan temuan; \6 kesalahan parsing.",
+            result,
+        )
+        result = result.replace("Daftar Periksa Group ", "Kelompok Daftar Periksa ")
+        result = result.replace("Kelompok Daftar Periksa Group ", "Kelompok Daftar Periksa ")
+        if result.startswith("Metrik:"):
+            result = result.replace("findings", "temuan")
+            result = result.replace("requires_review", "perlu_tinjauan")
+
+        # Common mixed-language phrases from the evidence-derived prose.
+        result = result.replace("security finding", "temuan keamanan")
+        result = result.replace("manual review", "tinjauan manual")
+        result = result.replace("manual-review", "tinjauan-manual")
+        result = result.replace("checklist", "daftar periksa")
+        result = result.replace("recommendation(s)", "rekomendasi")
+        result = result.replace("recommendation", "rekomendasi")
+        result = result.replace("were supplied in the optional ChatGPT review file.",
+                                "disediakan dalam berkas tinjauan ChatGPT opsional.")
+        result = result.replace("Priority distribution:", "Distribusi prioritas:")
+        result = result.replace("Priority distribution", "Distribusi prioritas")
+        result = result.replace("Prioritas distribution", "Distribusi prioritas")
+        result = result.replace("Metriks:", "Metrik:")
+        result = result.replace("High:", "Tinggi:")
+        result = result.replace("Medium:", "Sedang:")
+        result = result.replace("Low:", "Rendah:")
+        result = result.replace("Critical:", "Kritis:")
+        result = result.replace("Informational:", "Informasional:")
+
+        return result
+
+    def localize_paragraph(paragraph):
+        if is_raw_evidence(paragraph.text):
+            return
+        current = paragraph.text
+        translated = translate(current)
+        if translated != current:
+            paragraph.text = translated
+
+    for paragraph in doc.paragraphs:
+        localize_paragraph(paragraph)
+
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                if is_raw_evidence(cell.text):
+                    continue
+                for paragraph in cell.paragraphs:
+                    localize_paragraph(paragraph)
+
+    for section in doc.sections:
+        for paragraph in section.footer.paragraphs:
+            localize_paragraph(paragraph)
+
+
+# ---------------------------------------------------------------------------
+# Template handling
+# ---------------------------------------------------------------------------
+
+def find_placeholder_paragraph(doc: Document, tag: str):
+    """
+    Find a top-level or table-cell paragraph containing the exact template tag.
+    The current template uses top-level paragraphs, but table support is kept
+    so future templates do not require a report.py change.
+    """
+    for paragraph in doc.paragraphs:
+        if tag in paragraph.text:
+            return paragraph
+
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    if tag in paragraph.text:
+                        return paragraph
+
+    return None
+
+
+def clear_document_body(doc: Document) -> None:
+    """Remove all body blocks while retaining the document section properties."""
+    body = doc._body._body
+    for child in list(body):
+        if child.tag == qn("w:sectPr"):
+            continue
+        body.remove(child)
+
+
+def iter_report_blocks(doc: Document):
+    """
+    Yield generated body blocks excluding the document-level sectPr.
+
+    Paragraphs and tables are copied as XML so formatting created by the
+    report generator is preserved when inserted into the user's template.
+    """
+    body = doc._body._body
+    for child in list(body):
+        if child.tag == qn("w:sectPr"):
+            continue
+        yield child
+
+
+def insert_blocks_at_placeholder(
+    target_doc: Document,
+    tag: str,
+    source_doc: Document,
+) -> None:
+    """
+    Replace one placeholder paragraph with all generated blocks.
+
+    The placeholder itself is removed. The surrounding template content
+    (signature, letterhead, headers/footers, etc.) remains untouched.
+    """
+    from copy import deepcopy
+
+    placeholder = find_placeholder_paragraph(target_doc, tag)
+    if placeholder is None:
+        raise ValueError(
+            f"Template tag {tag!r} tidak ditemukan di template.docx."
+        )
+
+    placeholder_element = placeholder._p
+
+    for block in iter_report_blocks(source_doc):
+        placeholder_element.addprevious(deepcopy(block))
+
+    parent = placeholder_element.getparent()
+    parent.remove(placeholder_element)
+
+
+def build_body_document(
+    template_path: Path,
+    meta: dict[str, Any],
+    metrics: dict[str, Any],
+    checklists: list[dict[str, Any]],
+    findings: list[dict[str, Any]],
+    recommendations: list[dict[str, Any]],
     evidence: dict[str, Any],
     evidence_path: Path,
-    recommendations: list[dict[str, Any]],
-    recommendation_errors: list[str],
     recommendation_path: Path | None,
-    output_path: Path,
-) -> None:
-    checklists = extract_checklists(evidence, project_root=project_root)
-    source_files = extract_source_files(evidence)
-    findings = extract_findings(evidence)
+    recommendation_errors: list[str],
+) -> Document:
+    """
+    Build only the main report content.
 
-    meta = extract_project_metadata(evidence, active)
-    metrics = extract_metrics(evidence, checklists, source_files, findings)
-
-    doc = Document()
-    style_document(doc)
+    The document starts from the same template so custom styles available in
+    template.docx are also available to generated paragraphs/tables.
+    """
+    doc = Document(template_path)
+    clear_document_body(doc)
 
     add_cover(
         doc,
@@ -2237,15 +2818,121 @@ def generate_report(
     )
     add_signoff(doc, meta, metrics)
 
+    # Translate presentation text to Bahasa Indonesia while preserving
+    # source/evidence JSON-like content.
+    localize_report_document(doc)
+    return doc
+
+
+def build_appendix_document(
+    template_path: Path,
+    checklists: list[dict[str, Any]],
+    source_files: list[dict[str, Any]],
+    metrics: dict[str, Any],
+    recommendations: list[dict[str, Any]],
+) -> Document:
+    """Build only the appendix content for {{LAMPIRANREPORT}}."""
+    doc = Document(template_path)
+    clear_document_body(doc)
+
+    # Ensure the appendices start on a fresh page after the template's
+    # signature/approval block.
     doc.add_page_break()
+
     add_appendix_checklist_matrix(doc, checklists)
     add_appendix_evidence_index(doc, source_files)
     add_appendix_metrics(doc, metrics, recommendations)
     add_appendix_review_items(doc, checklists)
     add_appendix_recommendations(doc, recommendations)
 
+    localize_report_document(doc)
+    return doc
+
+
+# ---------------------------------------------------------------------------
+# Report generation
+# ---------------------------------------------------------------------------
+
+def generate_report(
+    project_root: Path,
+    active: dict[str, Any],
+    evidence: dict[str, Any],
+    evidence_path: Path,
+    recommendations: list[dict[str, Any]],
+    recommendation_errors: list[str],
+    recommendation_path: Path | None,
+    output_path: Path,
+    template_path: Path,
+) -> None:
+    checklists = extract_checklists(evidence, project_root=project_root)
+    source_files = extract_source_files(evidence)
+    findings = extract_findings(evidence)
+
+    meta = extract_project_metadata(evidence, active)
+    metrics = extract_metrics(evidence, checklists, source_files, findings)
+
+    # Generate the two logical parts separately.
+    body_doc = build_body_document(
+        template_path=template_path,
+        meta=meta,
+        metrics=metrics,
+        checklists=checklists,
+        findings=findings,
+        recommendations=recommendations,
+        evidence=evidence,
+        evidence_path=evidence_path,
+        recommendation_path=recommendation_path,
+        recommendation_errors=recommendation_errors,
+    )
+
+    appendix_doc = build_appendix_document(
+        template_path=template_path,
+        checklists=checklists,
+        source_files=source_files,
+        metrics=metrics,
+        recommendations=recommendations,
+    )
+
+    # Start from the user's template. Everything outside the two tags is
+    # preserved, including letterhead, signature/approval block, headers,
+    # footers, page numbering, margins, and template-specific formatting.
+    final_doc = Document(template_path)
+
+    insert_blocks_at_placeholder(
+        target_doc=final_doc,
+        tag=BODYREPORT_TAG,
+        source_doc=body_doc,
+    )
+    insert_blocks_at_placeholder(
+        target_doc=final_doc,
+        tag=LAMPIRANREPORT_TAG,
+        source_doc=appendix_doc,
+    )
+
+    # Fail closed if either tag somehow remains in the final document.
+    remaining = []
+    for paragraph in final_doc.paragraphs:
+        if BODYREPORT_TAG in paragraph.text:
+            remaining.append(BODYREPORT_TAG)
+        if LAMPIRANREPORT_TAG in paragraph.text:
+            remaining.append(LAMPIRANREPORT_TAG)
+    for table in final_doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                if BODYREPORT_TAG in cell.text:
+                    remaining.append(BODYREPORT_TAG)
+                if LAMPIRANREPORT_TAG in cell.text:
+                    remaining.append(LAMPIRANREPORT_TAG)
+
+    if remaining:
+        raise RuntimeError(
+            "Template tag masih tersisa setelah proses generate: "
+            + ", ".join(sorted(set(remaining)))
+        )
+
     ensure_dir(output_path.parent)
-    doc.save(output_path)
+    final_doc.save(output_path)
+
 
 
 # ---------------------------------------------------------------------------
@@ -2272,6 +2959,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Output DOCX path. Defaults to "
              "<project_root>/23-final-sign-off/penetration-test-report.docx.",
+    )
+    parser.add_argument(
+        "--template",
+        default=None,
+        help="Template DOCX. Defaults to "
+             "<repo_root>/reports/templates/template.docx.",
     )
     parser.add_argument(
         "--repo-root",
@@ -2367,12 +3060,27 @@ def main() -> int:
         if not output_path.is_absolute():
             output_path = project_root / output_path
 
+        template_path = (
+            Path(args.template).expanduser()
+            if args.template
+            else repo_root / TEMPLATE_RELATIVE
+        )
+        if not template_path.is_absolute():
+            template_path = repo_root / template_path
+        template_path = template_path.resolve()
+
+        if not template_path.is_file():
+            raise FileNotFoundError(
+                f"Template report tidak ditemukan: {template_path}"
+            )
+
         print("BrebesKab-CSIRT-Tools — Penetration Test Report Generator")
         print(f"Version             : {SCRIPT_VERSION}")
         print(f"Repository root     : {repo_root}")
         print(f"Project root        : {project_root}")
         print(f"Project             : {active.get('project_id') or '—'}")
         print(f"Evidence            : {evidence_path}")
+        print(f"Template            : {template_path}")
         print(
             "Recommendations     : "
             + (
@@ -2400,6 +3108,7 @@ def main() -> int:
             recommendation_errors=recommendation_errors,
             recommendation_path=recommendation_path,
             output_path=output_path,
+            template_path=template_path,
         )
 
         print(f"[PASS] Word report generated: {output_path}")
