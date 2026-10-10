@@ -1,38 +1,28 @@
 # BrebesKab-CSIRT-Tools
 
-**BrebesKab-CSIRT-Tools** adalah toolkit dan orchestrator *penetration testing* untuk mendukung kebutuhan CSIRT Kabupaten Brebes. Proyek ini membantu pelaksanaan asesmen berotorisasi agar terstruktur, terdokumentasi, dapat ditelusuri, dan konsisten.
+**BrebesKab-CSIRT-Tools** adalah toolkit dan orchestrator *penetration testing* untuk membantu pelaksanaan asesmen keamanan yang berotorisasi. Proyek ini mengorganisasi persiapan, reconnaissance, pengujian berbasis checklist, pencatatan aktivitas, pengelolaan evidence, dan penyusunan laporan agar prosesnya lebih konsisten dan dapat ditelusuri.
 
-Tool ini bukan sekadar kumpulan exploit. Alur kerjanya mendukung pengelolaan proyek dan persiapan asesmen, reconnaissance, pelaksanaan checklist, pengumpulan evidence, verifikasi, pencatatan temuan, serta penyusunan laporan.
+Tool ini bukan pengganti penilaian teknis reviewer. Output otomatis, evidence mentah, rekomendasi berbantuan AI, dan finding yang telah dikonfirmasi harus diperlakukan sebagai hal yang berbeda.
 
-> **Penting:** gunakan tool hanya untuk asesmen yang memiliki otorisasi dan ruang lingkup yang sah. Jangan menguji sistem di luar scope atau tanpa izin.
+> **Peringatan:** gunakan tool hanya terhadap aset yang tercantum dalam scope dan dengan otorisasi yang sah. Patuhi Rules of Engagement (RoE), batas request, jadwal, dan prosedur penghentian pengujian.
 
 ## Repository
 
-Repository resmi:
-
-```text
-https://github.com/NRTechnology/BrebesKab-CSIRT-Tools.git
-```
-
-[Repository GitHub](https://github.com/NRTechnology/BrebesKab-CSIRT-Tools)
-
----
+- Repository: <https://github.com/NRTechnology/BrebesKab-CSIRT-Tools>
+- Clone URL: `https://github.com/NRTechnology/BrebesKab-CSIRT-Tools.git`
 
 ## Tujuan dan alur asesmen
 
-Fokus utama proyek:
+Fokus proyek:
 
-- standardisasi proses penetration testing berbasis checklist;
-- pemisahan fase asesmen;
-- pencatatan activity/timeline;
-- pengelolaan proyek, authorization, scope, Rules of Engagement (RoE), kontak, test account, dan kesiapan backup/recovery;
-- reconnaissance yang terstruktur;
-- pengumpulan dan pengelolaan evidence;
-- traceability dari checklist dan aktivitas sampai evidence, finding, dan retest;
-- penyusunan laporan dari evidence dan metadata yang tersedia;
-- pemisahan hasil otomatis, rekomendasi tinjauan berbantuan AI, dan keputusan reviewer manusia.
+- mengelola project asesmen dan project aktif;
+- mendokumentasikan authorization, scope, RoE, kontak, test account, dan kesiapan backup/recovery;
+- menjalankan modul reconnaissance dan checklist pengujian;
+- mencatat aktivitas/timeline serta menghubungkan aktivitas, hasil, evidence, finding, dan retest;
+- menghasilkan laporan dari data yang tersedia tanpa mengarang metadata atau temuan;
+- membedakan status pelaksanaan checklist dari kelengkapan hasilnya.
 
-Alur asesmen konseptual:
+Alur konseptual:
 
 ```text
 PLAN → RECON → TEST → VERIFY → FINDING → REPORT
@@ -40,1496 +30,381 @@ PLAN → RECON → TEST → VERIFY → FINDING → REPORT
                          REMEDIATION → RETEST → CLOSE
 ```
 
----
+## 1. Prasyarat
 
-# 1. Prasyarat
+Environment yang tercermin pada repository saat ini adalah **Windows 11 dengan Python 3.14**. Versi dan lokasi tool eksternal dapat berbeda sesuai environment.
 
-Environment pengembangan/penggunaan saat ini ditujukan untuk **Windows
+Komponen yang digunakan oleh instalasi dan modul tertentu antara lain:
 
-11 + Python**.
+- Python dan Git;
+- Nmap;
+- Gobuster;
+- ProjectDiscovery Nuclei dan httpx;
+- OWASP ZAP;
+- Playwright dan Chromium;
+- paket Python yang digunakan project, termasuk Typer, Rich, HTTPX, Requests, PyYAML, Pydantic, python-dateutil, BeautifulSoup, lxml, Playwright, Jinja2, dan python-docx.
 
-Komponen utama:
+Tidak semua modul memerlukan semua tool di atas. Periksa konfigurasi dan pesan dari pemeriksaan instalasi untuk mengetahui kebutuhan yang berlaku pada environment Anda.
 
--   Python 3.14
-
--   Git
-
--   Nmap
-
--   ffuf
-
--   ProjectDiscovery Nuclei
-
--   ProjectDiscovery httpx
-
--   OWASP ZAP
-
--   Playwright + Chromium
-
-Python packages utama:
-
-```text
-
-typer
-
-rich
-
-httpx
-
-requests
-
-PyYAML
-
-pydantic
-
-python-dateutil
-
-beautifulsoup4
-
-lxml
-
-playwright
-
-Jinja2
-
-python-docx
-
-```
-
-Versi tools dapat berbeda tergantung environment. Gunakan
-
-`scripts/install-requirements.ps1` untuk proses instalasi yang
-
-disediakan project.
-
----
-
-# 2. Download dari GitHub
+## 2. Instalasi
 
 Clone repository:
 
 ```powershell
-
 git clone https://github.com/NRTechnology/BrebesKab-CSIRT-Tools.git
-
-```
-
-Masuk ke directory:
-
-```powershell
-
 cd BrebesKab-CSIRT-Tools
-
 ```
 
-Untuk mengambil perubahan terbaru:
+Buat virtual environment dan aktifkan:
 
 ```powershell
-
-git pull --ff-only origin main
-
-```
-
-`git pull --ff-only` digunakan agar update tidak membuat merge commit
-
-otomatis ketika branch lokal sudah memiliki divergence.
-
----
-
-# 3. Virtual Environment
-
-Buat virtual environment:
-
-```powershell
-
 python -m venv .venv
-
-```
-
-Aktifkan:
-
-```powershell
-
 . .\scripts\activate-venv.ps1
-
 ```
 
-Setelah aktif, prompt PowerShell akan menunjukkan:
-
-```text
-
-(.venv)
-
-```
-
-Script aktivasi project juga membantu menyiapkan `PYTHONPATH` agar modul
-
-internal seperti `context.py` dan `activity.py` dapat digunakan.
-
----
-
-# 4. Instalasi Requirements
-
-Jalankan PowerShell sebagai Administrator jika diperlukan oleh proses
-
-instalasi tools:
+Jalankan instalasi requirements:
 
 ```powershell
-
 Set-ExecutionPolicy -Scope Process Bypass
-
-```
-
-Kemudian:
-
-```powershell
-
 .\scripts\install-requirements.ps1
-
 ```
 
-Dry run:
+Untuk melihat tindakan yang akan dilakukan tanpa menjalankan instalasi:
 
 ```powershell
-
 .\scripts\install-requirements.ps1 -DryRun
-
 ```
 
-Jika script meminta elevation, jalankan kembali dari PowerShell
+Jika diperlukan, jalankan PowerShell dengan hak Administrator ketika script meminta akses tersebut. Hindari menjalankan seluruh tool sebagai Administrator secara default; gunakan hak akses minimum yang diperlukan.
 
-Administrator.
+Pemeriksaan environment:
 
----
+```powershell
+.\scripts\doctor.ps1
+```
 
-# 5. Struktur Repository
+Perintah update yang tersedia pada repository:
 
-Struktur utama project:
+```powershell
+.\scripts\update.ps1
+```
+
+Periksa opsi script sebelum menjalankannya pada environment yang sudah digunakan untuk asesmen.
+
+## 3. Struktur repository
+
+Ringkasan berikut menggambarkan direktori dan file utama yang terlihat pada tree repository. File runtime, virtual environment, project asesmen aktual, log, dan hasil pengujian tidak ditampilkan seluruhnya.
 
 ```text
-
 BrebesKab-CSIRT-Tools/
-
 ├── .gitignore
-
 ├── CHANGELOG.md
-
 ├── COMMERCIAL-LICENSE
-
 ├── CONTRIBUTING.md
-
 ├── LICENSE
-
 ├── README.md
-
 ├── SECURITY.md
-
+├── backup/                    # salinan kerja/versi sebelum perubahan
 ├── checklists/
-
+│   ├── api/
+│   ├── infrastructure/
+│   ├── pre-production/
+│   └── web/
 ├── config/
-
+│   ├── defaults.yaml
+│   ├── severity.yaml
+│   ├── tools.yaml
+│   ├── dictionaries/
+│   └── fingerprints/
 ├── docs/
-
+│   ├── methodology/
+│   ├── standards/
+│   └── templates/
 ├── evidence/
-
 ├── profiles/
-
+│   ├── api-full.yaml
+│   ├── pre-production.yaml
+│   ├── web-basic.yaml
+│   └── web-full.yaml
 ├── projects/
-
 ├── reports/
-
-├── tests/
-
+│   ├── examples/
+│   └── templates/
 ├── scripts/
-
-│   ├── activate-venv.ps1
-
-│   ├── activity.py
-
-│   ├── context.py
-
-│   ├── doctor.ps1
-
-│   ├── install.ps1
-
-│   ├── install-requirements.ps1
-
-│   ├── new-pentest-project.ps1
-
-│   ├── pentest.ps1
-
-│   ├── project.py
-
-│   ├── update.ps1
-
-│   ├── preparation/
-
-│   │   ├── authorization.py
-
-│   │   ├── scope.py
-
-│   │   ├── roe.py
-
-│   │   ├── contacts.py
-
-│   │   ├── account.py
-
-│   │   └── backup.py
-
-│   └── reconnaissance/
-
-│       ├── __init__.py
-
-│       ├── target.py
-
-│       ├── dns.py
-
-│       ├── network.py
-
-│       ├── technology.py
-
-│       ├── http.py
-
-│       ├── endpoint.py
-
-│       └── summary.py
-
+│   ├── activate-venv.ps1
+│   ├── activity.py
+│   ├── context.py
+│   ├── doctor.ps1
+│   ├── evidence.py
+│   ├── install-requirements.ps1
+│   ├── pentest.ps1
+│   ├── project.py
+│   ├── report.py
+│   ├── run-directory-discover.ps1
+│   ├── secrets.py
+│   ├── authentication/
+│   ├── authorization/
+│   ├── fileupload/
+│   ├── httpheader/
+│   ├── infrastructure/
+│   ├── inputvalidation/
+│   ├── preparation/
+│   ├── reconnaissance/
+│   └── webserver/
+├── tests/
 └── tools/
-
-    ├── api/
-
-    ├── infrastructure/
-
-    ├── recon/
-
-    ├── reporting/
-
-    ├── tls/
-
-    ├── web/
-
-    ├── httpx/
-
-    └── nuclei/
-
+    ├── api/
+    ├── gobuster/
+    ├── httpx/
+    ├── infrastructure/
+    ├── nuclei/
+    ├── recon/
+    ├── reporting/
+    ├── tls/
+    └── web/
 ```
 
----
+**Catatan:** direktori `backup/` berisi salinan sebelum perubahan dan bukan tempat penyimpanan backup target asesmen. Direktori `.runtime/` dan `.venv/` merupakan data lokal/runtime; jangan memasukkan secret, key enkripsi, log sensitif, atau evidence asesmen ke commit publik. Periksa `.gitignore` dan status Git sebelum melakukan commit.
 
-# 6. Project Management
+## 4. Project management
 
-Project harus dibuat sebelum menjalankan preparation atau
-
-reconnaissance.
-
-## Membuat project
+Buat project asesmen:
 
 ```powershell
-
 .\scripts\new-pentest-project.ps1
-
 ```
 
-Project akan dibuat di:
-
-```text
-
-projects/\<PROJECT-ID>/
-
-```
-
-Contoh:
-
-```text
-
-projects/
-
-└── PENTEST-2026-002/
-
-```
-
-## Melihat project
+Lihat project dan status:
 
 ```powershell
-
 python scripts/project.py list
-
-```
-
-## Memilih active project
-
-```powershell
-
-python scripts/project.py use PENTEST-2026-002
-
-```
-
-## Melihat status active project
-
-```powershell
-
 python scripts/project.py status
-
 ```
 
-## Menghapus active project context
+Pilih project aktif dengan ID yang benar-benar ada:
 
 ```powershell
+python scripts/project.py use <PROJECT-ID>
+```
 
+Contoh placeholder `<PROJECT-ID>` harus diganti dengan ID project Anda, misalnya `PENTEST-YYYY-NNN`. Untuk menghapus konteks project aktif:
+
+```powershell
 python scripts/project.py clear
-
 ```
 
-Active project disimpan pada:
+Konteks project aktif disimpan secara lokal pada `.runtime/active-project.yaml`. Pastikan project yang aktif benar sebelum menjalankan command yang membuat atau mengubah data asesmen.
 
-```text
+## 5. Preparation
 
-.runtime/active-project.yaml
+Preparation mendokumentasikan kesiapan dan batasan asesmen sebelum pengujian. Modul yang tersedia di `scripts/preparation/`:
 
+| Modul | Kegunaan |
+|---|---|
+| `authorization.py` | Mencatat dan memeriksa informasi otorisasi serta evidence pendukungnya. |
+| `scope.py` | Mengelola aset in-scope dan out-of-scope. |
+| `roe.py` | Mendokumentasikan jadwal, aturan, kondisi, komunikasi, dan penghentian pengujian. |
+| `contacts.py` | Mencatat kontak yang relevan untuk asesmen. |
+| `account.py` | Mencatat metadata akun pengujian; bukan tempat menyimpan password/token. |
+| `backup.py` | Mencatat kesiapan backup/recovery; bukan menjalankan backup atau restore target secara otomatis. |
+
+Contoh pola pemanggilan:
+
+```powershell
+python scripts/preparation/scope.py --help
+python scripts/preparation/authorization.py --help
+python scripts/preparation/roe.py --help
 ```
 
----
+Lihat bantuan CLI masing-masing modul sebelum menjalankan subcommand. Command dapat memiliki argumen atau kebutuhan interaktif yang berbeda. `verify` adalah pemeriksaan data/kesiapan dan tidak otomatis menggantikan approval administratif.
 
-# 7. Activity / Timeline
+## 6. Reconnaissance
 
-Semua aktivitas penting assessment dicatat ke:
+Direktori `scripts/reconnaissance/` saat ini berisi modul:
 
-```text
+- `target.py` — pengelolaan identitas target dan metadata URL;
+- `dns.py` — kegiatan terkait DNS/domain;
+- `network.py` — pemeriksaan terkait IP/network;
+- `technology.py` — identifikasi teknologi;
+- `http.py` — pemeriksaan HTTP/HTTPS;
+- `endpoint.py` — penemuan endpoint;
+- `subdomain.py` — kegiatan terkait subdomain;
+- `directory.py` — directory discovery;
+- `api.py` — reconnaissance API;
+- `attack.py` — fungsi terkait aktivitas/permukaan pengujian;
+- `summary.py` — ringkasan reconnaissance.
 
-projects/\<PROJECT-ID>/timeline/activity.log
+Keberadaan file tidak dengan sendirinya membuktikan bahwa setiap fungsi atau command sudah lengkap. Periksa bantuan CLI dan implementasi versi yang sedang digunakan:
 
+```powershell
+python scripts/reconnaissance/target.py --help
+python scripts/reconnaissance/dns.py --help
+python scripts/reconnaissance/directory.py --help
 ```
 
-Format activity:
+Jalankan hanya modul yang sesuai dengan scope dan RoE yang disetujui.
 
-```text
+## 7. Modul pengujian
 
-ACT-ID | Timestamp | Phase | Checklist Item | Action | Status
+Direktori `scripts/` mengelompokkan modul pengujian menurut area:
 
+| Direktori | Cakupan umum |
+|---|---|
+| `authentication/` | Login, brute force yang diizinkan, MFA, password, recovery, session, dan ringkasan. |
+| `authorization/` | Access control, endpoint, IDOR, ownership, privilege, role, dan ringkasan. |
+| `fileupload/` | Discovery upload, ekstensi, nama file, overwrite, ukuran, storage, validasi, dan ringkasan. |
+| `httpheader/` | Content type, CSP, frame, HSTS, permissions policy, referrer policy, dan ringkasan. |
+| `infrastructure/` | Admin exposure, sertifikat, exposure, HTTP/HTTPS, IPv6, service, TLS, dan ringkasan. |
+| `inputvalidation/` | Command injection, injection, parameter, SQLi, traversal, XSS, dan ringkasan. |
+| `webserver/` | Backup, konfigurasi, debug, default files, directory listing, environment, error handling, Git exposure, HTTP methods, versi, dan ringkasan. |
+
+Nama direktori menjelaskan pengelompokan kode, bukan jaminan bahwa semua skenario telah diuji atau seluruh hasil telah tervalidasi. Gunakan checklist, profil, konfigurasi tool, serta evidence untuk menentukan cakupan aktual.
+
+## 8. CLI utama
+
+Script tingkat atas yang tersedia:
+
+| Script | Peran |
+|---|---|
+| `scripts/pentest.ps1` | Entry point workflow pentest berbasis PowerShell. |
+| `scripts/project.py` | Pengelolaan project dan konteks project aktif. |
+| `scripts/activity.py` | Pencatatan aktivitas/timeline. |
+| `scripts/evidence.py` | Fungsi terkait pengelolaan evidence. |
+| `scripts/secrets.py` | Fungsi terkait pengelolaan secret. |
+| `scripts/report.py` | Penyusunan laporan dari data asesmen yang tersedia. |
+| `scripts/run-directory-discover.ps1` | Entry point PowerShell untuk directory discovery. |
+| `scripts/doctor.ps1` | Pemeriksaan environment. |
+
+Mulai dengan opsi bantuan yang disediakan oleh script:
+
+```powershell
+python scripts/project.py --help
+python scripts/report.py --help
+python scripts/evidence.py --help
+python scripts/secrets.py --help
+.\scripts\pentest.ps1 -?
+.\scripts\run-directory-discover.ps1 -?
 ```
 
-Contoh:
+Jika bentuk bantuan suatu script berbeda, gunakan dokumentasi dan implementasi aktualnya. Jangan mengasumsikan semua script memakai kontrak CLI yang sama.
+
+## 9. Activity, evidence, dan traceability
+
+Aktivitas asesmen perlu dapat ditelusuri ke hasil dan evidence yang mendukungnya. Bentuk relasi konseptual:
 
 ```text
-
-ACT-0001 | 2026-09-24T16:39:55+07:00 | 01-preparation | 01-004 | Contact recorded: C-001 (tester) | completed
-
-```
-
-Traceability yang digunakan:
-
-```text
-
 Checklist Item
-
-      ↓
-
-Activity ID
-
-      ↓
-
-Tool / Command
-
-      ↓
-
+    ↓
+Activity / Timeline
+    ↓
+Tool atau Command
+    ↓
 Result
-
-      ↓
-
+    ↓
 Evidence ID
-
-      ↓
-
+    ↓
 Finding ID
-
-      ↓
-
-Retest ID
-
+    ↓
+Retest
 ```
-
----
-
-# 8. Preparation
-
-Preparation adalah fase pertama dan harus selesai sebelum masuk
-
-Reconnaissance.
-
-Checklist:
-
-```text
-
-01-001 Authorization
-
-01-002 Scope
-
-01-003 Rules of Engagement
-
-01-004 Contacts
-
-01-005 Test Account
-
-01-006 Backup / Recovery
-
-```
-
----
-
-## 8.1 Authorization
-
-Script:
-
-```text
-
-scripts/preparation/authorization.py
-
-```
-
-Command:
-
-```powershell
-
-python scripts/preparation/authorization.py init
-
-python scripts/preparation/authorization.py add
-
-python scripts/preparation/authorization.py status
-
-python scripts/preparation/authorization.py verify
-
-python scripts/preparation/authorization.py attach \<FILE>
-
-python scripts/preparation/authorization.py reject
-
-python scripts/preparation/authorization.py version
-
-```
-
-### Argumen
-
-`attach` membutuhkan path file evidence:
-
-```powershell
-
-python scripts/preparation/authorization.py attach D:\pentest\permohonan.pdf
-
-```
-
-`reject` meminta alasan rejection secara interactive.
-
-Authorization menyimpan data pada:
-
-```text
-
-projects/\<PROJECT-ID>/01-preparation/authorization/authorization.yaml
-
-```
-
-Evidence:
-
-```text
-
-projects/\<PROJECT-ID>/01-preparation/authorization/evidence/
-
-```
-
-Credential, password, token, API key, dan secret tidak boleh disimpan di
-
-file authorization.
-
----
-
-## 8.2 Scope
-
-Script:
-
-```text
-
-scripts/preparation/scope.py
-
-```
-
-Command:
-
-```powershell
-
-python scripts/preparation/scope.py init
-
-python scripts/preparation/scope.py add-in
-
-python scripts/preparation/scope.py add-out
-
-python scripts/preparation/scope.py list
-
-python scripts/preparation/scope.py show \<ID>
-
-python scripts/preparation/scope.py verify \<ID>
-
-python scripts/preparation/scope.py status
-
-python scripts/preparation/scope.py remove \<ID>
-
-python scripts/preparation/scope.py version
-
-```
-
-`add-in` dan `add-out` sengaja dipertahankan karena scope memiliki dua
-
-jenis objek:
-
-```text
-
-IN-SCOPE
-
-OUT-OF-SCOPE
-
-```
-
-Contoh:
-
-```powershell
-
-python scripts/preparation/scope.py show IN-001
-
-```
-
-ID scope menggunakan format seperti:
-
-```text
-
-IN-001
-
-OUT-001
-
-```
-
----
-
-## 8.3 Rules of Engagement
-
-Script:
-
-```text
-
-scripts/preparation/roe.py
-
-```
-
-Command standar:
-
-```powershell
-
-python scripts/preparation/roe.py init
-
-python scripts/preparation/roe.py add
-
-python scripts/preparation/roe.py list
-
-python scripts/preparation/roe.py show
-
-python scripts/preparation/roe.py verify
-
-python scripts/preparation/roe.py status
-
-python scripts/preparation/roe.py remove
-
-python scripts/preparation/roe.py version
-
-```
-
-Command khusus RoE:
-
-```powershell
-
-python scripts/preparation/roe.py set-status \<STATUS>
-
-python scripts/preparation/roe.py set \<FIELD> \<VALUE>
-
-python scripts/preparation/roe.py schedule --start \<DATE> --end \<DATE> [--timezone \<TZ>]
-
-python scripts/preparation/roe.py window \<testing|blackout> --start \<DATETIME> --end \<DATETIME> [--reason \<TEXT>]
-
-python scripts/preparation/roe.py rule \<allowed|prohibited|conditional> --action \<ACTION> --description \<DESCRIPTION> [--condition \<TEXT>]
-
-python scripts/preparation/roe.py safety [OPTIONS]
-
-python scripts/preparation/roe.py communication [OPTIONS]
-
-python scripts/preparation/roe.py stop-trigger \<TRIGGER>
-
-python scripts/preparation/roe.py stop [OPTIONS]
-
-python scripts/preparation/roe.py deviation \<DESCRIPTION> [OPTIONS]
-
-python scripts/preparation/roe.py approve --approved-by \<NAME> --approved-date \<DATE> [OPTIONS]
-
-python scripts/preparation/roe.py add-rule
-
-```
-
-Status RoE:
-
-```text
-
-not-started
-
-draft
-
-pending-approval
-
-approved
-
-active
-
-suspended
-
-closed
-
-```
-
-Contoh:
-
-```powershell
-
-python scripts/preparation/roe.py set-status approved
-
-```
-
-> `verify` melakukan validasi kesiapan RoE. Verification tidak otomatis
-
-> berarti RoE telah mendapatkan approval administratif.
-
----
-
-## 8.4 Contacts
-
-Script:
-
-```text
-
-scripts/preparation/contacts.py
-
-```
-
-Command:
-
-```powershell
-
-python scripts/preparation/contacts.py init
-
-python scripts/preparation/contacts.py add
-
-python scripts/preparation/contacts.py list
-
-python scripts/preparation/contacts.py show \<ID>
-
-python scripts/preparation/contacts.py verify \<ID>
-
-python scripts/preparation/contacts.py status
-
-python scripts/preparation/contacts.py remove \<ID>
-
-python scripts/preparation/contacts.py version
-
-```
-
-Contoh:
-
-```powershell
-
-python scripts/preparation/contacts.py show C-001
-
-python scripts/preparation/contacts.py verify C-001
-
-```
-
-ID contact:
-
-```text
-
-C-001
-
-C-002
-
-C-003
-
-```
-
----
-
-## 8.5 Test Account
-
-Script:
-
-```text
-
-scripts/preparation/account.py
-
-```
-
-Command:
-
-```powershell
-
-python scripts/preparation/account.py init
-
-python scripts/preparation/account.py add
-
-python scripts/preparation/account.py list
-
-python scripts/preparation/account.py show \<ID>
-
-python scripts/preparation/account.py verify \<ID>
-
-python scripts/preparation/account.py status
-
-python scripts/preparation/account.py remove \<ID>
-
-python scripts/preparation/account.py version
-
-```
-
-Contoh:
-
-```powershell
-
-python scripts/preparation/account.py show TA-002
-
-python scripts/preparation/account.py verify TA-002
-
-```
-
-ID test account:
-
-```text
-
-TA-001
-
-TA-002
-
-TA-003
-
-```
-
-**Password, token, API key, dan secret tidak disimpan oleh script ini.**
-
----
-
-## 8.6 Backup / Recovery
-
-Script:
-
-```text
-
-scripts/preparation/backup.py
-
-```
-
-Command:
-
-```powershell
-
-python scripts/preparation/backup.py init
-
-python scripts/preparation/backup.py add
-
-python scripts/preparation/backup.py list
-
-python scripts/preparation/backup.py show \<ID>
-
-python scripts/preparation/backup.py verify \<ID>
-
-python scripts/preparation/backup.py status
-
-python scripts/preparation/backup.py remove \<ID>
-
-python scripts/preparation/backup.py version
-
-```
-
-Contoh:
-
-```powershell
-
-python scripts/preparation/backup.py show BK-001
-
-python scripts/preparation/backup.py verify BK-001
-
-```
-
-ID backup:
-
-```text
-
-BK-001
-
-BK-002
-
-BK-003
-
-```
-
-Script ini **mencatat kesiapan backup/recovery**. Script tidak melakukan
-
-backup atau restore secara otomatis.
-
----
-
-# 9. Reconnaissance
-
-Setelah Preparation selesai, assessment masuk ke:
-
-```text
-
-02 Reconnaissance
-
-```
-
-Struktur:
-
-```text
-
-02-001 Target Identification
-
-02-002 DNS / Domain
-
-02-003 IP / Network
-
-02-004 Technology Identification
-
-02-005 HTTP / HTTPS
-
-02-006 Endpoint Discovery
-
-02-007 Recon Summary
-
-```
-
-Script:
-
-```text
-
-scripts/reconnaissance/
-
-├── target.py
-
-├── dns.py
-
-├── network.py
-
-├── technology.py
-
-├── http.py
-
-├── endpoint.py
-
-└── summary.py
-
-```
-
----
-
-## 9.1 Target Identification
-
-Script:
-
-```text
-
-scripts/reconnaissance/target.py
-
-```
-
-Command standar:
-
-```powershell
-
-python scripts/reconnaissance/target.py init
-
-python scripts/reconnaissance/target.py add
-
-python scripts/reconnaissance/target.py list
-
-python scripts/reconnaissance/target.py show
-
-python scripts/reconnaissance/target.py verify
-
-python scripts/reconnaissance/target.py status
-
-python scripts/reconnaissance/target.py remove
-
-python scripts/reconnaissance/target.py version
-
-```
-
-Fungsi:
-
--   mencatat application;
-
--   mencatat target URL;
-
--   mengambil hostname dari URL;
-
--   menentukan scheme;
-
--   menentukan port default berdasarkan scheme;
-
--   mencatat environment;
-
--   mencatat assessment type;
-
--   menghubungkan target dengan scope.
-
-`target.py` **tidak melakukan network request atau scanning**.
-
----
-
-## 9.2 DNS / Domain
-
-Script yang disiapkan:
-
-```text
-
-scripts/reconnaissance/dns.py
-
-```
-
-Checklist:
-
-```text
-
-02-002 DNS / Domain
-
-```
-
-Implementasi command akan mengikuti standard CLI project.
-
----
-
-## 9.3 IP / Network
-
-Script:
-
-```text
-
-scripts/reconnaissance/network.py
-
-```
-
-Checklist:
-
-```text
-
-02-003 IP / Network
-
-```
-
----
-
-## 9.4 Technology Identification
-
-Script:
-
-```text
-
-scripts/reconnaissance/technology.py
-
-```
-
-Checklist:
-
-```text
-
-02-004 Technology Identification
-
-```
-
----
-
-## 9.5 HTTP / HTTPS
-
-Script:
-
-```text
-
-scripts/reconnaissance/http.py
-
-```
-
-Checklist:
-
-```text
-
-02-005 HTTP / HTTPS
-
-```
-
----
-
-## 9.6 Endpoint Discovery
-
-Script:
-
-```text
-
-scripts/reconnaissance/endpoint.py
-
-```
-
-Checklist:
-
-```text
-
-02-006 Endpoint Discovery
-
-```
-
----
-
-## 9.7 Recon Summary
-
-Script:
-
-```text
-
-scripts/reconnaissance/summary.py
-
-```
-
-Checklist:
-
-```text
-
-02-007 Recon Summary
-
-```
-
-Summary akan menggabungkan hasil reconnaissance yang telah dikumpulkan
-
-sebelumnya.
-
----
-
-# 10. Standard CLI Contract
-
-Untuk script yang menggunakan model multi-record, command dasar yang
-
-digunakan:
-
-```text
-
-init
-
-add
-
-list
-
-show \<ID>
-
-verify \<ID>
-
-status
-
-remove \<ID>
-
-version
-
-```
-
-Contoh:
-
-```powershell
-
-python scripts/preparation/account.py add
-
-python scripts/preparation/account.py list
-
-python scripts/preparation/account.py show TA-002
-
-python scripts/preparation/account.py verify TA-002
-
-python scripts/preparation/account.py status
-
-python scripts/preparation/account.py remove TA-002
-
-python scripts/preparation/account.py version
-
-```
-
-Tidak semua script dipaksa identik.
-
-Command khusus dipertahankan jika memang mewakili domain yang berbeda,
-
-misalnya:
-
-```text
-
-scope.py
-
-  add-in
-
-  add-out
-
-authorization.py
-
-  attach
-
-  reject
-
-roe.py
-
-  schedule
-
-  window
-
-  rule
-
-  safety
-
-  communication
-
-  stop-trigger
-
-  stop
-
-  deviation
-
-  approve
-
-```
-
-Prinsipnya:
-
-> **Standardisasi interface tanpa menghilangkan makna domain.**
-
----
-
-# 11. Project Status
-
-Project menggunakan lifecycle:
-
-```text
-
-01 Preparation
-
-02 Reconnaissance
-
-03 Infrastructure
-
-04 Web Server Configuration
-
-05 Security Headers
-
-06 Authentication
-
-07 Authorization
-
-08 Session Management
-
-09 Input Validation
-
-10 File Upload
-
-11 Client-Side Security
-
-12 CSRF
-
-13 CORS
-
-14 SSRF
-
-15 Sensitive Data
-
-16 Business Logic
-
-17 API
-
-18 Dependency & Component
-
-19 Logging & Monitoring
-
-20 Evidence Validation
-
-21 Finding Review
-
-22 Retest
-
-23 Final Sign-Off
-
-```
-
-Assessment tidak boleh melompat fase tanpa alasan dan dokumentasi yang
-
-jelas.
-
----
-
-# 12. Evidence
-
-Evidence harus dapat ditelusuri kembali ke aktivitas assessment.
 
 Prinsip evidence:
 
--   memiliki Evidence ID;
+- gunakan identitas evidence yang konsisten;
+- simpan request/response atau screenshot bila relevan dan diizinkan;
+- catat waktu dan konteks pengujian;
+- sanitasi credential, token, secret, dan data sensitif;
+- minimalkan penyimpanan data pribadi;
+- dokumentasikan keterbatasan dan langkah reproduksi;
+- batasi akses serta retensi evidence sesuai kebijakan asesmen.
 
--   request/response disimpan jika relevan;
+Jangan menganggap file yang tersimpan otomatis merupakan bukti kerentanan. Evidence harus ditinjau dalam konteks request, response, perilaku aplikasi, scope, dan kemungkinan penjelasan alternatif.
 
--   screenshot digunakan jika diperlukan;
+## 10. Pelaporan dan interpretasi hasil
 
--   timestamp tersedia;
+`report.py` menyusun laporan berdasarkan data asesmen, metadata, checklist, dan evidence yang tersedia. Kelengkapan serta ketepatan laporan bergantung pada input dan aturan pemrosesan versi tool yang digunakan.
 
--   data sensitif disanitasi;
+Prinsip interpretasi:
 
--   credential dan token tidak disimpan;
+- **Evidence bukan otomatis finding.** Respons HTTP `200` atau `303`, refleksi payload, penerimaan upload, versi komponen yang terlihat, metode HTTP yang diterima, atau perilaku replay tidak dengan sendirinya membuktikan kerentanan.
+- **Finding terkonfirmasi memerlukan validasi.** Indikator teknis harus diperiksa terhadap bukti dan konteks sebelum dinyatakan sebagai kerentanan.
+- **Item review bukan otomatis finding atau kondisi aman.** Tandai sebagai kebutuhan tinjauan sampai ada kesimpulan yang didukung bukti.
+- **Status pelaksanaan berbeda dari status hasil.** Checklist dapat sudah dijalankan meskipun hasilnya `partial`. Ringkasan pelaksanaan perlu menghitung penyelesaian proses berdasarkan kriteria yang eksplisit tanpa mengubah status hasil atau evidence asli.
+- **Tidak adanya finding record bukan jaminan target aman.** Periksa cakupan, item review, kualitas evidence, serta pengujian yang belum dilakukan.
+- **Rekomendasi AI bersifat pendukung.** Rekomendasi dari berkas tinjauan berbantuan AI bukan finding terkonfirmasi dan tidak boleh mengubah status evidence dengan sendirinya. Reviewer manusia bertanggung jawab atas validasi dan kesimpulan akhir.
 
--   PII disimpan seminimal mungkin;
+Pada konfigurasi pengujian yang didokumentasikan, batas teknisnya adalah maksimal **100 request untuk setiap pengujian**, di luar proses **Directory Discovery** yang menggunakan mekanisme tersendiri. Verifikasi konfigurasi dan implementasi versi yang digunakan sebelum asesmen; jangan menganggap angka ini sebagai batas total seluruh asesmen.
 
--   evidence dapat direproduksi.
+Alur otomatis juga dapat terhambat oleh interaksi manusia seperti OTP atau *Human Verification Challenge*. Kode status HTTP perlu ditafsirkan bersama request/response, alur aplikasi, dan evidence pendukung, bukan sebagai dasar tunggal untuk menetapkan kerentanan.
 
-Struktur umum project:
+## 11. Checklist, profil, konfigurasi, dan dokumentasi
 
-```text
+Direktori pendukung yang tersedia:
 
-projects/
+- `checklists/` — checklist untuk area web, API, infrastruktur, dan pre-production;
+- `profiles/` — profil `web-basic`, `web-full`, `api-full`, dan `pre-production`;
+- `config/` — default, severity, konfigurasi tool, dictionary, dan fingerprint teknologi;
+- `docs/methodology/` — dokumentasi metodologi pengujian;
+- `docs/standards/` — standar evidence, finding, laporan, dan severity;
+- `docs/templates/` — template rencana pentest, RoE, finding, retest, dan laporan;
+- `reports/templates/` — template dokumen laporan/checklist.
 
-└── PENTEST-YYYY-NNN/
+Gunakan checklist dan profil yang sesuai dengan jenis asesmen. Jangan menyimpulkan suatu area telah diuji hanya karena tersedia checklist atau modul untuk area tersebut.
 
-    ├── 01-preparation/
+## 12. Quick start
 
-    ├── 02-reconnaissance/
-
-    ├── ...
-
-    ├── evidence/
-
-    ├── findings/
-
-    ├── retest/
-
-    ├── report/
-
-    └── timeline/
-
-```
-
----
-
-# 13. Finding Traceability
-
-Setiap finding harus memiliki hubungan dengan evidence dan aktivitas.
-
-```text
-
-Checklist Item
-
-      ↓
-
-Activity ID
-
-      ↓
-
-Tool / Command
-
-      ↓
-
-Result
-
-      ↓
-
-Evidence ID
-
-      ↓
-
-Finding ID
-
-      ↓
-
-Retest ID
-
-```
-
-AI atau automation dapat membantu melakukan parsing dan penyusunan
-
-kandidat finding, tetapi keputusan akhir finding tetap melalui proses
-
-verification/manual review.
-
----
-
-# 14. Contoh Quick Start
-
-Clone:
+Urutan awal yang disarankan:
 
 ```powershell
-
 git clone https://github.com/NRTechnology/BrebesKab-CSIRT-Tools.git
-
 cd BrebesKab-CSIRT-Tools
 
-```
-
-Buat environment:
-
-```powershell
-
 python -m venv .venv
-
 . .\scripts\activate-venv.ps1
 
-```
-
-Install requirements:
-
-```powershell
-
 .\scripts\install-requirements.ps1
-
-```
-
-Buat project:
-
-```powershell
+.\scripts\doctor.ps1
 
 .\scripts\new-pentest-project.ps1
-
-```
-
-Pilih project:
-
-```powershell
-
 python scripts/project.py list
-
-python scripts/project.py use PENTEST-2026-002
-
 python scripts/project.py status
-
 ```
 
-Setelah Preparation selesai, mulai Reconnaissance:
+Sebelum reconnaissance atau pengujian, pastikan project yang aktif benar, otorisasi tersedia, scope telah diverifikasi, RoE disepakati, kontak darurat tersedia, dan persyaratan backup/recovery sudah dipahami. Kemudian ikuti workflow dan checklist yang berlaku pada versi repository tersebut.
 
-```powershell
+## 13. Prinsip pengembangan
 
-python scripts/reconnaissance/target.py init
+1. Authorized testing only.
+2. Scope first.
+3. Preparation before testing.
+4. Checklist-driven assessment.
+5. Activity and evidence traceability.
+6. Evidence-based findings.
+7. Manual verification of findings.
+8. No credentials or secrets in source control.
+9. Distinguish execution status from result completeness.
+10. Standardize interfaces where appropriate without removing domain-specific behavior.
+11. Test and validate changes before documenting them.
+12. AI assists analysis; human reviewer remains responsible for final finding validation.
 
-python scripts/reconnaissance/target.py add
+## 14. Status pengembangan
 
-python scripts/reconnaissance/target.py list
+Repository berisi modul preparation, reconnaissance, pengujian per area, pengelolaan evidence/secret, konfigurasi, checklist, profil, dokumentasi, serta generator laporan. Tingkat kesiapan setiap fitur dapat berbeda dan berubah antarversi.
 
-python scripts/reconnaissance/target.py verify
+Daftar file pada README ini disusun berdasarkan tree repository yang diperiksa. Tree hanya menunjukkan keberadaan file dan direktori; tree tidak membuktikan bahwa setiap fungsi telah selesai, lolos pengujian, atau siap digunakan untuk semua skenario. Untuk memastikan status suatu fitur, periksa implementasi, bantuan CLI, hasil pengujian, dan dokumentasi versi yang sedang digunakan.
 
-python scripts/reconnaissance/target.py status
-
-```
-
----
-
-# 15. Development Principle
-
-Project ini dikembangkan dengan prinsip:
-
-1.  **Authorized testing only**
-
-2.  **Scope first**
-
-3.  **Preparation before testing**
-
-4.  **Checklist-driven assessment**
-
-5.  **Activity traceability**
-
-6.  **Evidence-based findings**
-
-7.  **Manual verification of findings**
-
-8.  **No credentials/secrets in project data**
-
-9.  **One phase at a time**
-
-10. **Standard CLI where it makes sense**
-
-11. **Domain-specific commands are preserved when necessary**
-
-12. **AI assists analysis; human reviewer remains responsible for final
-
-    finding validation**
-
----
-
-# 16. Pelaporan dan Interpretasi Evidence
-
-Laporan disusun berdasarkan evidence dan metadata yang berhasil dibaca dari paket asesmen. Generator tidak boleh mengarang hasil, scope, jadwal, aturan pengujian, atau temuan yang tidak didukung data.
-
-Prinsip pelaporan:
-
-- **Evidence bukan otomatis finding.** Respons HTTP `200`, `303`, refleksi payload, file upload yang diterima, versi komponen yang terungkap, metode HTTP yang diterima, atau perilaku replay tidak dengan sendirinya membuktikan kerentanan.
-- **Temuan terkonfirmasi harus berbasis bukti.** Indikator teknis perlu divalidasi sebelum dinyatakan sebagai kerentanan yang dapat dieksploitasi.
-- **Tinjauan manual dipisahkan dari temuan.** Item yang memerlukan review tidak otomatis dikategorikan sebagai kerentanan maupun dianggap aman.
-- **Status pelaksanaan berbeda dari status hasil.** Checklist dapat sudah dijalankan sementara hasilnya masih `partial`. Status hasil tetap menggambarkan evidence yang diperoleh; ringkasan pelaksanaan harus mengikuti kriteria penyelesaian proses yang berlaku.
-- **Keterbatasan harus dinyatakan.** Tidak adanya finding record bukan jaminan bahwa target aman. Cakupan, item review, dan kelengkapan evidence tetap perlu dipertimbangkan.
-- **Tinjauan AI bersifat pendukung.** Rekomendasi dari berkas tinjauan ChatGPT opsional bukan finding terkonfirmasi dan tidak boleh mengubah status evidence dengan sendirinya. Reviewer manusia tetap bertanggung jawab atas validasi dan kesimpulan akhir.
-
-Pada konfigurasi pengujian yang didokumentasikan, batas teknis yang diterapkan adalah maksimal **100 request untuk setiap pengujian**, di luar proses **Directory Discovery** yang menggunakan mekanisme tersendiri. Pastikan penjelasan ini sesuai dengan implementasi versi tool yang digunakan.
-
-## 16.1 Keterbatasan Otomatisasi
-
-Alur yang memerlukan interaksi manusia—misalnya input OTP atau *Human Verification Challenge* dari Cloudflare—dapat membatasi kelanjutan pengujian otomatis. Kode status HTTP seperti `200` dan `303` harus ditafsirkan berdasarkan konteks request/response, alur aplikasi, dan evidence pendukung, bukan dijadikan dasar tunggal untuk menetapkan kerentanan.
-
-## 16.2 Ringkasan dan Status Checklist
-
-Status pada tabel checklist dan angka ringkasan dapat mewakili hal berbeda. Status `partial` pada checklist menunjukkan hasil yang diperoleh masih terbatas; status tersebut tidak selalu berarti proses pengujiannya belum dijalankan. Logika summary harus membedakan status pelaksanaan dari status hasil dan tidak boleh mengubah evidence asli demi menyesuaikan angka ringkasan.
-
----
-
-# 17. Status Pengembangan
-
-README ini mendokumentasikan struktur proyek dan alur kerja yang telah dibangun. Status implementasi setiap modul dapat berubah antarversi. Sebelum menggunakan perintah atau mengandalkan suatu fitur, periksa kode dan bantuan CLI pada versi repository yang sedang digunakan.
-
-Gambaran modul yang terdokumentasi:
-
-- **Preparation:** pengelolaan authorization, scope in-scope/out-of-scope, RoE, kontak, test account, dan catatan kesiapan backup/recovery.
-- **Project & activity:** pembuatan/pemilihan proyek aktif serta pencatatan timeline aktivitas.
-- **Reconnaissance:** modul target identification dan struktur modul DNS, network, technology, HTTP/HTTPS, endpoint, serta summary.
-- **Evidence & reporting:** pemrosesan metadata/checklist/evidence dan penyusunan laporan dengan batas interpretasi yang eksplisit.
-
-Tidak semua skrip reconnaissance yang tercantum dalam struktur berarti seluruh fungsi telah selesai atau memiliki interface CLI yang sama. Ikuti implementasi aktual pada repository dan jangan menganggap perintah yang belum tersedia sebagai fitur siap pakai.
-
-Pengembangan dilanjutkan bertahap:
+Siklus pengembangan:
 
 ```text
 Implement → Test → Validate → Document → Continue
 ```
 
----
+## 15. License
 
----
+Baca `LICENSE` dan `COMMERCIAL-LICENSE` untuk memahami ketentuan penggunaan, modifikasi, distribusi, dan penggunaan komersial.
 
-# 18. License
+## 16. Security
 
-Lihat:
+Untuk melaporkan masalah keamanan pada proyek ini, ikuti petunjuk di `SECURITY.md`.
 
-```text
-
-LICENSE
-
-COMMERCIAL-LICENSE
-
-```
-
-untuk ketentuan penggunaan project.
-
----
-
-# 19. Security
-
-Untuk melaporkan masalah keamanan pada project, lihat:
-
-```text
-
-SECURITY.md
-
-```
-
-Jangan memasukkan password, token, API key, credential, atau data
-
-sensitif ke issue, commit, atau repository.
+Jangan memasukkan password, token, API key, credential, encryption key, atau data asesmen sensitif ke issue publik, commit, maupun repository publik. Tinjau perubahan dan status Git sebelum melakukan commit.
