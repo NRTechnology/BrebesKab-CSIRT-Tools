@@ -8,8 +8,6 @@ Usage:
     python scripts/project.py list
     python scripts/project.py use PENTEST-2026-002
     python scripts/project.py status
-    python scripts/project.py start PENTEST-2026-002
-    python scripts/project.py complete PENTEST-2026-002
     python scripts/project.py clear
 
 The `create` command replaces the former new-pentest-project.ps1 bootstrap
@@ -35,7 +33,7 @@ except ImportError:
     sys.exit(1)
 
 
-SCRIPT_VERSION = "1.5.4"
+SCRIPT_VERSION = "1.5.3"
 PROJECT_ID_PATTERN = re.compile(r"^PENTEST-[0-9]{4}-[0-9]{3,}$")
 ALLOWED_ENVIRONMENTS = ("Production", "Staging", "Pre-Production")
 ALLOWED_ASSESSMENT_TYPES = ("Black Box", "Grey Box", "White Box")
@@ -760,7 +758,7 @@ def create_project(
         phase_readme = f"""# {phase['number']}. {phase['name']}\n\n**Project:** {project_id}\n\n## Purpose\n\nWorkspace untuk seluruh aktivitas pada phase **{phase['number']}. {phase['name']}**.\n\n## Activities\n\nCatat aktivitas assessment yang dilakukan pada phase ini pada `timeline/activity.log`\ndan hubungkan dengan Activity ID.\n\n## Evidence\n\nEvidence disimpan pada:\n\n`../evidence/`\n\n## Findings\n\nFinding yang dihasilkan dari phase ini disimpan pada:\n\n`../findings/`\n\n## Notes\n\n- Jangan menyimpan password, token, API key, atau credential aktif di repository.\n- Raw output tool disimpan pada `../scans/` sesuai tool.\n- Evidence yang dipilih untuk mendukung finding harus mempunyai Evidence ID.\n"""
         write_text_if_missing(phase_dir / "README.md", phase_readme)
 
-    readme = f"""# {project_id}\n\n## Web Application Penetration Testing Assessment\n\n| Item | Value |\n|---|---|\n| Project ID | {project_id} |\n| Application | {application} |\n| Target | {target} |\n| Tester | {tester} |\n| Reviewer | {reviewer} |\n| Environment | {environment} |\n| Assessment Type | {assessment_type} |\n| Created | {timestamp} |\n\n## Assessment Phases\n\nAssessment menggunakan 23 phase yang didefinisikan dalam\nframework assessment keamanan aplikasi web.\n\n""" + "\n".join(
+    readme = f"""# {project_id}\n\n## Web Application Penetration Testing Assessment\n\n| Item | Value |\n|---|---|\n| Project ID | {project_id} |\n| Application | {application} |\n| Target | {target} |\n| Tester | {tester} |\n| Reviewer | {reviewer} |\n| Environment | {environment} |\n| Assessment Type | {assessment_type} |\n| Created | {timestamp} |\n\n## Assessment Phases\n\nAssessment menggunakan 23 phase yang didefinisikan dalam\nBrebesKab-CSIRT Web Application Penetration Testing Checklist.\n\n""" + "\n".join(
         f"{idx}. {phase['name']}" for idx, phase in enumerate(PHASE_DEFINITIONS, start=1)
     ) + f"""\n\n## Repository Structure\n\n- `01-preparation/` sampai `23-final-sign-off/`\n  - Workspace berdasarkan phase assessment.\n- `timeline/`\n  - Jejak aktivitas assessment.\n- `scans/`\n  - Raw output dari security tools.\n- `wordlists/`\n  - Referensi wordlist yang dipilih dan metadata pemakaian; source wordlist tidak dicopy.\n- `scoring/`\n  - Konfigurasi, baseline, hasil ranking, feedback, dan history fuzzy-wordlist scoring.\n- `evidence/`\n  - Evidence yang dipilih dan direferensikan oleh assessment.\n- `findings/`\n  - Security findings.\n- `retest/`\n  - Evidence dan catatan retest.\n- `report/draft/`\n  - Draft report.\n- `report/final/`\n  - Final report.\n\n## Traceability\n\nSetiap aktivitas sebaiknya mempunyai:\n\n- Activity ID (`ACT-xxxx`)\n- Phase\n- Item\n- Timestamp\n- Action\n- Status\n- Operator\n- Evidence ID jika diperlukan\n- Finding ID jika menghasilkan finding\n- Scoring Run ID jika aktivitas menggunakan fuzzy/wordlist scoring\n- Wordlist ID dan source manifest jika menggunakan wordlist\n\n## Security\n\nJangan menyimpan:\n\n- Password\n- API key\n- Access token\n- Session cookie aktif\n- Private key\n- Credential lain\n\nSanitasi evidence sebelum dimasukkan ke repository.\n"""
     write_text_if_missing(project_dir / "README.md", readme)
@@ -793,6 +791,31 @@ def create_project(
     write_text_if_missing(
         project_dir / "assessment.yaml",
         "\n".join(assessment_lines) + "\n",
+    )
+
+    checklist_lines = [
+        "schema_version: '1.0'",
+        f"project_id: {yaml_quote(project_id)}",
+        "",
+        "# Status values:",
+        "# not-started | in-progress | completed | not-applicable",
+        "",
+        "items:",
+    ]
+    for phase in PHASE_DEFINITIONS:
+        checklist_lines.extend(
+            [
+                f"  - phase_id: '{phase['number']}'",
+                f"    phase: {yaml_quote(phase['name'])}",
+                "    status: 'not-started'",
+                "    activities: []",
+                "    evidence: []",
+                "    findings: []",
+            ]
+        )
+    write_text_if_missing(
+        project_dir / "checklist.yaml",
+        "\n".join(checklist_lines) + "\n",
     )
 
     evidence_readme = "\n".join(
@@ -952,6 +975,7 @@ def create_project(
     print("[PASS] Report repository tersedia.")
     print("[PASS] Timeline tersedia.")
     print("[PASS] assessment.yaml tersedia.")
+    print("[PASS] checklist.yaml tersedia.")
     print("[PASS] README.md tersedia.")
 
     if scoring_created:
@@ -998,97 +1022,6 @@ def create_project(
     print()
 
     return 0
-
-
-def update_assessment_lifecycle(project_id: str, action: str) -> int:
-    """Set assessment start/completion timestamps without rewriting unrelated YAML."""
-    try:
-        project_id = normalize_project_id(project_id)
-        project_dir, assessment = load_project(project_id)
-    except ValueError as exc:
-        print(f"[ERROR] {exc}")
-        return 1
-
-    assessment_path = project_dir / "assessment.yaml"
-    now = datetime.now().astimezone().isoformat(timespec="seconds")
-    current_status = str(assessment.get("status", "not-started")).strip().lower()
-    started_at = assessment.get("started_at")
-    completed_at = assessment.get("completed_at")
-
-    if action == "start":
-        if current_status == "completed" or completed_at:
-            print("[ERROR] Assessment sudah berstatus completed.")
-            print("        Tidak ada perubahan yang dilakukan.")
-            return 1
-        if started_at:
-            print(f"[INFO] Assessment sudah dimulai pada: {started_at}")
-            print("[INFO] started_at tidak diubah.")
-            if current_status != "in-progress":
-                _replace_assessment_root_values(
-                    assessment_path,
-                    {"status": "in-progress"},
-                )
-        else:
-            _replace_assessment_root_values(
-                assessment_path,
-                {"status": "in-progress", "started_at": now},
-            )
-            print(f"[PASS] started_at: {now}")
-        activity_action = "Assessment started"
-        activity_status = "in-progress"
-
-    elif action == "complete":
-        if completed_at:
-            print(f"[INFO] Assessment sudah selesai pada: {completed_at}")
-            print("[INFO] completed_at tidak diubah.")
-            return 0
-        updates = {"status": "completed", "completed_at": now}
-        _replace_assessment_root_values(assessment_path, updates)
-        print(f"[PASS] completed_at: {now}")
-        if not started_at:
-            print("[WARN] started_at masih null karena assessment belum pernah dimulai")
-            print("       melalui perintah project.py start.")
-        activity_action = "Assessment completed"
-        activity_status = "completed"
-    else:
-        print(f"[ERROR] Aksi lifecycle tidak dikenal: {action}")
-        return 2
-
-    try:
-        activity_id = append_activity_record(
-            project_dir,
-            phase="00-project",
-            item="00-003" if action == "start" else "00-004",
-            action=activity_action,
-            status=activity_status,
-            operator="project.py",
-        )
-    except OSError as exc:
-        print(f"[WARN] assessment.yaml diperbarui, tetapi activity log gagal ditulis: {exc}")
-    else:
-        print(f"[PASS] Activity log: {activity_id}")
-
-    print(f"Project    : {project_id}")
-    print(f"Assessment : {assessment_path}")
-    print()
-    return 0
-
-
-def _replace_assessment_root_values(path: Path, updates: dict[str, str]) -> None:
-    """Replace selected top-level scalar fields while preserving the rest of the YAML."""
-    content = path.read_text(encoding="utf-8-sig")
-    for key, value in updates.items():
-        if key not in {"status", "started_at", "completed_at"}:
-            raise ValueError(f"Field assessment tidak diizinkan: {key}")
-        if key == "status":
-            replacement = f"status: {yaml_quote(value)}"
-        else:
-            replacement = f"{key}: {yaml_quote(value)}"
-        pattern = re.compile(rf"(?m)^{re.escape(key)}:[^\n]*$")
-        content, count = pattern.subn(lambda _match, line=replacement: line, content, count=1)
-        if count != 1:
-            raise ValueError(f"Field top-level '{key}' tidak ditemukan di {path}")
-    atomic_write_text(path, content)
 
 
 def list_projects() -> int:
@@ -1316,10 +1249,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "command",
-        choices=(
-            "create", "init-secrets", "list", "use", "status",
-            "start", "start-at", "complete", "completed-at", "clear",
-        ),
+        choices=("create", "init-secrets", "list", "use", "status", "clear"),
         help="Project lifecycle command.",
     )
     parser.add_argument(
@@ -1390,16 +1320,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "status":
         return status_project()
-
-    if args.command in ("start", "start-at"):
-        if not args.project_id:
-            parser.error(f"command '{args.command}' membutuhkan <PROJECT-ID>.")
-        return update_assessment_lifecycle(args.project_id, "start")
-
-    if args.command in ("complete", "completed-at"):
-        if not args.project_id:
-            parser.error(f"command '{args.command}' membutuhkan <PROJECT-ID>.")
-        return update_assessment_lifecycle(args.project_id, "complete")
 
     if args.command == "clear":
         return clear_project()
