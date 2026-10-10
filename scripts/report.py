@@ -37,7 +37,7 @@ Example:
     python scripts/report.py
 
 Optional:
-    python scripts/report.py --project-root C:\\...\\projects\\PENTEST-2026-002
+    python scripts/report.py --project-root C:\\...\\projects\\<PROJECT_ID>
     python scripts/report.py --recommendation-file C:\\...\\chatgpt-recommendation.yaml
     python scripts/report.py --output C:\\...\\penetration-test-report.docx
 """
@@ -75,7 +75,7 @@ except ImportError:
     raise SystemExit(2)
 
 
-SCRIPT_VERSION = "1.2.1"
+SCRIPT_VERSION = "1.3.0"
 
 ACTIVE_PROJECT_RELATIVE = Path(".runtime") / "active-project.yaml"
 FINAL_DIRNAME = "23-final-sign-off"
@@ -351,47 +351,156 @@ def _first_assessment_result(values: Any) -> Any:
     return vals[0]
 
 
-def load_checklist_title_map(project_root: Path | None) -> dict[str, str]:
-    if project_root is None:
-        return {}
-    path = project_root / "checklist.yaml"
-    if not path.is_file():
-        return {}
-    try:
-        data = load_yaml(path)
-    except Exception:
+def load_checklist_definition_map(
+    project_root: Path | None, evidence: dict[str, Any] | None = None
+) -> dict[str, dict[str, str]]:
+    """
+    Read checklist definitions from checklist.yaml.
+
+    Supports both list-based definitions (each item has id/checklist_id) and
+    mapping-based definitions (the checklist ID is the YAML key). The parser
+    deliberately searches common title/objective/description fields instead
+    of assuming one specific checklist.yaml layout.
+    """
+    data_sources: list[tuple[str, dict[str, Any]]] = []
+    excluded_parts = {
+        ".git", ".runtime", "evidence", "scans", "23-final-sign-off",
+        "report", "findings", "retest", "scoring", "timeline",
+    }
+    if project_root is not None:
+        # Prefer the project-level checklist definition, then inspect project
+        # configuration YAML files outside generated evidence/output folders.
+        candidates = [project_root / "checklist.yaml"]
+        if project_root.is_dir():
+            for candidate in sorted(project_root.rglob("*.yaml")) + sorted(project_root.rglob("*.yml")):
+                try:
+                    relative_parts = {part.lower() for part in candidate.relative_to(project_root).parts[:-1]}
+                except ValueError:
+                    continue
+                if relative_parts & excluded_parts:
+                    continue
+                if candidate not in candidates:
+                    candidates.append(candidate)
+        for candidate in candidates:
+            if not candidate.is_file():
+                continue
+            try:
+                parsed = load_yaml(candidate)
+            except Exception:
+                continue
+            if isinstance(parsed, dict):
+                data_sources.append((str(candidate), parsed))
+
+    # Evidence bundles may embed the original checklist metadata. Add it as a
+    # fallback source, useful when the project directory is not fully available.
+    if isinstance(evidence, dict):
+        project_metadata = evidence.get("project_metadata")
+        if isinstance(project_metadata, dict):
+            embedded = project_metadata.get("checklist.yaml") or project_metadata.get("checklist")
+            if isinstance(embedded, dict):
+                data_sources.append(("evidence.project_metadata.checklist.yaml", embedded))
+    if not data_sources:
         return {}
 
-    result: dict[str, str] = {}
+    result: dict[str, dict[str, str]] = {}
+    id_pattern = re.compile(r"^\d{1,2}-\d{3}$")
 
-    def walk(value: Any) -> None:
+    title_keys = (
+        "name", "title", "checklist_name", "label", "display_name",
+    )
+    aspect_keys = (
+        "objective", "purpose", "description", "test_objective",
+        "testing_objective", "what_to_test", "test_scope", "scope",
+        "verification", "verification_steps", "test_steps", "checks",
+        "test", "assessment", "summary", "details",
+    )
+
+    def scalar_text(value: Any) -> str:
+        if value is None or isinstance(value, (dict, list)):
+            return ""
+        return str(value).strip()
+
+    def text_value(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, (int, float, bool)):
+            return str(value)
+        if isinstance(value, list):
+            parts = [text_value(x) for x in value]
+            return "; ".join(x for x in parts if x)
         if isinstance(value, dict):
-            cid = first_nonempty(
-                value.get("id"),
-                value.get("checklist_id"),
+            # Prefer human-readable description-like fields, not raw YAML.
+            parts = []
+            for key in aspect_keys:
+                if key in value:
+                    item = text_value(value[key])
+                    if item and item not in parts:
+                        parts.append(item)
+            if parts:
+                return "; ".join(parts)
+            return ""
+        return str(value).strip()
+
+    def walk(value: Any, parent_key: str = "") -> None:
+        if isinstance(value, dict):
+            key_id = parent_key if id_pattern.fullmatch(str(parent_key)) else ""
+            field_id = first_nonempty(
+                value.get("id"), value.get("checklist_id"),
+                value.get("checklistId"), value.get("check_id"),
                 default="",
             )
-            name = first_nonempty(
-                value.get("name"),
-                value.get("title"),
-                value.get("checklist_name"),
-                default="",
-            )
-            if cid and name and re.fullmatch(r"\d{1,2}-\d{3}", str(cid)):
-                result[str(cid)] = name
-            for child in value.values():
-                walk(child)
+            cid = str(field_id) if id_pattern.fullmatch(str(field_id)) else key_id
+
+            title = ""
+            for key in title_keys:
+                candidate = scalar_text(value.get(key))
+                if candidate:
+                    title = candidate
+                    break
+
+            aspect_parts = []
+            for key in aspect_keys:
+                if key in value:
+                    candidate = text_value(value.get(key))
+                    if candidate and candidate not in aspect_parts:
+                        aspect_parts.append(candidate)
+            aspect = "; ".join(aspect_parts)
+
+            if cid:
+                current = result.setdefault(cid, {})
+                if title and (not current.get("title") or current["title"] == cid):
+                    current["title"] = title
+                if aspect and not current.get("aspect"):
+                    current["aspect"] = aspect
+
+            for key, child in value.items():
+                # A mapping key such as "2-003" is passed down so its value
+                # can be associated with the correct checklist ID.
+                walk(child, str(key))
         elif isinstance(value, list):
             for child in value:
-                walk(child)
+                walk(child, parent_key)
 
-    walk(data)
+    for _source_name, source_data in data_sources:
+        walk(source_data)
     return result
+
+
+def load_checklist_title_map(project_root: Path | None) -> dict[str, str]:
+    """Backward-compatible title map wrapper."""
+    return {
+        cid: details["title"]
+        for cid, details in load_checklist_definition_map(project_root).items()
+        if details.get("title")
+    }
 
 
 def _normalize_checklist_record(
     record: dict[str, Any],
     title_map: dict[str, str],
+    definition_map: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     cid = first_nonempty(
         record.get("checklist_id"),
@@ -412,16 +521,48 @@ def _normalize_checklist_record(
     else:
         observation = safe_text(result, "")
 
+    definition_map = definition_map or {}
+    definition = definition_map.get(cid, {})
+    record_title = first_nonempty(
+        record.get("title"),
+        record.get("name"),
+        record.get("checklist"),
+        default="",
+    )
+    is_generic_title = bool(re.fullmatch(
+        r"(Daftar Periksa|Checklist)\s+\d{1,2}-\d{3}",
+        record_title,
+        re.I,
+    ))
+    title = first_nonempty(
+        definition.get("title") if is_generic_title or not record_title else record_title,
+        title_map.get(cid),
+        definition.get("title"),
+        record_title,
+        default=f"Daftar Periksa {cid}",
+    )
+    aspect = first_nonempty(
+        record.get("aspect"),
+        record.get("objective"),
+        record.get("purpose"),
+        record.get("test_objective"),
+        record.get("testing_objective"),
+        record.get("what_to_test"),
+        record.get("test_scope"),
+        record.get("description"),
+        record.get("verification"),
+        record.get("test_steps"),
+        record.get("checks"),
+        definition.get("aspect"),
+        default="",
+    )
+
     normalized = dict(record)
     normalized.update({
         "id": cid,
         "checklist_id": cid,
-        "title": first_nonempty(
-            record.get("title"),
-            record.get("name"),
-            title_map.get(cid),
-            default=f"Checklist {cid}",
-        ),
+        "title": title,
+        "scope_description": aspect,
         "name": first_nonempty(
             record.get("name"),
             title_map.get(cid),
@@ -446,7 +587,12 @@ def extract_checklists(
     authoritative checklist index under aggregate.checklists as a mapping:
         {"3-006": {...}, "10-001": {...}, ...}
     """
-    title_map = load_checklist_title_map(project_root)
+    definition_map = load_checklist_definition_map(project_root, evidence=evidence)
+    title_map = {
+        cid: details["title"]
+        for cid, details in definition_map.items()
+        if details.get("title")
+    }
 
     aggregate = evidence.get("aggregate")
     if isinstance(aggregate, dict):
@@ -457,12 +603,12 @@ def extract_checklists(
                 if isinstance(value, dict):
                     item = dict(value)
                     item.setdefault("checklist_id", key)
-                    records.append(_normalize_checklist_record(item, title_map))
+                    records.append(_normalize_checklist_record(item, title_map, definition_map))
             if records:
                 return records
         elif isinstance(candidate, list):
             return [
-                _normalize_checklist_record(x, title_map)
+                _normalize_checklist_record(x, title_map, definition_map)
                 for x in candidate
                 if isinstance(x, dict)
             ]
@@ -478,7 +624,7 @@ def extract_checklists(
     for candidate in candidates:
         if isinstance(candidate, list):
             return [
-                _normalize_checklist_record(x, title_map)
+                _normalize_checklist_record(x, title_map, definition_map)
                 for x in candidate
                 if isinstance(x, dict)
             ]
@@ -488,7 +634,7 @@ def extract_checklists(
                 if isinstance(value, dict):
                     item = dict(value)
                     item.setdefault("checklist_id", key)
-                    result.append(_normalize_checklist_record(item, title_map))
+                    result.append(_normalize_checklist_record(item, title_map, definition_map))
             if result:
                 return result
 
@@ -550,6 +696,7 @@ def extract_findings(evidence: dict[str, Any]) -> list[dict[str, Any]]:
 def extract_project_metadata(
     evidence: dict[str, Any],
     active: dict[str, Any],
+    project_root: Path | None = None,
 ) -> dict[str, Any]:
     project = evidence.get("project")
     if not isinstance(project, dict):
@@ -569,6 +716,56 @@ def extract_project_metadata(
     target = target_file.get("target")
     if not isinstance(target, dict):
         target = {}
+
+    scope_data = (
+        metadata.get("scope.yaml")
+        or metadata.get("scope")
+        or deep_get(evidence, "scope", "assessment.scope", "project.scope")
+    )
+    roe_data = (
+        metadata.get("rules-of-engagement.yaml")
+        or metadata.get("roe.yaml")
+        or metadata.get("rules_of_engagement")
+        or deep_get(evidence, "rules_of_engagement", "roe", "assessment.roe")
+    )
+
+    if project_root is not None:
+        if not scope_data:
+            scope_candidates = [
+                project_root / "scope.yaml",
+                project_root / "01-preparation" / "scope" / "scope.yaml",
+                project_root / "scope" / "scope.yaml",
+            ]
+            for candidate in scope_candidates:
+                if candidate.is_file():
+                    try:
+                        scope_data = load_yaml(candidate)
+                        break
+                    except Exception:
+                        continue
+        if not roe_data:
+            roe_candidates = [
+                project_root / "rules-of-engagement.yaml",
+                project_root / "roe.yaml",
+                project_root / "01-preparation" / "rules-of-engagement.yaml",
+                project_root / "01-preparation" / "roe.yaml",
+            ]
+            # Also accept a project-defined ROE filename under preparation.
+            prep_dir = project_root / "01-preparation"
+            if prep_dir.is_dir():
+                roe_candidates.extend(sorted(prep_dir.rglob("*rules*engagement*.yaml")))
+                roe_candidates.extend(sorted(prep_dir.rglob("*roe*.yaml")))
+            seen_candidates = set()
+            for candidate in roe_candidates:
+                if candidate in seen_candidates:
+                    continue
+                seen_candidates.add(candidate)
+                if candidate.is_file():
+                    try:
+                        roe_data = load_yaml(candidate)
+                        break
+                    except Exception:
+                        continue
 
     return {
         "project_id": first_nonempty(
@@ -617,9 +814,8 @@ def extract_project_metadata(
             evidence.get("generated_at"),
             default="—",
         ),
-        "scope": metadata.get("scope.yaml"),
-        "roe": metadata.get("rules-of-engagement.yaml")
-            or metadata.get("roe.yaml"),
+        "scope": scope_data,
+        "roe": roe_data,
     }
 
 def extract_metrics(
@@ -628,52 +824,63 @@ def extract_metrics(
     source_files: list[dict[str, Any]],
     findings: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    aggregate = evidence.get("aggregate")
-    counts = aggregate.get("high_level_counts") if isinstance(aggregate, dict) else {}
-    if not isinstance(counts, dict):
-        counts = {}
+    """Derive report metrics from normalized records to keep sections consistent.
 
-    return {
-        "source_files": first_nonempty(
-            counts.get("file_count"),
-            len(source_files),
-            default="0",
+    Aggregate counters are retained for discrepancy reporting, but are not mixed
+    into computed counts when the underlying records are available.
+    """
+    aggregate = evidence.get("aggregate")
+    aggregate = aggregate if isinstance(aggregate, dict) else {}
+    counts = aggregate.get("high_level_counts")
+    counts = counts if isinstance(counts, dict) else {}
+
+    statuses = [checklist_status(x).strip().lower() for x in checklists]
+    completed_statuses = {"completed", "complete", "passed", "pass", "closed"}
+    incomplete_statuses = {"incomplete", "partial", "in-progress", "in_progress"}
+    computed = {
+        "source_files": len(source_files),
+        "checklists": len(checklists),
+        "completed": sum(status in completed_statuses for status in statuses),
+        "incomplete": sum(status in incomplete_statuses for status in statuses),
+        "findings": len(findings),
+        "checklists_with_finding": sum(checklist_finding(x) for x in checklists),
+        "checklists_with_review_flag": sum(checklist_review(x) for x in checklists),
+        "review": sum(
+            checklist_review(x)
+            or checklist_status(x).strip().lower() in {
+                "review", "requires_review", "partial", "incomplete"
+            }
+            for x in checklists
         ),
-        "checklists": first_nonempty(
-            counts.get("checklist_count"),
-            len(checklists),
-            default="0",
-        ),
-        "completed": first_nonempty(
-            counts.get("completed_checklists"),
-            sum(checklist_status(x).lower() in {
-                "completed", "complete", "passed", "pass", "closed"
-            } for x in checklists),
-            default="0",
-        ),
-        "incomplete": first_nonempty(
-            counts.get("incomplete_checklists"),
-            sum(checklist_status(x).lower() in {
-                "incomplete", "partial", "in-progress", "in_progress"
-            } for x in checklists),
-            default="0",
-        ),
-        "findings": first_nonempty(
-            counts.get("checklists_with_finding_true"),
-            sum(checklist_finding(x) for x in checklists),
-            default="0",
-        ),
-        "review": first_nonempty(
-            counts.get("checklists_with_review_true"),
-            sum(checklist_review(x) for x in checklists),
-            default="0",
-        ),
-        "parse_errors": len(
-            aggregate.get("parse_errors", [])
-            if isinstance(aggregate, dict) and isinstance(aggregate.get("parse_errors", []), list)
-            else []
-        ),
+        "parse_errors": len(aggregate.get("parse_errors", []))
+            if isinstance(aggregate.get("parse_errors", []), list) else 0,
     }
+
+    # If a source inventory or checklist record set is absent, preserve an
+    # aggregate count when available but make the source of that count explicit.
+    fallback_map = {
+        "source_files": "file_count",
+        "checklists": "checklist_count",
+        "completed": "completed_checklists",
+        "incomplete": "incomplete_checklists",
+        "checklists_with_finding": "checklists_with_finding_true",
+        "checklists_with_review_flag": "checklists_with_review_true",
+    }
+    for key, aggregate_key in fallback_map.items():
+        if computed[key] == 0 and not source_files and key == "source_files":
+            if counts.get(aggregate_key) is not None:
+                computed[key] = counts[aggregate_key]
+        elif computed[key] == 0 and not checklists and key in {
+            "checklists", "completed", "incomplete", "checklists_with_finding", "review"
+        }:
+            if counts.get(aggregate_key) is not None:
+                computed[key] = counts[aggregate_key]
+
+    # Keep old report consumers working: findings means actual finding records,
+    # not merely a checklist's boolean indicator.
+    computed["aggregate_counts"] = counts
+    return computed
+
 
 def resolve_evidence_ref(
     project_root: Path,
@@ -1385,11 +1592,19 @@ def add_executive_summary(
             "The findings section below is the authoritative presentation of those records."
         )
     else:
-        summary = (
-            "Berdasarkan evidence yang dikumpulkan, tidak terdapat security finding "
-            "yang terkonfirmasi secara otomatis. Evidence tetap memuat item yang memerlukan "
-            "manual review dan satu atau lebih checklist yang belum lengkap."
-        )
+        flagged = sum(checklist_finding(item) for item in checklists)
+        if flagged:
+            summary = (
+                f"Tidak ditemukan record temuan terstruktur, tetapi {flagged} checklist "
+                "memiliki flag temuan. Status ini perlu direkonsiliasi secara manual; "
+                "laporan tidak menyimpulkan bahwa tidak ada temuan."
+            )
+        else:
+            summary = (
+                "Tidak ada record temuan terstruktur pada paket evidence yang dibaca. "
+                "Hal ini tidak menjamin target aman; periksa cakupan checklist, item "
+                "tinjauan manual, dan kelengkapan evidence sebelum menarik kesimpulan."
+            )
 
     doc.add_paragraph(summary)
 
@@ -1397,7 +1612,7 @@ def add_executive_summary(
     p.add_run("Coverage: ").bold = True
     p.add_run(
         f"{metrics['checklists']} checklist; {metrics['completed']} completed; "
-        f"{metrics['incomplete']} incomplete; {metrics['review']} review item(s); "
+        f"{metrics['incomplete']} incomplete; {metrics['review']} review/incomplete checklist(s); "
         f"{metrics['findings']} finding record(s); {metrics['parse_errors']} parse error(s)."
     )
 
@@ -1426,14 +1641,34 @@ def add_executive_summary(
     )
 
 
+def _render_metadata_block(doc: Document, title: str, value: Any) -> None:
+    """Render supplied scope/ROE metadata without assuming a fixed schema."""
+    if isinstance(value, dict):
+        if not value:
+            return
+        doc.add_paragraph(title)
+        for key, item in value.items():
+            if isinstance(item, (dict, list)):
+                add_label_value(doc, str(key), clean_multiline(item))
+            else:
+                add_label_value(doc, str(key), item)
+    elif isinstance(value, list):
+        if not value:
+            return
+        doc.add_paragraph(title)
+        for item in value:
+            add_bullet(doc, clean_multiline(item))
+    elif value not in (None, ""):
+        doc.add_paragraph(title)
+        doc.add_paragraph(clean_multiline(value))
+
+
 def add_scope_roe(
     doc: Document,
     meta: dict[str, Any],
     evidence: dict[str, Any],
 ):
-    """Render explicit target/port boundaries without inventing missing ROE terms."""
-    from urllib.parse import urlsplit
-
+    """Render project-provided scope and ROE; never invent project boundaries."""
     doc.add_heading("2. Ruang Lingkup & Aturan Pelaksanaan Pengujian", level=1)
 
     add_label_value(doc, "ID Proyek", meta["project_id"])
@@ -1442,107 +1677,54 @@ def add_scope_roe(
     add_label_value(doc, "Jenis Pengujian", meta["assessment_type"])
     add_label_value(doc, "Lingkungan", meta["environment"])
 
-    # Scope boundary confirmed by the project owner: web ports 80 and 443 only.
-    # This explicit project constraint takes precedence over missing/incomplete
-    # scope metadata; the original metadata is still shown below for traceability.
-    target_url = safe_text(meta.get("target"), "")
-    parsed_target = urlsplit(
-        target_url if "://" in target_url else f"https://{target_url}"
-    )
-    target_host = parsed_target.hostname or target_url or "target yang tercantum"
     scope = meta.get("scope")
     roe = meta.get("roe")
 
     doc.add_heading("2.1 Ruang Lingkup Pengujian", level=2)
-    doc.add_paragraph(
-        "Pengujian dibatasi pada aplikasi web yang menjadi target penilaian. "
-        "Batas port yang diizinkan adalah TCP/80 (HTTP) dan TCP/443 (HTTPS) saja. "
-        "Batas ini berlaku untuk aktivitas pengujian dan enumerasi layanan; "
-        "port lain tidak termasuk dalam ruang lingkup."
-    )
-    add_bullet(doc, f"Target host: {target_host}. URL target: {target_url or 'tidak tercantum'}.")
-    add_bullet(doc, "Port yang termasuk scope: TCP/80 untuk HTTP dan TCP/443 untuk HTTPS.")
-    add_bullet(
-        doc,
-        "Aktivitas yang termasuk scope: pemeriksaan aplikasi web dan konfigurasi "
-        "web yang dapat diamati melalui target pada port 80/443, termasuk endpoint "
-        "yang ditemukan selama pengujian pada host target yang sama."
-    )
-    add_bullet(
-        doc,
-        "Di luar scope: port TCP/UDP selain 80 dan 443, layanan non-web pada port lain, "
-        "serta host, subdomain, alamat IP, atau aplikasi lain yang tidak dinyatakan "
-        "secara eksplisit sebagai target."
-    )
-    add_bullet(
-        doc,
-        "Temuan atau sinyal yang muncul dari respons aplikasi dicatat sebagai evidence; "
-        "respons tersebut tidak otomatis dianggap sebagai kerentanan terkonfirmasi."
-    )
-
-    if isinstance(scope, dict) and scope:
+    if scope not in (None, "", {}, []):
         doc.add_paragraph(
-            "Metadata scope yang tersedia pada paket evidence ditampilkan berikut "
-            "sebagai informasi tambahan. Batas port TCP/80 dan TCP/443 di atas tetap "
-            "menjadi batas operasional pengujian."
+            "Ruang lingkup di bawah disajikan dari metadata proyek yang tersedia. "
+            "Batas target, host, port, protokol, endpoint, dan pengecualian harus "
+            "ditafsirkan sesuai definisi yang tercatat pada metadata tersebut."
         )
-        for key, value in scope.items():
-            add_label_value(doc, str(key), value)
-    elif scope:
-        doc.add_paragraph("Metadata scope tambahan:")
-        doc.add_paragraph(clean_multiline(scope))
-    else:
-        doc.add_paragraph(
-            "Rincian scope operasional pada metadata evidence tidak terisi secara "
-            "terpisah. Karena itu, laporan ini menyatakan batas yang telah ditetapkan "
-            "secara eksplisit: host target aplikasi web dan hanya port TCP/80 serta "
-            "TCP/443."
-        )
-
-    doc.add_heading("2.2 Aturan Pelaksanaan Pengujian", level=2)
-    doc.add_paragraph(
-        "Aturan pelaksanaan berikut menjabarkan batas operasional yang dapat "
-        "dipastikan dari scope penilaian. Aturan ini tidak memperluas otorisasi "
-        "ke aset atau port lain."
-    )
-    for rule in [
-        "Pengujian hanya diarahkan ke host target yang tercantum dalam laporan dan "
-        "layanan web pada TCP/80 atau TCP/443.",
-        "Tidak melakukan pemindaian atau pengujian layanan pada port selain TCP/80 "
-        "dan TCP/443, sekalipun layanan tersebut terlihat dari hasil observasi.",
-        "Penemuan tautan atau endpoint baru tidak memperluas scope ke host, subdomain, "
-        "alamat IP, atau aplikasi lain; endpoint hanya diuji jika masih berada pada "
-        "host target yang sama.",
-        "Status HTTP seperti 200, 302, 403, atau 500, refleksi payload, pesan error, "
-        "atau respons upload yang diterima dicatat sebagai observasi. Status tersebut "
-        "bukan bukti tunggal bahwa eksploitasi berhasil atau kerentanan telah terkonfirmasi.",
-        "Pengujian lanjutan yang berpotensi mengganggu ketersediaan layanan, mengubah "
-        "atau menghapus data, mempertahankan akses, atau mengakses data di luar kebutuhan "
-        "validasi tidak dianggap otomatis diizinkan oleh scope ini; diperlukan otorisasi "
-        "terpisah yang eksplisit.",
-    ]:
-        add_bullet(doc, rule)
-
-    if isinstance(roe, dict) and roe:
-        doc.add_paragraph(
-            "Metadata Rules of Engagement yang tersedia pada paket evidence:"
-        )
-        for key, value in roe.items():
-            add_label_value(doc, str(key), value)
-    elif roe:
-        doc.add_paragraph("Metadata Rules of Engagement tambahan:")
-        doc.add_paragraph(clean_multiline(roe))
+        _render_metadata_block(doc, "Metadata scope proyek:", scope)
     else:
         add_note_box(
             doc,
-            "Catatan kelengkapan Rules of Engagement",
-            "Paket evidence tidak memuat blok Rules of Engagement terpisah. "
-            "Karena itu, laporan ini tidak mengarang jadwal pengujian, batas laju request, "
-            "kontak eskalasi, prosedur penghentian, atau ketentuan penanganan data yang "
-            "belum terdokumentasi. Ketentuan tersebut perlu dikonfirmasi pada dokumen "
-            "otorisasi/ROE proyek jika diperlukan.",
+            "Ruang lingkup belum terdokumentasi lengkap",
+            "Metadata scope terstruktur tidak ditemukan dalam paket evidence yang dibaca. "
+            "Generator tidak menetapkan host, port, protokol, endpoint, maupun pengecualian "
+            "secara otomatis. Lengkapi bagian ini secara manual dari dokumen otorisasi atau "
+            "konfigurasi scope proyek sebelum laporan disahkan.",
             fill="FFF8E1",
         )
+        if meta.get("target") not in (None, "", "—"):
+            add_label_value(doc, "Target yang tercatat (bukan pengganti scope lengkap)", meta["target"])
+
+    doc.add_heading("2.2 Aturan Pelaksanaan Pengujian", level=2)
+    if roe not in (None, "", {}, []):
+        doc.add_paragraph(
+            "Aturan pelaksanaan berikut berasal dari metadata Rules of Engagement "
+            "yang tersedia pada paket evidence."
+        )
+        _render_metadata_block(doc, "Metadata Rules of Engagement:", roe)
+    else:
+        add_note_box(
+            doc,
+            "Rules of Engagement belum terdokumentasi",
+            "Paket evidence tidak menyediakan metadata Rules of Engagement yang dapat "
+            "dibaca. Generator tidak mengarang jadwal, batas laju request, teknik yang "
+            "diizinkan/dilarang, kontak eskalasi, prosedur penghentian, atau aturan "
+            "penanganan data. Lengkapi bagian ini secara manual berdasarkan otorisasi "
+            "dan kesepakatan pelaksanaan pengujian yang berlaku.",
+            fill="FFF8E1",
+        )
+
+    doc.add_paragraph(
+        "Catatan interpretasi: status respons, pesan error, refleksi payload, atau "
+        "indikator teknis lain harus dibaca bersama evidence pendukung. Indikator "
+        "tersebut tidak otomatis menjadi temuan terkonfirmasi tanpa bukti yang memadai."
+    )
 
 
 def add_methodology(
@@ -1563,21 +1745,20 @@ def add_methodology(
         doc.add_paragraph(clean_multiline(methodology))
     else:
         doc.add_paragraph(
-            "The assessment was executed using the checklist structure represented by "
-            "BrebesKab-CSIRT-Tools. Evidence was collected by checklist-specific tooling, "
-            "then aggregated into an evidence bundle for final reporting."
+            "Rincian metodologi tidak tersedia sebagai metadata eksplisit pada paket "
+            "evidence. Laporan ini menyajikan hasil berdasarkan record checklist dan "
+            "evidence yang tersedia; uraian metodologi spesifik proyek dapat dilengkapi "
+            "secara manual sebelum laporan disahkan."
         )
 
+    doc.add_heading("Alur penyusunan laporan", level=2)
     steps = [
-        "Preparation and scope confirmation.",
-        "Reconnaissance and attack-surface mapping.",
-        "Infrastructure and web-server configuration assessment.",
-        "Security-header, session, authentication and authorization checks.",
-        "Input-validation, file-upload and application-security checks.",
-        "Evidence aggregation and consistency review.",
-        "Final report generation from the evidence bundle.",
+        "Memuat metadata proyek aktif dan paket evidence.",
+        "Menormalisasi record checklist, temuan, dan inventaris sumber.",
+        "Memvalidasi rekomendasi eksternal jika berkas rekomendasi disediakan.",
+        "Menyusun bagian laporan dan lampiran dari data yang berhasil dibaca.",
+        "Mempertahankan status evidence dan menandai keterbatasan metadata yang tidak tersedia.",
     ]
-    doc.add_heading("Assessment flow", level=2)
     for index, step in enumerate(steps, start=1):
         add_numbered(doc, step, index)
 
@@ -1589,31 +1770,71 @@ def add_methodology(
     )
 
 
+def checklist_scope_description(item: dict[str, Any]) -> str:
+    """Return the declared test aspect without fabricating checklist details."""
+    aspect = first_nonempty(
+        item.get("scope_description"),
+        item.get("objective"),
+        item.get("purpose"),
+        item.get("test_objective"),
+        item.get("testing_objective"),
+        item.get("what_to_test"),
+        item.get("test_scope"),
+        item.get("description"),
+        item.get("verification"),
+        item.get("test_steps"),
+        item.get("checks"),
+        item.get("summary"),
+        default="",
+    )
+    if aspect:
+        return aspect
+    title = checklist_title(item)
+    if title and not re.fullmatch(r"(Daftar Periksa|Checklist)\s+\d{1,2}-\d{3}", title, re.I):
+        return (
+            f"Nama checklist tersedia: {title}. Namun, tujuan/aspek rinci dan langkah "
+            "pengujian tidak tersedia pada metadata yang dibaca; lengkapi secara manual "
+            "jika diperlukan."
+        )
+    return (
+        "Definisi aspek/objek uji untuk checklist ini tidak ditemukan pada "
+        "checklist.yaml maupun record evidence. Lengkapi metadata checklist "
+        "agar laporan dapat menyebutkan objek dan tujuan pengujian secara spesifik."
+    )
+
+
 def add_coverage(
     doc: Document,
     checklists: list[dict[str, Any]],
 ):
-    doc.add_heading("4. Assessment Coverage", level=1)
+    doc.add_heading("4. Cakupan Pengujian", level=1)
+    doc.add_paragraph(
+        "Tabel berikut menjelaskan aspek yang diuji berdasarkan definisi checklist "
+        "dan metadata evidence yang tersedia. Jika aspek tidak dapat ditentukan, "
+        "laporan menandainya secara eksplisit untuk dilengkapi, bukan menebak dari ID."
+    )
 
     rows = []
     for item in sort_checklists(checklists):
         rows.append([
             checklist_id(item),
             checklist_title(item),
+            checklist_scope_description(item),
             checklist_status(item),
-            "Yes" if checklist_review(item) else "No",
-            "Yes" if checklist_finding(item) else "No",
+            "Ya" if checklist_review(item) else "Tidak",
+            "Ya" if checklist_finding(item) else "Tidak",
         ])
 
     if not rows:
-        doc.add_paragraph("No checklist records were present in the evidence bundle.")
+        doc.add_paragraph("Tidak ada record checklist dalam paket evidence.")
         return
 
     add_table(
         doc,
-        ["Checklist", "Title", "Status", "Review", "Finding"],
+        ["ID", "Nama Checklist", "Aspek/Objek yang Diuji", "Status", "Tinjauan", "Temuan"],
         rows,
-        widths=[0.75, 3.35, 1.05, 0.75, 0.75],
+        widths=[0.58, 1.25, 3.15, 0.72, 0.55, 0.55],
+        font_size=7,
     )
 
 
@@ -1885,11 +2106,26 @@ def add_limitations(
 
     limitations.extend([
         "Evidence is limited to what was observed and captured during the assessment.",
-        "A response that is accepted or reflected is not, by itself, proof of exploitability.",
-        "CVE candidate correlation requires manual applicability validation.",
-        "File-upload acceptance does not by itself prove persistence, storage location, overwrite, or code execution.",
-        "Manual-review items are not automatically classified as vulnerabilities.",
+        "An individual response or technical indicator is not, by itself, proof of exploitability.",
     ])
+    if build_review_items(checklists):
+        limitations.append(
+            "Items marked for manual review are not automatically classified as vulnerabilities; "
+            "they require validation by an authorized reviewer."
+        )
+    checklist_text = " ".join(
+        f"{checklist_title(item)} {checklist_observation(item)}" for item in checklists
+    ).lower()
+    if any(token in checklist_text for token in ("cve", "vulnerability database", "version disclosure")):
+        limitations.append(
+            "Any CVE or component-vulnerability correlation requires manual validation "
+            "of product identity, version, configuration, and applicability."
+        )
+    if any(token in checklist_text for token in ("file upload", "upload berkas", "unggah berkas", "upload")):
+        limitations.append(
+            "An accepted file-upload response does not by itself prove persistence, storage "
+            "location, overwrite, or code execution."
+        )
 
     seen = set()
     for item in limitations:
@@ -2008,13 +2244,20 @@ def add_conclusion(
             "and verified through remediation/retest activities."
         )
     else:
-        doc.add_paragraph(
-            "The evidence bundle records no confirmed security findings. "
-            "However, this conclusion must be read together with the manual-review "
-            f"items ({metrics['review']}) and incomplete coverage ({metrics['incomplete']}). "
-            "The assessment therefore should not be interpreted as a blanket statement "
-            "that the target is secure."
-        )
+        flagged = sum(checklist_finding(item) for item in checklists)
+        if flagged:
+            conclusion = (
+                f"No structured finding record is present, but {flagged} checklist record(s) "
+                "carry a finding flag. Reconcile these records manually before sign-off."
+            )
+        else:
+            conclusion = (
+                "The evidence bundle contains no structured finding records. This does not "
+                "guarantee that the target is secure; interpret the result together with "
+                f"manual-review items ({metrics['review']}) and incomplete coverage "
+                f"({metrics['incomplete']})."
+            )
+        doc.add_paragraph(conclusion)
 
     if build_incomplete_items(checklists):
         add_note_box(
@@ -2034,38 +2277,79 @@ def add_consistency_notes(
 ):
     doc.add_heading("13. Evidence / Data Consistency Notes", level=1)
 
-    assessment_status = deep_get(
-        evidence,
-        "assessment.status",
-        "assessment_status",
-        default=None,
+    project_metadata = evidence.get("project_metadata")
+    project_metadata = project_metadata if isinstance(project_metadata, dict) else {}
+    assessment_metadata = project_metadata.get("assessment.yaml")
+    assessment_metadata = assessment_metadata if isinstance(assessment_metadata, dict) else {}
+    assessment_status = first_nonempty(
+        assessment_metadata.get("status"),
+        deep_get(evidence, "assessment.status", "assessment_status"),
+        default="",
     )
     if assessment_status:
         add_label_value(doc, "Assessment status recorded in evidence", assessment_status)
 
-    started = deep_get(
-        evidence,
-        "assessment.started_at",
-        "started_at",
-        default=None,
+    started = first_nonempty(
+        assessment_metadata.get("started_at"),
+        deep_get(evidence, "assessment.started_at", "started_at"),
+        default="",
     )
-    completed = deep_get(
-        evidence,
-        "assessment.completed_at",
-        "completed_at",
-        default=None,
+    completed = first_nonempty(
+        assessment_metadata.get("completed_at"),
+        deep_get(evidence, "assessment.completed_at", "completed_at"),
+        default="",
     )
+    started = None if started == "" else started
+    completed = None if completed == "" else completed
 
     if started is not None:
         add_label_value(doc, "Assessment started_at", started)
     if completed is not None:
         add_label_value(doc, "Assessment completed_at", completed)
 
+    status_normalized = str(assessment_status or "").strip().lower()
+    if status_normalized in {"not-started", "not_started", "not started", "planned"} and int(metrics.get("completed", 0) or 0) > 0:
+        add_note_box(
+            doc,
+            "Status metadata perlu direkonsiliasi",
+            "Metadata assessment menyatakan belum dimulai, tetapi terdapat checklist dengan status selesai. "
+            "Generator mempertahankan kedua sumber tanpa mengubahnya; periksa dan perbaiki metadata proyek secara manual.",
+            fill="FFF8E1",
+        )
+
     doc.add_paragraph(
         "The report generator does not derive assessment start/end dates from "
         "the evidence generation timestamp. If the assessment metadata records "
         "null or not-started values, those values are preserved."
     )
+
+    aggregate_counts = metrics.get("aggregate_counts", {})
+    if isinstance(aggregate_counts, dict):
+        comparisons = {
+            "file_count": ("source_files", "Jumlah file pada aggregate berbeda dari inventaris sumber yang dibaca."),
+            "checklist_count": ("checklists", "Jumlah checklist pada aggregate berbeda dari record checklist yang dibaca."),
+            "completed_checklists": ("completed", "Jumlah completed pada aggregate berbeda dari status checklist yang dibaca."),
+            "incomplete_checklists": ("incomplete", "Jumlah incomplete pada aggregate berbeda dari status checklist yang dibaca."),
+            "checklists_with_finding_true": ("checklists_with_finding", "Jumlah checklist ber-flag temuan pada aggregate berbeda dari record checklist yang dibaca."),
+            "checklists_with_review_true": ("checklists_with_review_flag", "Jumlah checklist dengan flag review pada aggregate berbeda dari record checklist yang dibaca."),
+        }
+        mismatches = []
+        for aggregate_key, (metric_key, message) in comparisons.items():
+            raw_value = aggregate_counts.get(aggregate_key)
+            if raw_value is None:
+                continue
+            try:
+                if int(raw_value) != int(metrics.get(metric_key, 0)):
+                    mismatches.append(f"{message} Aggregate={raw_value}; dihitung dari record={metrics.get(metric_key, 0)}.")
+            except (TypeError, ValueError):
+                mismatches.append(f"Nilai aggregate {aggregate_key} tidak numerik: {raw_value!r}.")
+        if mismatches:
+            add_note_box(
+                doc,
+                "Perbedaan hitungan aggregate dan record",
+                "\n".join(mismatches) + "\nGunakan record checklist yang tercantum untuk peninjauan dan perbaiki sumber data jika perbedaan tersebut tidak disengaja.",
+                fill="FFF8E1",
+            )
 
     if recommendation_errors:
         add_note_box(
@@ -2210,7 +2494,8 @@ def add_appendix_metrics(
         ["Completed", metrics["completed"]],
         ["Incomplete", metrics["incomplete"]],
         ["Confirmed findings", metrics["findings"]],
-        ["Review items", metrics["review"]],
+        ["Review/incomplete checklist records", metrics["review"]],
+        ["Checklist records with review flag", metrics.get("checklists_with_review_flag", 0)],
         ["Parse errors", metrics["parse_errors"]],
         ["ChatGPT recommendations", len(recommendations)],
     ]
@@ -2853,6 +3138,23 @@ def build_appendix_document(
 # Report generation
 # ---------------------------------------------------------------------------
 
+def validate_project_identity(active: dict[str, Any], evidence: dict[str, Any]) -> None:
+    """Stop if active project and evidence identify different projects."""
+    active_id = str(active.get("project_id") or "").strip()
+    evidence_id = first_nonempty(
+        deep_get(evidence, "project.project_id"),
+        deep_get(evidence, "project_metadata.assessment.yaml.project_id"),
+        evidence.get("project_id"),
+        default="",
+    ).strip()
+    if active_id and evidence_id and active_id != evidence_id:
+        raise ValueError(
+            "Project identity mismatch: active-project.yaml identifies "
+            f"{active_id!r}, but the evidence bundle identifies {evidence_id!r}. "
+            "Report generation stopped to avoid mixing data from different projects."
+        )
+
+
 def generate_report(
     project_root: Path,
     active: dict[str, Any],
@@ -2868,7 +3170,7 @@ def generate_report(
     source_files = extract_source_files(evidence)
     findings = extract_findings(evidence)
 
-    meta = extract_project_metadata(evidence, active)
+    meta = extract_project_metadata(evidence, active, project_root=project_root)
     metrics = extract_metrics(evidence, checklists, source_files, findings)
 
     # Generate the two logical parts separately.
@@ -3001,6 +3303,7 @@ def main() -> int:
         )
 
         evidence, evidence_path = load_evidence(project_root)
+        validate_project_identity(active, evidence)
 
         checklists = extract_checklists(evidence, project_root=project_root)
         source_files = extract_source_files(evidence)
