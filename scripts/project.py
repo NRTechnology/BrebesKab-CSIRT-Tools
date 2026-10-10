@@ -23,6 +23,7 @@ import base64
 import re
 import os
 import sys
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -35,7 +36,7 @@ except ImportError:
     sys.exit(1)
 
 
-SCRIPT_VERSION = "1.5.4"
+SCRIPT_VERSION = "1.5.5"
 PROJECT_ID_PATTERN = re.compile(r"^PENTEST-[0-9]{4}-[0-9]{3,}$")
 ALLOWED_ENVIRONMENTS = ("Production", "Staging", "Pre-Production")
 ALLOWED_ASSESSMENT_TYPES = ("Black Box", "Grey Box", "White Box")
@@ -1000,6 +1001,55 @@ def create_project(
     return 0
 
 
+def validate_generated_report(project_dir: Path, started_at: Any) -> tuple[bool, str]:
+    """
+    Require a successfully generated report.py DOCX before assessment completion.
+
+    report.py defaults to:
+      <project>/23-final-sign-off/penetration-test-report.docx
+
+    A valid DOCX container is required, and the report must not predate the
+    current assessment start timestamp.
+    """
+    report_path = (
+        project_dir
+        / "23-final-sign-off"
+        / "penetration-test-report.docx"
+    )
+
+    if not report_path.is_file():
+        return False, f"Laporan belum ditemukan: {report_path}"
+
+    try:
+        if report_path.stat().st_size == 0 or not zipfile.is_zipfile(report_path):
+            return False, f"File laporan bukan DOCX yang valid: {report_path}"
+        with zipfile.ZipFile(report_path) as archive:
+            names = set(archive.namelist())
+            if "[Content_Types].xml" not in names or "word/document.xml" not in names:
+                return False, f"Struktur DOCX tidak lengkap: {report_path}"
+    except (OSError, zipfile.BadZipFile) as exc:
+        return False, f"Laporan tidak dapat diverifikasi ({report_path}): {exc}"
+
+    if started_at:
+        try:
+            started_dt = datetime.fromisoformat(str(started_at))
+            report_dt = datetime.fromtimestamp(
+                report_path.stat().st_mtime, tz=started_dt.tzinfo
+            )
+            if report_dt < started_dt:
+                return False, (
+                    "Laporan ditemukan, tetapi waktu modifikasinya lebih lama "
+                    "daripada started_at assessment saat ini."
+                )
+        except (TypeError, ValueError, OSError):
+            return False, (
+                "started_at tidak dapat diverifikasi; periksa assessment.yaml "
+                "sebelum menyelesaikan assessment."
+            )
+
+    return True, str(report_path)
+
+
 def update_assessment_lifecycle(project_id: str, action: str) -> int:
     """Set assessment start/completion timestamps without rewriting unrelated YAML."""
     try:
@@ -1042,12 +1092,25 @@ def update_assessment_lifecycle(project_id: str, action: str) -> int:
             print(f"[INFO] Assessment sudah selesai pada: {completed_at}")
             print("[INFO] completed_at tidak diubah.")
             return 0
+
+        if not started_at:
+            print("[ERROR] Assessment belum dimulai.")
+            print("        Jalankan: python scripts/project.py start <PROJECT-ID>")
+            print("        completed_at tidak diubah.")
+            return 1
+
+        report_ok, report_message = validate_generated_report(project_dir, started_at)
+        if not report_ok:
+            print("[ERROR] Assessment belum dapat diselesaikan.")
+            print(f"        {report_message}")
+            print("        Jalankan scripts/report.py sampai muncul [PASS] Word report generated.")
+            print("        completed_at tidak diubah.")
+            return 1
+
+        print(f"[PASS] Report terverifikasi: {report_message}")
         updates = {"status": "completed", "completed_at": now}
         _replace_assessment_root_values(assessment_path, updates)
         print(f"[PASS] completed_at: {now}")
-        if not started_at:
-            print("[WARN] started_at masih null karena assessment belum pernah dimulai")
-            print("       melalui perintah project.py start.")
         activity_action = "Assessment completed"
         activity_status = "completed"
     else:
